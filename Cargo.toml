@@ -2,6 +2,7 @@
 name = "yt-music-tui"
 version = "0.1.0"
 edition = "2024"
+#WARN:remove secret and clientid when puslished
 
 [dependencies]
 ratatui = "0.30.0"
