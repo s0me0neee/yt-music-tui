@@ -2,8 +2,8 @@ mod api;
 mod app;
 mod auth;
 
-use anyhow::Context;
-use google_youtube3::{YouTube, api::Playlist, hyper_rustls, hyper_util};
+use anyhow::Ok;
+use google_youtube3::{YouTube, hyper_rustls, hyper_util};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 
 #[tokio::main]
@@ -21,8 +21,7 @@ async fn main() -> anyhow::Result<()> {
         authenticator,
     );
 
-    let response = api::get_playlists(&hub).await?;
-    let titles: Vec<Playlist> = response.items.unwrap_or_default();
-
-    app::App::new(titles).run()
+    let playlists = api::get_playlists(&hub).await?;
+    dbg!(playlists.len());
+    app::App::new(playlists).run()
 }
