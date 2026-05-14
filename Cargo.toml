@@ -1,0 +1,13 @@
+[package]
+name = "yt-music-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30.0"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+google-youtube3 = "7"
+yup-oauth2 = { version = "12", features = ["hyper-rustls"] }
+open = "5"
