@@ -1,41 +1,21 @@
 use anyhow::Result;
-use google_youtube3::{
-    YouTube,
-    api::{Playlist, PlaylistItemListResponse},
-    hyper_rustls, hyper_util,
-};
+use serde_json::Value;
+use ytmusicapi::YTMusic;
 
-pub type Hub =
-    YouTube<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>>;
-
-pub async fn get_playlists(hub: &Hub) -> Result<Vec<Playlist>> {
-    let mut all = Vec::new();
-    let mut page_token: Option<String> = None;
-
-    loop {
-        let mut call = hub
-            .playlists()
-            .list(&vec!["snippet".to_string()])
-            .add_scope("https://www.googleapis.com/auth/youtube.readonly")
-            .mine(true)
-            .max_results(50);
-
-        if let Some(ref token) = page_token {
-            call = call.page_token(token);
-        }
-
-        let (_, response) = call.doit().await?;
-        all.extend(response.items.unwrap_or_default());
-
-        match response.next_page_token {
-            Some(token) => page_token = Some(token),
-            None => break,
-        }
-    }
-
-    Ok(all)
+pub fn get_playlists(yt: &YTMusic) -> Result<Vec<Value>> {
+    let val = yt.get_library_playlists(None)?;
+    Ok(val.as_array().cloned().unwrap_or_default())
 }
 
-pub async fn get_songs(pl_id: String) -> Result<PlaylistItemListResponse> {
-    unimplemented!()
+pub fn get_liked_songs(yt: &YTMusic) -> Result<Vec<Value>> {
+    let val = yt.get_liked_songs(Some(5000))?;
+    Ok(val["tracks"].as_array().cloned().unwrap_or_default())
+}
+
+pub fn get_songs(yt: &YTMusic, playlist_id: &str) -> Result<Vec<Value>> {
+    log::debug!("get_songs: fetching playlist_id={playlist_id}");
+    let val = yt.get_playlist(playlist_id, Some(5000), None, None)?;
+    let tracks = val["tracks"].as_array().cloned().unwrap_or_default();
+    log::debug!("get_songs: done, total={}", tracks.len());
+    Ok(tracks)
 }

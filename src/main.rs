@@ -1,27 +1,39 @@
 mod api;
 mod app;
-mod auth;
 
-use anyhow::Ok;
-use google_youtube3::{YouTube, hyper_rustls, hyper_util};
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use simplelog::{Config, LevelFilter, WriteLogger};
+use std::fs::File;
+use std::path::Path;
+use ytmusicapi::YTMusic;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let authenticator = auth::build_authenticator().await?;
+fn main() -> anyhow::Result<()> {
+    WriteLogger::init(LevelFilter::Debug, Config::default(), File::create("app.log")?)?;
 
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()?
-        .https_only()
-        .enable_http2()
-        .build();
+    let yt = if Path::new("browser.json").exists() {
+        YTMusic::authenticated("browser.json")?
+    } else {
+        log::info!("browser.json not found, running setup");
+        YTMusic::setup(Some("browser.json"))?;
+        YTMusic::authenticated("browser.json")?
+    };
 
-    let hub = YouTube::new(
-        Client::builder(TokioExecutor::new()).build(connector),
-        authenticator,
-    );
+    let mut playlists = api::get_playlists(&yt)?;
 
-    let playlists = api::get_playlists(&hub).await?;
-    dbg!(playlists.len());
-    app::App::new(playlists).run()
+    let liked_songs = api::get_liked_songs(&yt).unwrap_or_else(|e| {
+        log::warn!("failed to fetch liked songs: {e:#}");
+        Vec::new()
+    });
+    playlists.insert(0, serde_json::json!({"title": "Liked Songs", "playlistId": "LM"}));
+
+    let mut all_songs = vec![liked_songs];
+    for pl in &playlists[1..] {
+        let id = pl["playlistId"].as_str().unwrap_or("");
+        let songs = api::get_songs(&yt, id).unwrap_or_else(|e| {
+            log::error!("failed to fetch songs for {id}: {e:#}");
+            Vec::new()
+        });
+        all_songs.push(songs);
+    }
+
+    app::App::new(playlists, all_songs).run()
 }
