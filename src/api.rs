@@ -7,10 +7,6 @@ pub fn get_playlists(yt: &YTMusic) -> Result<Vec<Value>> {
     Ok(val.as_array().cloned().unwrap_or_default())
 }
 
-pub fn get_liked_songs(yt: &YTMusic) -> Result<Vec<Value>> {
-    let val = yt.get_liked_songs(Some(5000))?;
-    Ok(val["tracks"].as_array().cloned().unwrap_or_default())
-}
 
 pub fn get_songs(yt: &YTMusic, playlist_id: &str) -> Result<Vec<Value>> {
     log::debug!("get_songs: fetching playlist_id={playlist_id}");
