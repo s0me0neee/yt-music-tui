@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::BufRead;
 
 pub fn run_setup(browser_json_path: &str) -> Result<()> {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -8,11 +8,25 @@ pub fn run_setup(browser_json_path: &str) -> Result<()> {
         eprintln!("No browser.json found.");
         eprintln!("Open music.youtube.com, open DevTools (F12) → Network,");
         eprintln!("click any request → right-click → Copy as cURL (bash),");
-        eprintln!("paste below, then press Ctrl+D:\n");
+        eprintln!("paste below and press Enter:\n");
     }
 
-    let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text)?;
+    // Read until a line with no trailing backslash (end of the curl command).
+    // Blank lines before content are skipped; a blank line after content also stops.
+    // This means the user just pastes and presses Enter — no Ctrl+D required.
+    let mut lines: Vec<String> = Vec::new();
+    for raw in std::io::stdin().lock().lines() {
+        let line = raw?;
+        let cont = line.trim_end().ends_with('\\');
+        let empty = line.trim().is_empty();
+        if empty {
+            if !lines.is_empty() { break; } // blank line after content = done
+            continue;                        // skip leading blank lines
+        }
+        lines.push(line);
+        if !cont { break; } // non-continuation line = end of curl command
+    }
+    let text = lines.join("\n");
 
     let headers = parse_curl(&text)?;
     let json = serde_json::to_string_pretty(&headers)?;

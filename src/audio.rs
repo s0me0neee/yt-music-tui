@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::TryRecvError;
 use std::thread;
@@ -12,7 +13,7 @@ use serde_json::{json, Value};
 #[allow(dead_code)]
 pub enum Cmd {
     Play(String),     // video_id
-    Prefetch(String), // video_id — resolve URL in background for faster future Play
+    Prefetch(String), // pre-resolve CDN URL before the user presses play
     Pause,
     Resume,
     Seek(i64),        // relative seconds
@@ -27,7 +28,7 @@ pub struct AudioState {
     pub paused:     bool,
     pub loading:    bool,
     pub error:      Option<String>,
-    pub song_ended: bool, // set on natural eof; app must reset after reading
+    pub song_ended: bool, // set on natural eof; caller must reset after reading
 }
 
 pub struct AudioEngine {
@@ -57,19 +58,16 @@ impl AudioEngine {
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
-        // Disconnect the channel — the audio thread detects this and kills mpv.
+        // Disconnecting the sender causes run() to detect Disconnected and kill mpv.
         drop(self.cmd_tx.take());
-        // Wait for the audio thread to finish so mpv is dead before we return.
-        if let Some(handle) = self.audio_thread.take() {
-            let _ = handle.join();
+        if let Some(h) = self.audio_thread.take() {
+            let _ = h.join();
         }
     }
 }
 
-// ── URL pre-resolution ────────────────────────────────────────────────────────
+// ── URL resolution ────────────────────────────────────────────────────────────
 
-/// Calls yt-dlp to get a direct CDN audio URL for the given video ID.
-/// Returns None on failure (audio thread falls back to YouTube URL so mpv handles it).
 fn resolve_url(video_id: &str) -> Option<String> {
     let yt_url = format!("https://music.youtube.com/watch?v={video_id}");
     log::debug!("[audio] yt-dlp resolving {video_id}");
@@ -80,16 +78,17 @@ fn resolve_url(video_id: &str) -> Option<String> {
             "--no-playlist",
             &yt_url,
         ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output()
         .ok()?;
 
     if !out.status.success() {
-        log::warn!("[audio] yt-dlp resolve failed for {video_id}: {}",
-            String::from_utf8_lossy(&out.stderr).trim());
+        log::warn!("[audio] yt-dlp failed for {video_id}");
         return None;
     }
     let stdout = String::from_utf8(out.stdout).ok()?;
-    let url = stdout.trim().lines().next()?.to_string();
+    let url    = stdout.trim().lines().next()?.to_string();
     if url.starts_with("http") { Some(url) } else { None }
 }
 
@@ -97,14 +96,13 @@ fn mpv_write(w: &mut impl Write, msg: Value) {
     let mut s = msg.to_string();
     s.push('\n');
     if let Err(e) = w.write_all(s.as_bytes()) {
-        log::error!("[audio] write to mpv socket failed: {e}");
+        log::error!("[audio] mpv write failed: {e}");
     }
 }
 
 // ── audio thread ──────────────────────────────────────────────────────────────
 
 fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
-    // ── dependency checks ────────────────────────────────────────────────────
     for bin in ["mpv", "yt-dlp"] {
         match Command::new("which").arg(bin).output() {
             Ok(o) if o.status.success() => {
@@ -119,11 +117,9 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     }
 
     let socket = format!("/tmp/yt-tui-{}.sock", std::process::id());
-    log::info!("[audio] IPC socket path: {socket}");
 
     // ── spawn mpv ────────────────────────────────────────────────────────────
-    log::info!("[audio] spawning mpv…");
-    let child = Command::new("mpv")
+    let mut child = match Command::new("mpv")
         .args([
             "--no-video",
             "--no-terminal",
@@ -141,9 +137,8 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-
-    let mut _child = match child {
+        .spawn()
+    {
         Ok(c) => { log::info!("[audio] mpv spawned (pid {})", c.id()); c }
         Err(e) => {
             let msg = format!("mpv spawn failed: {e} — brew install mpv");
@@ -153,11 +148,10 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         }
     };
 
-    // ── wait for IPC socket ───────────────────────────────────────────────────
-    log::info!("[audio] waiting for IPC socket…");
+    // ── wait for IPC socket (up to 2.5 s) ───────────────────────────────────
     let stream = {
         let mut conn = None;
-        for attempt in 0..40 {
+        for attempt in 0..50 {
             thread::sleep(Duration::from_millis(50));
             match UnixStream::connect(&socket) {
                 Ok(s) => {
@@ -165,7 +159,9 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                     conn = Some(s);
                     break;
                 }
-                Err(e) if attempt == 39 => log::error!("[audio] IPC socket never appeared: {e}"),
+                Err(e) if attempt == 49 => {
+                    log::error!("[audio] IPC socket never appeared: {e}");
+                }
                 _ => {}
             }
         }
@@ -173,7 +169,9 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
             Some(s) => s,
             None => {
                 state.lock().unwrap().error = Some("mpv IPC unavailable".into());
-                let _ = _child.kill();
+                let _ = child.kill();
+                let _ = child.wait();
+                std::fs::remove_file(&socket).ok();
                 return;
             }
         }
@@ -187,124 +185,189 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     }
     log::info!("[audio] mpv IPC ready, entering event loop");
 
-    // ── reader thread ─────────────────────────────────────────────────────────
+    // ── mpv reader thread ─────────────────────────────────────────────────────
+    // Exits naturally when mpv's socket closes (mpv died). ev_tx being dropped
+    // signals the audio loop that mpv is gone.
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Value>();
-    thread::spawn(move || {
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&l) { let _ = ev_tx.send(v); }
+    thread::Builder::new()
+        .name("mpv-reader".into())
+        .spawn(move || {
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                            if ev_tx.send(v).is_err() { break; }
+                        }
+                    }
+                    Err(e) => { log::error!("[audio] reader: {e}"); break; }
                 }
-                Err(e) => { log::error!("[audio] mpv reader: {e}"); break; }
             }
-        }
-        log::warn!("[audio] reader thread exited");
-    });
+            log::info!("[audio] reader thread exited");
+        })
+        .expect("spawn mpv-reader");
 
-    // URL cache: video_id → direct CDN URL (populated by Prefetch)
-    let mut url_cache: HashMap<String, String> = HashMap::new();
-    let mut fetching:  HashSet<String>          = HashSet::new();
+    // ── background URL resolution ─────────────────────────────────────────────
+    // Single channel for both Prefetch and Play-time resolution.
+    // pending_resolve tracks whether the in-flight resolve is for the currently
+    // loading song — if it arrives while mpv is still loading we upgrade the URL.
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
+    let mut url_cache:       HashMap<String, String> = HashMap::new();
+    let mut fetching:        HashSet<String>          = HashSet::new();
+    let mut pending_resolve: Option<String>           = None;
+
+    const MAX_PREFETCH: usize = 2;
 
     // ── main loop ─────────────────────────────────────────────────────────────
     loop {
-        // Drain completed prefetch results into cache
+        // ── SIGTERM / SIGHUP shutdown ────────────────────────────────────────
+        if crate::QUIT.load(Ordering::Relaxed) {
+            log::info!("[audio] QUIT signal — killing mpv");
+            let _ = child.kill();
+            let _ = child.wait();
+            std::fs::remove_file(&socket).ok();
+            return;
+        }
+
+        // ── drain background resolution results ──────────────────────────────
         while let Ok((id, maybe_url)) = fetch_rx.try_recv() {
             fetching.remove(&id);
             match maybe_url {
                 Some(url) => {
-                    log::info!("[audio] prefetch done: cached URL for {id}");
+                    // If this resolve is for the currently loading song, switch
+                    // mpv to the direct CDN URL now — skips mpv's own yt-dlp run.
+                    if pending_resolve.as_deref() == Some(id.as_str()) {
+                        let still_loading = state.lock().unwrap().loading;
+                        if still_loading {
+                            log::info!("[audio] upgrading in-flight play to direct URL for {id}");
+                            mpv_write(&mut writer, json!({"command": ["loadfile", url, "replace"]}));
+                        }
+                        pending_resolve = None;
+                    }
+                    log::info!("[audio] cached CDN URL for {id}");
                     url_cache.insert(id, url);
                 }
-                None => log::debug!("[audio] prefetch failed for {id} — will resolve at play time"),
+                None => {
+                    log::warn!("[audio] resolve failed for {id} — mpv will use its own yt-dlp");
+                    if pending_resolve.as_deref() == Some(id.as_str()) {
+                        pending_resolve = None;
+                    }
+                }
             }
         }
 
-        // Commands from UI — also watch for channel disconnect (AudioEngine dropped)
+        // ── commands from UI ─────────────────────────────────────────────────
         loop {
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    log::info!("[audio] channel disconnected — killing mpv and exiting");
-                    let _ = _child.kill();
-                    let _ = _child.wait();
+                    log::info!("[audio] channel disconnected — killing mpv");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    std::fs::remove_file(&socket).ok();
                     return;
                 }
                 Ok(cmd) => match cmd {
-                Cmd::Play(id) => {
-                    // Use cached direct URL if available (instant start), else fall back
-                    // to the YouTube URL and let mpv invoke yt-dlp itself
-                    let url = if let Some(cached) = url_cache.get(&id) {
-                        log::info!("[audio] Play {id}: cache HIT — direct CDN URL");
-                        cached.clone()
-                    } else {
-                        log::info!("[audio] Play {id}: cache miss — YouTube URL (mpv resolves)");
-                        format!("https://music.youtube.com/watch?v={id}")
-                    };
-                    mpv_write(&mut writer, json!({"command": ["loadfile", url, "replace"]}));
-                    let mut s = state.lock().unwrap();
-                    s.loading = true;
-                    s.elapsed = 0.0;
-                    s.total   = 0.0;
-                    s.error   = None;
-                }
-                Cmd::Prefetch(id) => {
-                    if url_cache.contains_key(&id) || fetching.contains(&id) {
-                        continue; // already cached or in-flight
-                    }
-                    fetching.insert(id.clone());
-                    let tx = fetch_tx.clone();
-                    thread::spawn(move || {
-                        let _ = tx.send((id.clone(), resolve_url(&id)));
-                    });
-                }
-                Cmd::Pause   => { log::debug!("[audio] Pause");       mpv_write(&mut writer, json!({"command": ["set_property", "pause", true]})); }
-                Cmd::Resume  => { log::debug!("[audio] Resume");      mpv_write(&mut writer, json!({"command": ["set_property", "pause", false]})); }
-                Cmd::Seek(d) => { log::debug!("[audio] Seek {d:+}s"); mpv_write(&mut writer, json!({"command": ["seek", d, "relative"]})); }
-                Cmd::Volume(v)=>{ log::debug!("[audio] Volume {v}");  mpv_write(&mut writer, json!({"command": ["set_property", "volume", v]})); }
-                Cmd::Stop    => { log::debug!("[audio] Stop");        mpv_write(&mut writer, json!({"command": ["stop"]})); }
-                }  // end match cmd
-            }  // end match rx.try_recv()
-        }  // end loop
+                    Cmd::Play(id) => {
+                        // Cancel any stale pending resolution from a previous song.
+                        pending_resolve = None;
 
-        // Events from mpv; Disconnected means reader thread exited (mpv crashed/closed)
+                        let url = if let Some(cached) = url_cache.get(&id) {
+                            log::info!("[audio] Play {id}: cache HIT — instant CDN URL");
+                            cached.clone()
+                        } else {
+                            // No cache — send YouTube URL immediately so mpv starts
+                            // buffering right away, and simultaneously resolve the
+                            // direct CDN URL in the background. If resolution wins
+                            // the race (mpv still loading), we upgrade with loadfile.
+                            if !fetching.contains(&id) {
+                                fetching.insert(id.clone());
+                                pending_resolve = Some(id.clone());
+                                let tx  = fetch_tx.clone();
+                                let id2 = id.clone();
+                                thread::Builder::new()
+                                    .name(format!("resolve-{id2}"))
+                                    .spawn(move || { let _ = tx.send((id2.clone(), resolve_url(&id2))); })
+                                    .ok();
+                            }
+                            log::info!("[audio] Play {id}: cache miss — YouTube URL (resolving in background)");
+                            format!("https://music.youtube.com/watch?v={id}")
+                        };
+
+                        mpv_write(&mut writer, json!({"command": ["loadfile", url, "replace"]}));
+                        let mut s = state.lock().unwrap();
+                        s.loading = true;
+                        s.elapsed = 0.0;
+                        s.total   = 0.0;
+                        s.error   = None;
+                    }
+
+                    Cmd::Prefetch(id) => {
+                        if url_cache.contains_key(&id) || fetching.contains(&id) { continue; }
+                        if fetching.len() >= MAX_PREFETCH { continue; }
+                        fetching.insert(id.clone());
+                        let tx  = fetch_tx.clone();
+                        let id2 = id.clone();
+                        thread::Builder::new()
+                            .name(format!("prefetch-{id2}"))
+                            .spawn(move || { let _ = tx.send((id2.clone(), resolve_url(&id2))); })
+                            .ok();
+                    }
+
+                    Cmd::Pause   => { log::debug!("[audio] Pause");       mpv_write(&mut writer, json!({"command": ["set_property", "pause", true]})); }
+                    Cmd::Resume  => { log::debug!("[audio] Resume");      mpv_write(&mut writer, json!({"command": ["set_property", "pause", false]})); }
+                    Cmd::Seek(d) => { log::debug!("[audio] Seek {d:+}s"); mpv_write(&mut writer, json!({"command": ["seek", d, "relative"]})); }
+                    Cmd::Volume(v)=>{ log::debug!("[audio] Volume {v}");  mpv_write(&mut writer, json!({"command": ["set_property", "volume", v]})); }
+                    Cmd::Stop    => { log::debug!("[audio] Stop");        mpv_write(&mut writer, json!({"command": ["stop"]})); }
+                }
+            }
+        }
+
+        // ── events from mpv ──────────────────────────────────────────────────
         let mut mpv_dead = false;
         loop {
             match ev_rx.try_recv() {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => { mpv_dead = true; break; }
                 Ok(ev) => match ev["event"].as_str().unwrap_or("") {
-                "property-change" => {
-                    let mut s = state.lock().unwrap();
-                    match ev["name"].as_str().unwrap_or("") {
-                        "time-pos" => { if let Some(v) = ev["data"].as_f64() { s.elapsed = v; } }
-                        "pause"    => { if let Some(v) = ev["data"].as_bool() { s.paused = v; } }
-                        "duration" => {
-                            if let Some(v) = ev["data"].as_f64() {
-                                log::info!("[audio] duration: {v:.1}s");
-                                s.total   = v;
-                                s.loading = false;
+                    "property-change" => {
+                        let mut s = state.lock().unwrap();
+                        match ev["name"].as_str().unwrap_or("") {
+                            "time-pos" => { if let Some(v) = ev["data"].as_f64() { s.elapsed = v; } }
+                            "pause"    => { if let Some(v) = ev["data"].as_bool() { s.paused  = v; } }
+                            "duration" => {
+                                if let Some(v) = ev["data"].as_f64() {
+                                    log::info!("[audio] duration: {v:.1}s");
+                                    s.total   = v;
+                                    s.loading = false;
+                                    pending_resolve = None; // mpv buffered; upgrade no longer useful
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    "start-file"  => {
+                        log::info!("[audio] start-file");
+                        let mut s = state.lock().unwrap();
+                        s.loading = true;
+                        s.elapsed = 0.0;
+                    }
+                    "end-file" => {
+                        let reason = ev["reason"].as_str().unwrap_or("?");
+                        log::info!("[audio] end-file: reason={reason}");
+                        let mut s = state.lock().unwrap();
+                        s.loading = false;
+                        if reason == "eof" { s.song_ended = true; }
+                    }
+                    "file-loaded" => { log::info!("[audio] file-loaded"); }
+                    _ => {}
                 }
-                "start-file"  => { log::info!("[audio] start-file");  let mut s = state.lock().unwrap(); s.loading = true;  s.elapsed = 0.0; }
-                "end-file"    => {
-                    let reason = ev["reason"].as_str().unwrap_or("?");
-                    log::info!("[audio] end-file: reason={reason}");
-                    let mut s = state.lock().unwrap();
-                    s.loading = false;
-                    if reason == "eof" { s.song_ended = true; }
-                }
-                "file-loaded" => { log::info!("[audio] file-loaded"); }
-                _ => {}
-                }  // end match ev["event"]
-            }  // end match ev_rx.try_recv()
-        }  // end loop
+            }
+        }
+
         if mpv_dead {
-            log::warn!("[audio] mpv reader exited — mpv crashed or was closed externally");
-            let _ = _child.wait();
+            log::warn!("[audio] mpv reader exited — mpv crashed or closed");
+            let _ = child.wait();
+            std::fs::remove_file(&socket).ok();
             return;
         }
 

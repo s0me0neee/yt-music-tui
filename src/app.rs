@@ -162,7 +162,13 @@ impl App {
     // ── event loop ────────────────────────────────────────────────────────────
 
     fn event_loop(&mut self, term: &mut DefaultTerminal) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
         loop {
+            // Check for SIGTERM / SIGHUP — breaks cleanly so Drop runs and mpv is killed.
+            if crate::QUIT.load(Ordering::Relaxed) {
+                break Ok(());
+            }
+
             self.throbber_state.calc_next();
             term.draw(|frame| self.render(frame))?;
             self.handle_song_end();
@@ -179,7 +185,10 @@ impl App {
                             Panel::Songs if self.show_queue => {
                                 self.queue_view_state.select_next();
                             }
-                            Panel::Songs => self.songs_state.select_next(),
+                            Panel::Songs => {
+                                self.songs_state.select_next();
+                                self.prefetch_selected();
+                            }
                         },
                         KeyCode::Char('k') => match self.active_panel {
                             Panel::Playlists => {
@@ -189,7 +198,10 @@ impl App {
                             Panel::Songs if self.show_queue => {
                                 self.queue_view_state.select_previous();
                             }
-                            Panel::Songs => self.songs_state.select_previous(),
+                            Panel::Songs => {
+                                self.songs_state.select_previous();
+                                self.prefetch_selected();
+                            }
                         },
                         KeyCode::Char('h') => self.active_panel = Panel::Playlists,
                         KeyCode::Char('l') => {
@@ -197,6 +209,7 @@ impl App {
                             if self.songs_state.selected().is_none() {
                                 self.songs_state.select(Some(0));
                             }
+                            self.prefetch_selected();
                         }
                         KeyCode::Enter => match self.active_panel {
                             Panel::Playlists => {
@@ -204,6 +217,7 @@ impl App {
                                 if self.songs_state.selected().is_none() {
                                     self.songs_state.select(Some(0));
                                 }
+                                self.prefetch_selected();
                             }
                             Panel::Songs if self.show_queue => {
                                 if let Some(q_pos) = self.queue_view_state.selected() {
@@ -362,6 +376,25 @@ impl App {
         }
     }
 
+    /// Prefetch whichever song is currently highlighted in the Songs panel (plus the
+    /// one after it). Called on every j/k movement so the CDN URL is warm by the
+    /// time the user presses Enter.
+    fn prefetch_selected(&self) {
+        let Some(pl) = self.list_state.selected() else { return };
+        let songs = match self.all_songs.get(pl) {
+            Some(s) => s,
+            None    => return,
+        };
+        let base = self.songs_state.selected().unwrap_or(0);
+        for idx in [base, base + 1] {
+            if let Some(id) = songs.get(idx).and_then(|t| t["videoId"].as_str()) {
+                if !id.is_empty() {
+                    self.audio.send(AudioCmd::Prefetch(id.to_string()));
+                }
+            }
+        }
+    }
+
     /// Prefetch the next song in the queue so it starts instantly when needed.
     fn prefetch_next_in_queue(&self) {
         let n = self.queue.len();
@@ -413,12 +446,17 @@ impl App {
     }
 
     /// Remove the entry at `q_pos` from the queue and fix up `queue_pos`.
+    /// If the removed entry was currently playing, immediately switch to whatever
+    /// queue_pos now points at (or stop if the queue became empty).
     fn remove_from_queue(&mut self, q_pos: usize) {
         if q_pos >= self.queue.len() { return; }
+
+        let was_playing = self.queue_pos == Some(q_pos);
+
         self.queue.remove(q_pos);
         log::info!("remove_from_queue: removed q_pos={q_pos} remaining={}", self.queue.len());
 
-        // Adjust queue_pos so the currently playing song index stays correct
+        // Adjust queue_pos so it still refers to the same logical position.
         self.queue_pos = match self.queue_pos {
             None => None,
             Some(p) if p == q_pos && self.queue.is_empty() => None,
@@ -427,9 +465,32 @@ impl App {
             Some(p)                                        => Some(p),
         };
 
-        // Keep queue_view_state in bounds
+        // Keep queue_view_state in bounds.
         let new_sel = q_pos.min(self.queue.len().saturating_sub(1));
         self.queue_view_state.select(if self.queue.is_empty() { None } else { Some(new_sel) });
+
+        // If we removed the actively playing entry, audio must actually switch.
+        if was_playing {
+            match (self.queue_pos, self.queue_pl) {
+                (None, _) | (_, None) => {
+                    self.audio.send(AudioCmd::Stop);
+                    self.playing_pl   = None;
+                    self.playing_song = None;
+                    log::info!("remove_from_queue: queue empty — stopped playback");
+                }
+                (Some(pos), Some(pl)) => {
+                    let song  = self.queue[pos];
+                    let title = self.all_songs.get(pl)
+                        .and_then(|s| s.get(song))
+                        .and_then(|t| t["title"].as_str())
+                        .unwrap_or("next song")
+                        .to_string();
+                    log::info!("remove_from_queue: switching to pl={pl} song={song}");
+                    self.do_play(pl, song);
+                    self.notify(format!("▶  {title}"));
+                }
+            }
+        }
     }
 
     // ── help / notification bar ───────────────────────────────────────────────
@@ -481,17 +542,33 @@ impl App {
     // ── playlists panel ───────────────────────────────────────────────────────
 
     fn render_playlists(&mut self, frame: &mut Frame, area: Rect) {
-        let items: Vec<String> = self
-            .playlists
-            .iter()
-            .map(|pl| pl["title"].as_str().unwrap_or("Untitled").to_string())
-            .collect();
-
         let border_style = if self.active_panel == Panel::Playlists {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
+
+        if self.playlists.is_empty() {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled("No playlists found.", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(""),
+                    Line::from(Span::styled("Your session may have expired.", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("Quit (q) and re-run `cargo run`.", Style::default().fg(Color::DarkGray))),
+                ])
+                .block(Block::bordered().title("Playlists").border_style(border_style))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
+
+        let items: Vec<String> = self
+            .playlists
+            .iter()
+            .map(|pl| pl["title"].as_str().unwrap_or("Untitled").to_string())
+            .collect();
 
         let list = List::new(items)
             .block(Block::bordered().title("Playlists").border_style(border_style))
@@ -786,10 +863,12 @@ impl App {
                 &mut self.throbber_state,
             );
         } else {
-            let [bar_area, icon_area] = gauge_area.layout(
-                &Layout::horizontal([Constraint::Fill(1), Constraint::Length(2)]),
+            let [icon_area, bar_area] = gauge_area.layout(
+                &Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]),
             );
             let ratio = if ast.total > 0.0 { (ast.elapsed / ast.total).clamp(0.0, 1.0) } else { 0.0 };
+            let state_icon = if ast.paused { "⏸" } else if ast.total > 0.0 { "▶" } else { "" };
+            frame.render_widget(Paragraph::new(state_icon), icon_area);
             frame.render_widget(
                 LineGauge::default()
                     .ratio(ratio)
@@ -799,8 +878,6 @@ impl App {
                     .unfilled_style(Style::default().fg(Color::DarkGray)),
                 bar_area,
             );
-            let state_icon = if ast.paused { "⏸" } else if ast.total > 0.0 { "▶" } else { "" };
-            frame.render_widget(Paragraph::new(state_icon).alignment(Alignment::Right), icon_area);
         }
 
         // ── row 2: song title — artist (grey+italic when paused) ───────────
