@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod audio;
 mod setup;
 
 use simplelog::{Config, LevelFilter, WriteLogger};
