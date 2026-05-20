@@ -203,6 +203,16 @@ impl App {
                                     self.songs_state.select(Some(0));
                                 }
                             }
+                            Panel::Songs if self.show_queue => {
+                                if let Some(q_pos) = self.queue_view_state.selected() {
+                                    self.queue_pos = Some(q_pos);
+                                    if let (Some(pl), Some(&song)) =
+                                        (self.queue_pl, self.queue.get(q_pos))
+                                    {
+                                        self.do_play(pl, song);
+                                    }
+                                }
+                            }
                             Panel::Songs => {
                                 if let (Some(pl), Some(song)) = (
                                     self.list_state.selected(),
@@ -226,6 +236,20 @@ impl App {
                         KeyCode::Char('p') => self.play_prev(),
                         KeyCode::Char('n') => self.play_next(),
                         KeyCode::Char('m') => self.mode = self.mode.next(),
+                        // ── queue edit ────────────────────────────────────────────
+                        KeyCode::Char('a') if self.active_panel == Panel::Songs && !self.show_queue => {
+                            if let (Some(pl), Some(song)) = (
+                                self.list_state.selected(),
+                                self.songs_state.selected(),
+                            ) {
+                                self.append_to_queue(pl, song);
+                            }
+                        }
+                        KeyCode::Char('d') if self.active_panel == Panel::Songs && self.show_queue => {
+                            if let Some(q_pos) = self.queue_view_state.selected() {
+                                self.remove_from_queue(q_pos);
+                            }
+                        }
                         KeyCode::Char('o') => {
                             self.show_queue = !self.show_queue;
                             if self.show_queue {
@@ -352,6 +376,39 @@ impl App {
                 self.audio.send(AudioCmd::Prefetch(id));
             }
         }
+    }
+
+    /// Append the song at `song_idx` in `pl_idx` to the end of the current queue.
+    /// If no queue exists yet for this playlist, start one.
+    fn append_to_queue(&mut self, pl_idx: usize, song_idx: usize) {
+        if self.queue_pl != Some(pl_idx) {
+            // No queue for this playlist yet — initialise an empty one
+            self.queue_pl  = Some(pl_idx);
+            self.queue     = Vec::new();
+            self.queue_pos = None;
+        }
+        self.queue.push(song_idx);
+        log::info!("append_to_queue: pl={pl_idx} song={song_idx} queue_len={}", self.queue.len());
+    }
+
+    /// Remove the entry at `q_pos` from the queue and fix up `queue_pos`.
+    fn remove_from_queue(&mut self, q_pos: usize) {
+        if q_pos >= self.queue.len() { return; }
+        self.queue.remove(q_pos);
+        log::info!("remove_from_queue: removed q_pos={q_pos} remaining={}", self.queue.len());
+
+        // Adjust queue_pos so the currently playing song index stays correct
+        self.queue_pos = match self.queue_pos {
+            None => None,
+            Some(p) if p == q_pos && self.queue.is_empty() => None,
+            Some(p) if p >= self.queue.len()               => Some(self.queue.len() - 1),
+            Some(p) if p > q_pos                           => Some(p - 1),
+            Some(p)                                        => Some(p),
+        };
+
+        // Keep queue_view_state in bounds
+        let new_sel = q_pos.min(self.queue.len().saturating_sub(1));
+        self.queue_view_state.select(if self.queue.is_empty() { None } else { Some(new_sel) });
     }
 
     // ── layout ────────────────────────────────────────────────────────────────

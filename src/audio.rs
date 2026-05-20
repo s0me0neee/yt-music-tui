@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+#[allow(dead_code)]
 pub enum Cmd {
     Play(String),     // video_id
     Prefetch(String), // video_id — resolve URL in background for faster future Play
@@ -203,15 +204,20 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     // URL cache: video_id → direct CDN URL (populated by Prefetch)
     let mut url_cache: HashMap<String, String> = HashMap::new();
     let mut fetching:  HashSet<String>          = HashSet::new();
-    let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<(String, String)>();
+    let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
 
     // ── main loop ─────────────────────────────────────────────────────────────
     loop {
         // Drain completed prefetch results into cache
-        while let Ok((id, url)) = fetch_rx.try_recv() {
-            log::info!("[audio] prefetch done: cached URL for {id}");
+        while let Ok((id, maybe_url)) = fetch_rx.try_recv() {
             fetching.remove(&id);
-            url_cache.insert(id, url);
+            match maybe_url {
+                Some(url) => {
+                    log::info!("[audio] prefetch done: cached URL for {id}");
+                    url_cache.insert(id, url);
+                }
+                None => log::debug!("[audio] prefetch failed for {id} — will resolve at play time"),
+            }
         }
 
         // Commands from UI — also watch for channel disconnect (AudioEngine dropped)
@@ -249,11 +255,7 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                     fetching.insert(id.clone());
                     let tx = fetch_tx.clone();
                     thread::spawn(move || {
-                        if let Some(url) = resolve_url(&id) {
-                            let _ = tx.send((id, url));
-                        } else {
-                            // failure is fine — Play will fall back to YouTube URL
-                        }
+                        let _ = tx.send((id.clone(), resolve_url(&id)));
                     });
                 }
                 Cmd::Pause   => { log::debug!("[audio] Pause");       mpv_write(&mut writer, json!({"command": ["set_property", "pause", true]})); }
@@ -265,9 +267,13 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
             }  // end match rx.try_recv()
         }  // end loop
 
-        // Events from mpv
-        while let Ok(ev) = ev_rx.try_recv() {
-            match ev["event"].as_str().unwrap_or("") {
+        // Events from mpv; Disconnected means reader thread exited (mpv crashed/closed)
+        let mut mpv_dead = false;
+        loop {
+            match ev_rx.try_recv() {
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => { mpv_dead = true; break; }
+                Ok(ev) => match ev["event"].as_str().unwrap_or("") {
                 "property-change" => {
                     let mut s = state.lock().unwrap();
                     match ev["name"].as_str().unwrap_or("") {
@@ -293,7 +299,13 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                 }
                 "file-loaded" => { log::info!("[audio] file-loaded"); }
                 _ => {}
-            }
+                }  // end match ev["event"]
+            }  // end match ev_rx.try_recv()
+        }  // end loop
+        if mpv_dead {
+            log::warn!("[audio] mpv reader exited — mpv crashed or was closed externally");
+            let _ = _child.wait();
+            return;
         }
 
         thread::sleep(Duration::from_millis(50));
