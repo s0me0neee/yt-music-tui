@@ -355,6 +355,7 @@ impl App {
             self.queue.shuffle(&mut rand::thread_rng());
         }
         self.queue_pos = self.queue.iter().position(|&i| i == start_song);
+        if self.show_queue { self.queue_view_state.select(self.queue_pos); }
         log::info!("build_queue: pl={pl_idx} n={n} mode={} pos={:?}",
             self.mode.label(), self.queue_pos);
     }
@@ -416,6 +417,7 @@ impl App {
         // Re-find where the current song ended up in the new order.
         if let Some(song) = self.playing_song {
             self.queue_pos = self.queue.iter().position(|&i| i == song);
+            if self.show_queue { self.queue_view_state.select(self.queue_pos); }
         }
     }
 
