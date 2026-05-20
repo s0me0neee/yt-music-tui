@@ -394,14 +394,22 @@ impl App {
             self.queue_pos = None;
         }
         self.queue.push(song_idx);
+        let q_len = self.queue.len();
         let title = self.all_songs.get(pl_idx)
             .and_then(|s| s.get(song_idx))
             .and_then(|t| t["title"].as_str())
             .unwrap_or("song")
             .to_string();
-        let pos = self.queue.len();
-        self.notify(format!("+ queue #{pos}: {title}"));
-        log::info!("append_to_queue: pl={pl_idx} song={song_idx} queue_len={pos}");
+        log::info!("append_to_queue: pl={pl_idx} song={song_idx} queue_len={q_len}");
+
+        if self.playing_song.is_none() {
+            // Nothing playing — start this song immediately
+            self.queue_pos = Some(q_len - 1);
+            self.do_play(pl_idx, song_idx);
+            self.notify(format!("Playing: {title}"));
+        } else {
+            self.notify(format!("+ queue #{q_len}: {title}"));
+        }
     }
 
     /// Remove the entry at `q_pos` from the queue and fix up `queue_pos`.
