@@ -23,7 +23,31 @@
   3. Config file — ~/.config/yt-tui/config.toml: default volume, keybindings, auth path. Avoids hardcoded values.
 
   ---
-  Tier 4 — Auth improvements
+  Tier 4 — Playback power features
+
+  1. Download / offline cache — D on a song runs yt-dlp -x --audio-format opus -o
+     ~/.cache/yt-tui/%(id)s.%(ext)s. On Cmd::Play, check cache first before resolving URL —
+     instant start, works offline. Show ↓ indicator next to cached songs in the list.
+     Progress shown in notification bar during download.
+
+  2. Crossfade — buffer next song early via mpv audio-device switching or a second mpv
+     instance. C key cycles 0 / 2s / 5s crossfade. Requires coordinating two mpv instances
+     or using mpv's --blend-subtitles / lavfi crossfade filter. Store in config.
+
+  3. Speed control — [ / ] adjusts playback rate 0.5×–2× via mpv set_property speed.
+     Display current speed in the player bar extra row (replaces or alongside volume).
+
+  4. Local history — every do_play() appends {video_id, title, artist, timestamp} to
+     ~/.local/share/yt-tui/history.json (capped at 1000 entries, deduplicated by recency).
+     Shown as a tab (key 4) alongside Playlists/Liked/Albums. No API call needed.
+
+  5. Mouse support — ratatui has MouseEvent support. Enable with
+     crossterm::event::EnableMouseCapture. Click playlist to select, click song to play,
+     scroll wheel for j/k, click player bar to seek to position. Low cost since all state
+     is already index-driven.
+
+  ---
+  Tier 5 — Auth improvements
 
   Context: ytmusicapi OAuth is broken upstream. Cookie/header auth (browser.json) works but expires ~1yr
   and requires a manual DevTools cURL copy-paste. Goal: eliminate that friction.

@@ -121,6 +121,9 @@ pub struct App {
     show_queue:      bool,
     queue_view_state: ListState,
     notification:    Option<(String, Instant)>,
+    // filter
+    filter:      String,
+    filter_mode: bool,
 }
 
 impl App {
@@ -151,6 +154,8 @@ impl App {
             show_queue:       false,
             queue_view_state: ListState::default(),
             notification:     None,
+            filter:           String::new(),
+            filter_mode:      false,
         }
     }
 
@@ -176,11 +181,15 @@ impl App {
                 if let Some(key) = event::read()?.as_key_press_event() {
                     log::debug!("key={:?}", key.code);
                     match key.code {
+                        // ── filter mode intercepts all input ──────────────────────
+                        _ if self.filter_mode => self.handle_filter_key(key.code),
+
                         // ── navigation ────────────────────────────────────────────
                         KeyCode::Char('j') => match self.active_panel {
                             Panel::Playlists => {
                                 self.list_state.select_next();
                                 self.songs_state = ListState::default();
+                                self.clear_filter();
                             }
                             Panel::Songs if self.show_queue => {
                                 self.queue_view_state.select_next();
@@ -194,6 +203,7 @@ impl App {
                             Panel::Playlists => {
                                 self.list_state.select_previous();
                                 self.songs_state = ListState::default();
+                                self.clear_filter();
                             }
                             Panel::Songs if self.show_queue => {
                                 self.queue_view_state.select_previous();
@@ -203,7 +213,10 @@ impl App {
                                 self.prefetch_selected();
                             }
                         },
-                        KeyCode::Char('h') => self.active_panel = Panel::Playlists,
+                        KeyCode::Char('h') => {
+                            self.active_panel = Panel::Playlists;
+                            self.clear_filter();
+                        }
                         KeyCode::Char('l') => {
                             self.active_panel = Panel::Songs;
                             if self.songs_state.selected().is_none() {
@@ -217,27 +230,38 @@ impl App {
                                 if self.songs_state.selected().is_none() {
                                     self.songs_state.select(Some(0));
                                 }
+                                self.clear_filter();
                                 self.prefetch_selected();
                             }
                             Panel::Songs if self.show_queue => {
-                                if let Some(q_pos) = self.queue_view_state.selected() {
-                                    self.queue_pos = Some(q_pos);
-                                    if let (Some(pl), Some(&song)) =
-                                        (self.queue_pl, self.queue.get(q_pos))
-                                    {
-                                        self.do_play(pl, song);
+                                if let Some(display_idx) = self.queue_view_state.selected() {
+                                    let filtered = self.filtered_queue_positions();
+                                    if let Some(&q_pos) = filtered.get(display_idx) {
+                                        self.queue_pos = Some(q_pos);
+                                        if let (Some(pl), Some(&song)) =
+                                            (self.queue_pl, self.queue.get(q_pos))
+                                        {
+                                            self.do_play(pl, song);
+                                        }
                                     }
                                 }
                             }
                             Panel::Songs => {
-                                if let (Some(pl), Some(song)) = (
+                                if let (Some(pl), Some(display_idx)) = (
                                     self.list_state.selected(),
                                     self.songs_state.selected(),
                                 ) {
-                                    self.play_song(pl, song);
+                                    let filtered = self.filtered_songs(pl);
+                                    if let Some(&song) = filtered.get(display_idx) {
+                                        self.play_song(pl, song);
+                                    }
                                 }
                             }
                         },
+                        // ── filter ────────────────────────────────────────────────
+                        KeyCode::Char('/') if self.active_panel == Panel::Songs => {
+                            self.filter_mode = true;
+                        }
                         // ── playback ──────────────────────────────────────────────
                         KeyCode::Char(' ') => {
                             if self.playing_song.is_some() {
@@ -251,23 +275,35 @@ impl App {
                         }
                         KeyCode::Char('p') => self.play_prev(),
                         KeyCode::Char('n') => self.play_next(),
-                        KeyCode::Char('m') => self.mode = self.mode.next(),
+                        KeyCode::Char('m') => {
+                            let old = self.mode;
+                            self.mode = self.mode.next();
+                            self.sync_queue_to_mode(old);
+                        }
                         // ── queue edit ────────────────────────────────────────────
                         KeyCode::Char('a') if self.active_panel == Panel::Songs && !self.show_queue => {
-                            if let (Some(pl), Some(song)) = (
+                            if let (Some(pl), Some(display_idx)) = (
                                 self.list_state.selected(),
                                 self.songs_state.selected(),
                             ) {
-                                self.append_to_queue(pl, song);
+                                let filtered = self.filtered_songs(pl);
+                                if let Some(&song) = filtered.get(display_idx) {
+                                    self.append_to_queue(pl, song);
+                                }
                             }
                         }
                         KeyCode::Char('d') if self.active_panel == Panel::Songs && self.show_queue => {
-                            if let Some(q_pos) = self.queue_view_state.selected() {
-                                self.remove_from_queue(q_pos);
+                            if let Some(display_idx) = self.queue_view_state.selected() {
+                                let filtered = self.filtered_queue_positions();
+                                if let Some(&q_pos) = filtered.get(display_idx) {
+                                    self.remove_from_queue(q_pos);
+                                }
                             }
                         }
                         KeyCode::Char('o') => {
                             self.show_queue = !self.show_queue;
+                            self.filter.clear();
+                            self.filter_mode = false;
                             if self.show_queue {
                                 self.queue_view_state.select(self.queue_pos);
                             }
@@ -286,6 +322,7 @@ impl App {
                         }
                         // ── quit ──────────────────────────────────────────────────
                         KeyCode::Esc => match self.active_panel {
+                            Panel::Songs if !self.filter.is_empty() => self.clear_filter(),
                             Panel::Songs     => self.active_panel = Panel::Playlists,
                             Panel::Playlists => break Ok(()),
                         },
@@ -360,6 +397,28 @@ impl App {
     fn play_next(&mut self) { self.advance_queue(1); }
     fn play_prev(&mut self) { self.advance_queue(-1); }
 
+    /// Called after `self.mode` is updated. Reorders the live queue so that
+    /// Shuffle gives a random order and Cycle gives the original index order.
+    /// `queue_pos` is re-pinned to the currently playing song so playback
+    /// state stays consistent.
+    fn sync_queue_to_mode(&mut self, old_mode: PlayMode) {
+        use rand::seq::SliceRandom;
+        match (old_mode, self.mode) {
+            (_, PlayMode::Shuffle) => {
+                self.queue.shuffle(&mut rand::thread_rng());
+            }
+            (PlayMode::Shuffle, _) => {
+                // Restore original playlist order (queue entries are song indices).
+                self.queue.sort_unstable();
+            }
+            _ => {} // Single↔Cycle switch doesn't need a reorder
+        }
+        // Re-find where the current song ended up in the new order.
+        if let Some(song) = self.playing_song {
+            self.queue_pos = self.queue.iter().position(|&i| i == song);
+        }
+    }
+
     fn handle_song_end(&mut self) {
         let ended = {
             let mut ast = self.audio.state.lock().unwrap();
@@ -376,20 +435,86 @@ impl App {
         }
     }
 
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.filter_mode = false;
+        self.songs_state.select(Some(0));
+        self.queue_view_state.select(Some(0));
+    }
+
+    fn handle_filter_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.clear_filter(),
+            KeyCode::Enter => { self.filter_mode = false; }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.songs_state.select(Some(0));
+                self.queue_view_state.select(Some(0));
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.songs_state.select(Some(0));
+                self.queue_view_state.select(Some(0));
+            }
+            _ => {}
+        }
+    }
+
+    /// Original song indices in `all_songs[pl]` that match the current filter.
+    /// Returns all indices when the filter is empty.
+    fn filtered_songs(&self, pl: usize) -> Vec<usize> {
+        let songs = self.all_songs.get(pl).map(Vec::as_slice).unwrap_or(&[]);
+        if self.filter.is_empty() {
+            return (0..songs.len()).collect();
+        }
+        let q = self.filter.to_lowercase();
+        songs.iter().enumerate()
+            .filter(|(_, t)| {
+                let title = t["title"].as_str().unwrap_or("").to_lowercase();
+                let artists = t["artists"].as_array()
+                    .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(" ").to_lowercase())
+                    .unwrap_or_default();
+                title.contains(&q) || artists.contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Queue positions whose songs match the current filter.
+    /// Returns all positions when the filter is empty.
+    fn filtered_queue_positions(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.queue.len()).collect();
+        }
+        let q   = self.filter.to_lowercase();
+        let pl  = match self.queue_pl { Some(p) => p, None => return vec![] };
+        self.queue.iter().enumerate()
+            .filter(|&(_, &song_idx)| {
+                let track   = self.all_songs.get(pl).and_then(|s| s.get(song_idx));
+                let title   = track.and_then(|t| t["title"].as_str()).unwrap_or("").to_lowercase();
+                let artists = track.and_then(|t| t["artists"].as_array())
+                    .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(" ").to_lowercase())
+                    .unwrap_or_default();
+                title.contains(&q) || artists.contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Prefetch whichever song is currently highlighted in the Songs panel (plus the
     /// one after it). Called on every j/k movement so the CDN URL is warm by the
     /// time the user presses Enter.
     fn prefetch_selected(&self) {
         let Some(pl) = self.list_state.selected() else { return };
-        let songs = match self.all_songs.get(pl) {
-            Some(s) => s,
-            None    => return,
-        };
+        let Some(songs) = self.all_songs.get(pl) else { return };
+        let filtered = self.filtered_songs(pl);
         let base = self.songs_state.selected().unwrap_or(0);
-        for idx in [base, base + 1] {
-            if let Some(id) = songs.get(idx).and_then(|t| t["videoId"].as_str()) {
-                if !id.is_empty() {
-                    self.audio.send(AudioCmd::Prefetch(id.to_string()));
+        for display_idx in [base, base + 1] {
+            if let Some(&real_idx) = filtered.get(display_idx) {
+                if let Some(id) = songs.get(real_idx).and_then(|t| t["videoId"].as_str()) {
+                    if !id.is_empty() {
+                        self.audio.send(AudioCmd::Prefetch(id.to_string()));
+                    }
                 }
             }
         }
@@ -503,16 +628,22 @@ impl App {
 
         if !show_notif { self.notification = None; }
 
-        let line = if let Some((msg, _)) = &self.notification {
+        let line = if self.filter_mode {
+            Line::from(vec![
+                Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(self.filter.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled("█  ·  Enter confirm · Esc cancel", Style::default().fg(Color::DarkGray)),
+            ])
+        } else if let Some((msg, _)) = &self.notification {
             Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
         } else {
             let hint = match (self.active_panel, self.show_queue) {
                 (Panel::Playlists, _) =>
                     "j/k nav · l/↵ open · q quit",
                 (Panel::Songs, false) =>
-                    "j/k nav · ↵ play · a +queue · o queue · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode · h back",
+                    "j/k nav · ↵ play · / filter · a +queue · o queue · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode",
                 (Panel::Songs, true)  =>
-                    "j/k nav · ↵ play · d remove · o songs · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode · h back",
+                    "j/k nav · ↵ play · / filter · d remove · o songs · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode",
             };
             Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
         };
@@ -630,9 +761,22 @@ impl App {
     }
 
     fn selected_song(&self) -> Option<&Value> {
-        let pl  = self.list_state.selected()?;
-        let idx = self.songs_state.selected()?;
-        self.all_songs.get(pl)?.get(idx)
+        let pl           = self.list_state.selected()?;
+        let display_idx  = self.songs_state.selected()?;
+        let real_idx     = *self.filtered_songs(pl).get(display_idx)?;
+        self.all_songs.get(pl)?.get(real_idx)
+    }
+
+    /// Build a panel title that shows the active filter query.
+    fn filter_title(&self, base: &str) -> String {
+        if self.filter.is_empty() {
+            return base.to_string();
+        }
+        if self.filter_mode {
+            format!("{base}  /{}█", self.filter)
+        } else {
+            format!("{base}  /{}", self.filter)
+        }
     }
 
     fn render_playlist_info(&self, frame: &mut Frame, area: Rect) {
@@ -712,17 +856,17 @@ impl App {
         let playing_pl   = self.playing_pl;
         let playing_song = self.playing_song;
 
-        let songs = current_pl
+        let all_songs = current_pl
             .and_then(|i| self.all_songs.get(i))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        let num_w = songs.len().to_string().len();
+        let filtered = current_pl.map(|pl| self.filtered_songs(pl)).unwrap_or_default();
+        let num_w = all_songs.len().to_string().len();
 
-        let items: Vec<ListItem> = songs
-            .iter()
-            .enumerate()
-            .map(|(i, track)| {
+        let items: Vec<ListItem> = filtered.iter()
+            .map(|&i| {
+                let track      = &all_songs[i];
                 let is_playing = current_pl == playing_pl && Some(i) == playing_song;
                 let title   = track["title"].as_str().unwrap_or("Unknown");
                 let artists = track["artists"]
@@ -759,9 +903,10 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
+        let panel_title = self.filter_title("Songs");
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::bordered().title("Songs").border_style(border_style))
+                .block(Block::bordered().title(panel_title).border_style(border_style))
                 .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
                 .highlight_symbol("> "),
             area,
@@ -772,13 +917,13 @@ impl App {
     // ── queue view ────────────────────────────────────────────────────────────
 
     fn render_queue(&mut self, frame: &mut Frame, area: Rect) {
-        let pl = self.queue_pl;
+        let pl        = self.queue_pl;
         let queue_pos = self.queue_pos;
+        let filtered  = self.filtered_queue_positions();
 
-        let items: Vec<ListItem> = self.queue
-            .iter()
-            .enumerate()
-            .map(|(q_pos, &song_idx)| {
+        let items: Vec<ListItem> = filtered.iter()
+            .map(|&q_pos| {
+                let song_idx   = self.queue[q_pos];
                 let is_current = Some(q_pos) == queue_pos;
                 let track = pl
                     .and_then(|p| self.all_songs.get(p))
@@ -787,12 +932,7 @@ impl App {
                 let title   = track.and_then(|t| t["title"].as_str()).unwrap_or("Unknown");
                 let artists = track
                     .and_then(|t| t["artists"].as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|a| a["name"].as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
+                    .map(|arr| arr.iter().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>().join(", "))
                     .unwrap_or_default();
 
                 let indicator = if is_current { "♫ " } else { "  " };
@@ -824,15 +964,15 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
-        let title = match self.mode {
+        let base_title = match self.mode {
             PlayMode::Shuffle => "Queue  (Shuffle)",
             PlayMode::Single  => "Queue  (Single)",
             PlayMode::Cycle   => "Queue",
         };
-
+        let panel_title = self.filter_title(base_title);
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::bordered().title(title).border_style(border_style))
+                .block(Block::bordered().title(panel_title).border_style(border_style))
                 .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
                 .highlight_symbol("> "),
             area,

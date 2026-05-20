@@ -294,8 +294,13 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         };
 
                         mpv_write(&mut writer, json!({"command": ["loadfile", url, "replace"]}));
+                        // --keep-open=yes leaves mpv paused at EOF; loadfile inherits that
+                        // paused state, so the new song would silently sit at 0:00 without
+                        // this explicit unpause.
+                        mpv_write(&mut writer, json!({"command": ["set_property", "pause", false]}));
                         let mut s = state.lock().unwrap();
                         s.loading = true;
+                        s.paused  = false;
                         s.elapsed = 0.0;
                         s.total   = 0.0;
                         s.error   = None;
