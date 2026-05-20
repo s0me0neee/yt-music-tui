@@ -180,7 +180,7 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     let mut writer = stream.try_clone().expect("clone IPC socket");
     let reader     = BufReader::new(stream);
 
-    for (id, prop) in [(1u32, "time-pos"), (2, "pause"), (3, "duration")] {
+    for (id, prop) in [(1u32, "time-pos"), (2, "pause"), (3, "duration"), (4, "eof-reached")] {
         mpv_write(&mut writer, json!({"command": ["observe_property", id, prop]}));
     }
     log::info!("[audio] mpv IPC ready, entering event loop");
@@ -299,11 +299,12 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         // this explicit unpause.
                         mpv_write(&mut writer, json!({"command": ["set_property", "pause", false]}));
                         let mut s = state.lock().unwrap();
-                        s.loading = true;
-                        s.paused  = false;
-                        s.elapsed = 0.0;
-                        s.total   = 0.0;
-                        s.error   = None;
+                        s.loading    = true;
+                        s.paused     = false;
+                        s.elapsed    = 0.0;
+                        s.total      = 0.0;
+                        s.error      = None;
+                        s.song_ended = false; // clear stale eof-reached from previous file
                     }
 
                     Cmd::Prefetch(id) => {
@@ -345,6 +346,14 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                                     s.total   = v;
                                     s.loading = false;
                                     pending_resolve = None; // mpv buffered; upgrade no longer useful
+                                }
+                            }
+                            // With --keep-open=yes mpv never sends end-file reason=eof; instead
+                            // eof-reached flips to true when the file pauses at its natural end.
+                            "eof-reached" => {
+                                if ev["data"].as_bool() == Some(true) {
+                                    log::info!("[audio] eof-reached → song_ended");
+                                    s.song_ended = true;
                                 }
                             }
                             _ => {}
