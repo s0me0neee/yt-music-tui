@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     DefaultTerminal, Frame,
@@ -120,6 +120,7 @@ pub struct App {
     queue_pl:        Option<usize>, // which playlist the queue belongs to
     show_queue:      bool,
     queue_view_state: ListState,
+    notification:    Option<(String, Instant)>,
 }
 
 impl App {
@@ -149,6 +150,7 @@ impl App {
             queue_pl:         None,
             show_queue:       false,
             queue_view_state: ListState::default(),
+            notification:     None,
         }
     }
 
@@ -378,6 +380,10 @@ impl App {
         }
     }
 
+    fn notify(&mut self, msg: impl Into<String>) {
+        self.notification = Some((msg.into(), Instant::now()));
+    }
+
     /// Append the song at `song_idx` in `pl_idx` to the end of the current queue.
     /// If no queue exists yet for this playlist, start one.
     fn append_to_queue(&mut self, pl_idx: usize, song_idx: usize) {
@@ -388,7 +394,14 @@ impl App {
             self.queue_pos = None;
         }
         self.queue.push(song_idx);
-        log::info!("append_to_queue: pl={pl_idx} song={song_idx} queue_len={}", self.queue.len());
+        let title = self.all_songs.get(pl_idx)
+            .and_then(|s| s.get(song_idx))
+            .and_then(|t| t["title"].as_str())
+            .unwrap_or("song")
+            .to_string();
+        let pos = self.queue.len();
+        self.notify(format!("+ queue #{pos}: {title}"));
+        log::info!("append_to_queue: pl={pl_idx} song={song_idx} queue_len={pos}");
     }
 
     /// Remove the entry at `q_pos` from the queue and fix up `queue_pos`.
@@ -411,18 +424,50 @@ impl App {
         self.queue_view_state.select(if self.queue.is_empty() { None } else { Some(new_sel) });
     }
 
+    // ── help / notification bar ───────────────────────────────────────────────
+
+    fn render_help(&mut self, frame: &mut Frame, area: Rect) {
+        // Show notification for 2 s, then fall back to context-sensitive hints
+        let show_notif = self.notification.as_ref()
+            .map(|(_, t)| t.elapsed() < Duration::from_secs(2))
+            .unwrap_or(false);
+
+        if !show_notif { self.notification = None; }
+
+        let line = if let Some((msg, _)) = &self.notification {
+            Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
+        } else {
+            let hint = match (self.active_panel, self.show_queue) {
+                (Panel::Playlists, _) =>
+                    "j/k nav · l/↵ open · q quit",
+                (Panel::Songs, false) =>
+                    "j/k nav · ↵ play · a +queue · o queue · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode · h back",
+                (Panel::Songs, true)  =>
+                    "j/k nav · ↵ play · d remove · o songs · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode · h back",
+            };
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+        };
+
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
     // ── layout ────────────────────────────────────────────────────────────────
 
     fn render(&mut self, frame: &mut Frame) {
-        let vertical   = Layout::vertical([Constraint::Fill(1), Constraint::Length(5)]).spacing(1);
+        // No vertical spacing — player sits flush below the main panels
+        let vertical   = Layout::vertical([Constraint::Fill(1), Constraint::Length(6)]);
         let horizontal = Layout::horizontal([Constraint::Percentage(25), Constraint::Fill(1)]).spacing(1);
 
-        let [main, pg_bar]     = frame.area().layout(&vertical);
+        let [main, bottom]     = frame.area().layout(&vertical);
+        let [pg_bar, help_bar] = bottom.layout(
+            &Layout::vertical([Constraint::Length(5), Constraint::Length(1)])
+        );
         let [playlists, right] = main.layout(&horizontal);
 
         self.render_playlists(frame, playlists);
         self.render_right_panel(frame, right);
         self.render_player(frame, pg_bar);
+        self.render_help(frame, help_bar);
     }
 
     // ── playlists panel ───────────────────────────────────────────────────────
