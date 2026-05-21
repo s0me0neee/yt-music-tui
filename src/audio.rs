@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::TryRecvError;
@@ -58,17 +58,57 @@ impl AudioEngine {
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
-        // Disconnecting the sender causes run() to detect Disconnected and kill mpv.
+        // Dropping the sender disconnects the channel; the audio thread detects
+        // Disconnected and kills mpv before returning.
         drop(self.cmd_tx.take());
         if let Some(h) = self.audio_thread.take() {
-            let _ = h.join();
+            let _ = h.join(); // returns Err if the thread panicked — ignored intentionally
         }
+    }
+}
+
+// ── MpvGuard ──────────────────────────────────────────────────────────────────
+// Kills and reaps mpv, and deletes the IPC socket, on drop.
+// This is the safety net for panics: the audio thread's explicit exit paths
+// already do kill+wait, so the Drop is idempotent (kill on dead process = no-op,
+// wait on already-waited process = ECHILD which is ignored).
+
+struct MpvGuard {
+    child:  Child,
+    socket: String,
+}
+
+impl MpvGuard {
+    fn new(child: Child, socket: String) -> Self {
+        Self { child, socket }
+    }
+}
+
+impl std::ops::Deref for MpvGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child { &self.child }
+}
+
+impl std::ops::DerefMut for MpvGuard {
+    fn deref_mut(&mut self) -> &mut Child { &mut self.child }
+}
+
+impl Drop for MpvGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::fs::remove_file(&self.socket).ok();
     }
 }
 
 // ── URL resolution ────────────────────────────────────────────────────────────
 
 fn resolve_url(video_id: &str) -> Option<String> {
+    // Don't start new yt-dlp work if the app is shutting down.
+    if crate::QUIT.load(Ordering::Relaxed) {
+        return None;
+    }
+
     let yt_url = format!("https://music.youtube.com/watch?v={video_id}");
     log::debug!("[audio] yt-dlp resolving {video_id}");
     let out = Command::new("yt-dlp")
@@ -102,6 +142,12 @@ fn mpv_write(w: &mut impl Write, msg: Value) {
 
 // ── audio thread ──────────────────────────────────────────────────────────────
 
+fn lock_state(state: &Mutex<AudioState>) -> std::sync::MutexGuard<'_, AudioState> {
+    // If another thread panicked while holding this lock, recover the inner
+    // value rather than propagating the poison and panicking the audio thread.
+    state.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     for bin in ["mpv", "yt-dlp"] {
         match Command::new("which").arg(bin).output() {
@@ -111,7 +157,7 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
             _ => {
                 let msg = format!("{bin} not found — install with: brew install {bin}");
                 log::error!("[audio] {msg}");
-                state.lock().unwrap().error = Some(msg);
+                lock_state(&state).error = Some(msg);
             }
         }
     }
@@ -119,7 +165,7 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     let socket = format!("/tmp/yt-tui-{}.sock", std::process::id());
 
     // ── spawn mpv ────────────────────────────────────────────────────────────
-    let mut child = match Command::new("mpv")
+    let mpv_child = match Command::new("mpv")
         .args([
             "--no-video",
             "--no-terminal",
@@ -143,23 +189,27 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         Err(e) => {
             let msg = format!("mpv spawn failed: {e} — brew install mpv");
             log::error!("[audio] {msg}");
-            state.lock().unwrap().error = Some(msg);
+            lock_state(&state).error = Some(msg);
             return;
         }
     };
 
+    // Wrap in guard immediately — from this point on mpv is always killed on exit,
+    // even if the audio thread panics.
+    let mut child = MpvGuard::new(mpv_child, socket.clone());
+
     // ── wait for IPC socket (up to 2.5 s) ───────────────────────────────────
     let stream = {
         let mut conn = None;
-        for attempt in 0..50 {
-            thread::sleep(Duration::from_millis(50));
+        for attempt in 0..250 {
+            thread::sleep(Duration::from_millis(10));
             match UnixStream::connect(&socket) {
                 Ok(s) => {
-                    log::info!("[audio] IPC connected after {}ms", (attempt + 1) * 50);
+                    log::info!("[audio] IPC connected after {}ms", (attempt + 1) * 10);
                     conn = Some(s);
                     break;
                 }
-                Err(e) if attempt == 49 => {
+                Err(e) if attempt == 249 => {
                     log::error!("[audio] IPC socket never appeared: {e}");
                 }
                 _ => {}
@@ -168,10 +218,8 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         match conn {
             Some(s) => s,
             None => {
-                state.lock().unwrap().error = Some("mpv IPC unavailable".into());
-                let _ = child.kill();
-                let _ = child.wait();
-                std::fs::remove_file(&socket).ok();
+                lock_state(&state).error = Some("mpv IPC unavailable".into());
+                // MpvGuard::drop handles kill + wait + socket cleanup.
                 return;
             }
         }
@@ -207,9 +255,6 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         .expect("spawn mpv-reader");
 
     // ── background URL resolution ─────────────────────────────────────────────
-    // Single channel for both Prefetch and Play-time resolution.
-    // pending_resolve tracks whether the in-flight resolve is for the currently
-    // loading song — if it arrives while mpv is still loading we upgrade the URL.
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
     let mut url_cache:       HashMap<String, String> = HashMap::new();
     let mut fetching:        HashSet<String>          = HashSet::new();
@@ -233,10 +278,8 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
             fetching.remove(&id);
             match maybe_url {
                 Some(url) => {
-                    // If this resolve is for the currently loading song, switch
-                    // mpv to the direct CDN URL now — skips mpv's own yt-dlp run.
                     if pending_resolve.as_deref() == Some(id.as_str()) {
-                        let still_loading = state.lock().unwrap().loading;
+                        let still_loading = lock_state(&state).loading;
                         if still_loading {
                             log::info!("[audio] upgrading in-flight play to direct URL for {id}");
                             mpv_write(&mut writer, json!({"command": ["loadfile", url, "replace"]}));
@@ -268,17 +311,12 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                 }
                 Ok(cmd) => match cmd {
                     Cmd::Play(id) => {
-                        // Cancel any stale pending resolution from a previous song.
                         pending_resolve = None;
 
                         let url = if let Some(cached) = url_cache.get(&id) {
                             log::info!("[audio] Play {id}: cache HIT — instant CDN URL");
                             cached.clone()
                         } else {
-                            // No cache — send YouTube URL immediately so mpv starts
-                            // buffering right away, and simultaneously resolve the
-                            // direct CDN URL in the background. If resolution wins
-                            // the race (mpv still loading), we upgrade with loadfile.
                             if !fetching.contains(&id) {
                                 fetching.insert(id.clone());
                                 pending_resolve = Some(id.clone());
@@ -294,17 +332,14 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         };
 
                         mpv_write(&mut writer, json!({"command": ["loadfile", url, "replace"]}));
-                        // --keep-open=yes leaves mpv paused at EOF; loadfile inherits that
-                        // paused state, so the new song would silently sit at 0:00 without
-                        // this explicit unpause.
                         mpv_write(&mut writer, json!({"command": ["set_property", "pause", false]}));
-                        let mut s = state.lock().unwrap();
+                        let mut s = lock_state(&state);
                         s.loading    = true;
                         s.paused     = false;
                         s.elapsed    = 0.0;
                         s.total      = 0.0;
                         s.error      = None;
-                        s.song_ended = false; // clear stale eof-reached from previous file
+                        s.song_ended = false;
                     }
 
                     Cmd::Prefetch(id) => {
@@ -336,7 +371,7 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                 Err(TryRecvError::Disconnected) => { mpv_dead = true; break; }
                 Ok(ev) => match ev["event"].as_str().unwrap_or("") {
                     "property-change" => {
-                        let mut s = state.lock().unwrap();
+                        let mut s = lock_state(&state);
                         match ev["name"].as_str().unwrap_or("") {
                             "time-pos" => { if let Some(v) = ev["data"].as_f64() { s.elapsed = v; } }
                             "pause"    => { if let Some(v) = ev["data"].as_bool() { s.paused  = v; } }
@@ -345,11 +380,9 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                                     log::info!("[audio] duration: {v:.1}s");
                                     s.total   = v;
                                     s.loading = false;
-                                    pending_resolve = None; // mpv buffered; upgrade no longer useful
+                                    pending_resolve = None;
                                 }
                             }
-                            // With --keep-open=yes mpv never sends end-file reason=eof; instead
-                            // eof-reached flips to true when the file pauses at its natural end.
                             "eof-reached" => {
                                 if ev["data"].as_bool() == Some(true) {
                                     log::info!("[audio] eof-reached → song_ended");
@@ -361,14 +394,14 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                     }
                     "start-file"  => {
                         log::info!("[audio] start-file");
-                        let mut s = state.lock().unwrap();
+                        let mut s = lock_state(&state);
                         s.loading = true;
                         s.elapsed = 0.0;
                     }
                     "end-file" => {
                         let reason = ev["reason"].as_str().unwrap_or("?");
                         log::info!("[audio] end-file: reason={reason}");
-                        let mut s = state.lock().unwrap();
+                        let mut s = lock_state(&state);
                         s.loading = false;
                         if reason == "eof" { s.song_ended = true; }
                     }
@@ -380,11 +413,14 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
 
         if mpv_dead {
             log::warn!("[audio] mpv reader exited — mpv crashed or closed");
+            // kill() before wait() in case the reader exited for a reason
+            // other than mpv closing the socket (prevents wait() from blocking).
+            let _ = child.kill();
             let _ = child.wait();
             std::fs::remove_file(&socket).ok();
             return;
         }
 
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(5));
     }
 }

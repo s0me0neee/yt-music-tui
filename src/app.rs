@@ -2,12 +2,13 @@ use std::time::{Duration, Instant};
 
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{self, KeyCode},
-    layout::{Alignment, Constraint, Layout, Rect},
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEvent, MouseEventKind},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
     symbols,
     text::{Line, Span},
-    widgets::{Block, LineGauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, LineGauge, List, ListItem, ListState, Paragraph, Scrollbar,
+              ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use serde_json::Value;
 use throbber_widgets_tui::{Throbber, ThrobberState};
@@ -126,6 +127,9 @@ pub struct App {
     // filter
     filter:      String,
     filter_mode: bool,
+    // hit-test areas for mouse events (updated each frame)
+    playlists_area: Rect,
+    songs_area:     Rect,
 }
 
 impl App {
@@ -160,12 +164,19 @@ impl App {
             notification:     None,
             filter:           String::new(),
             filter_mode:      false,
+            playlists_area:   Rect::default(),
+            songs_area:       Rect::default(),
         }
     }
 
     pub fn run(mut self) -> anyhow::Result<()> {
-        ratatui::run(|term| self.event_loop(term))?;
-        Ok(())
+        use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        let mut terminal = ratatui::init();
+        ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+        let result = self.event_loop(&mut terminal);
+        ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture).ok();
+        ratatui::restore();
+        result.map_err(Into::into)
     }
 
     // ── event loop ────────────────────────────────────────────────────────────
@@ -182,7 +193,9 @@ impl App {
             term.draw(|frame| self.render(frame))?;
             self.handle_song_end();
             if event::poll(Duration::from_millis(200))? {
-                if let Some(key) = event::read()?.as_key_press_event() {
+                match event::read()? {
+                Event::Mouse(me) => self.handle_mouse(me),
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     log::debug!("key={:?}", key.code);
                     match key.code {
                         // ── filter mode intercepts all input ──────────────────────
@@ -269,7 +282,7 @@ impl App {
                         // ── playback ──────────────────────────────────────────────
                         KeyCode::Char(' ') => {
                             if self.playing_song.is_some() {
-                                let ast = self.audio.state.lock().unwrap();
+                                let ast = self.audio.state.lock().unwrap_or_else(|p| p.into_inner());
                                 if !ast.loading {
                                     let paused = ast.paused;
                                     drop(ast);
@@ -347,7 +360,48 @@ impl App {
                         _ => {}
                     }
                 }
+                _ => {}
+                } // match event::read()
             }
+        }
+    }
+
+    // ── mouse handling ────────────────────────────────────────────────────────
+
+    fn handle_mouse(&mut self, me: MouseEvent) {
+        let pos = Position::new(me.column, me.row);
+        match me.kind {
+            MouseEventKind::ScrollDown => {
+                if self.playlists_area.contains(pos) {
+                    self.list_state.select_next();
+                    self.songs_state = ListState::default();
+                    self.filter.clear();
+                    self.filter_mode = false;
+                } else if self.songs_area.contains(pos) {
+                    if self.show_queue {
+                        self.queue_view_state.select_next();
+                    } else {
+                        self.songs_state.select_next();
+                        self.prefetch_selected();
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.playlists_area.contains(pos) {
+                    self.list_state.select_previous();
+                    self.songs_state = ListState::default();
+                    self.filter.clear();
+                    self.filter_mode = false;
+                } else if self.songs_area.contains(pos) {
+                    if self.show_queue {
+                        self.queue_view_state.select_previous();
+                    } else {
+                        self.songs_state.select_previous();
+                        self.prefetch_selected();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -440,7 +494,7 @@ impl App {
 
     fn handle_song_end(&mut self) {
         let ended = {
-            let mut ast = self.audio.state.lock().unwrap();
+            let mut ast = self.audio.state.lock().unwrap_or_else(|p| p.into_inner());
             if ast.song_ended { ast.song_ended = false; true } else { false }
         };
         if !ended { return; }
@@ -683,6 +737,9 @@ impl App {
         );
         let [playlists, right] = main.layout(&horizontal);
 
+        self.playlists_area = playlists;
+        self.songs_area     = right;
+
         self.render_playlists(frame, playlists);
         self.render_right_panel(frame, right);
         self.render_player(frame, pg_bar);
@@ -726,6 +783,18 @@ impl App {
             .highlight_symbol("> ");
 
         frame.render_stateful_widget(list, area, &mut self.list_state);
+
+        let n = self.playlists.len();
+        if n > 1 {
+            let pos = self.list_state.selected().unwrap_or(0);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area,
+                &mut ScrollbarState::new(n).position(pos),
+            );
+        }
     }
 
     // ── right panel ───────────────────────────────────────────────────────────
@@ -922,6 +991,7 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
+        let item_count  = items.len();
         let panel_title = self.filter_title("Songs");
         frame.render_stateful_widget(
             List::new(items)
@@ -931,6 +1001,17 @@ impl App {
             area,
             &mut self.songs_state,
         );
+
+        if item_count > 1 {
+            let pos = self.songs_state.selected().unwrap_or(0);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area,
+                &mut ScrollbarState::new(item_count).position(pos),
+            );
+        }
     }
 
     // ── queue view ────────────────────────────────────────────────────────────
@@ -988,6 +1069,7 @@ impl App {
             PlayMode::Single  => "Queue  (Single)",
             PlayMode::Cycle   => "Queue",
         };
+        let item_count  = items.len();
         let panel_title = self.filter_title(base_title);
         frame.render_stateful_widget(
             List::new(items)
@@ -997,12 +1079,23 @@ impl App {
             area,
             &mut self.queue_view_state,
         );
+
+        if item_count > 1 {
+            let pos = self.queue_view_state.selected().unwrap_or(0);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area,
+                &mut ScrollbarState::new(item_count).position(pos),
+            );
+        }
     }
 
     // ── player bar ────────────────────────────────────────────────────────────
 
     fn render_player(&mut self, frame: &mut Frame, area: Rect) {
-        let ast = self.audio.state.lock().unwrap().clone();
+        let ast = self.audio.state.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
         let title = if ast.error.is_some() { "Error" } else { "Player" };
         let block = Block::bordered().title(title);

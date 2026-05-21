@@ -2,69 +2,87 @@ mod api;
 mod app;
 mod audio;
 mod setup;
+mod ytm;
 
 use simplelog::{Config, LevelFilter, WriteLogger};
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use ytmusicapi::YTMusic;
+use ytmusicapi::{BrowserAuth, YTMusicClient};
 
 /// Set to true by SIGINT / SIGTERM / SIGHUP handlers. The event loop polls
 /// this and breaks cleanly, which runs all Drop impls and kills mpv.
 pub static QUIT: AtomicBool = AtomicBool::new(false);
 
-fn reauth() -> anyhow::Result<()> {
-    eprintln!();
-    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("  Session expired — re-authentication required");
-    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!();
-    eprintln!("  1. Open music.youtube.com in your browser (stay logged in)");
-    eprintln!("  2. Open DevTools → Network tab  (F12 or Cmd+Opt+I)");
-    eprintln!("  3. Reload the page, then click any request in the list");
-    eprintln!("  4. Right-click → \"Copy as cURL (bash)\"");
-    eprintln!("  5. Paste it here, then press Ctrl+D\n");
-    std::fs::remove_file("browser.json").ok();
-    setup::run_setup("browser.json")?;
-    eprintln!("\nRe-authentication complete. Run `cargo run` again to start.\n");
+fn build_client(browser_json: &str) -> anyhow::Result<YTMusicClient> {
+    let auth = BrowserAuth::from_file(browser_json)?;
+    Ok(YTMusicClient::builder().with_browser_auth(auth).build()?)
+}
+
+fn reauth(browser_json: &str) -> anyhow::Result<()> {
+    std::fs::remove_file(browser_json).ok();
+    std::fs::remove_file(setup::BROWSER_FILE).ok();
+    setup::run_setup(browser_json)?;
+    eprintln!("\nSetup complete. Restart the app to continue.\n");
     Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
-    WriteLogger::init(LevelFilter::Debug, Config::default(), File::create("app.log")?)?;
+    WriteLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        File::create("app.log")?,
+    )?;
+    log::info!("Start up");
 
     ctrlc::set_handler(|| {
         QUIT.store(true, Ordering::Relaxed);
     })?;
 
-    if !Path::new("browser.json").exists() {
-        setup::run_setup("browser.json")?;
-        eprintln!("\nSetup complete. Run `cargo run` to start the TUI.");
+    let browser_json = "browser.json";
+
+    if !Path::new(browser_json).exists() {
+        setup::run_setup(browser_json)?;
+        eprintln!("\nSetup complete. Run again to start the TUI.");
         return Ok(());
     }
 
-    // Refresh cookies from Chrome before every session so the stored
-    // browser.json never goes stale — requires the user to be signed in
-    // to YouTube Music in Chrome. Failures are non-fatal.
-    if let Err(e) = setup::refresh_cookies("browser.json") {
-        log::warn!("cookie refresh failed (using cached): {e}");
-    }
-
-    let yt = match YTMusic::authenticated("browser.json") {
-        Ok(yt) => yt,
+    // Build the API client immediately with cached cookies, then kick off a
+    // background refresh so yt-dlp's 2-5 s run doesn't block startup.
+    // The refresh writes fresh cookies for the *next* session; if today's
+    // cached cookies are still valid (they usually are) we proceed right away.
+    let yt = match build_client(browser_json) {
+        Ok(c) => c,
         Err(e) => {
-            log::error!("YTMusic::authenticated failed: {e:#}");
+            log::error!("build_client failed: {e:#}");
             eprintln!("\nFailed to load session: {e}");
-            reauth()?;
+            reauth(browser_json)?;
             return Ok(());
         }
     };
-    let yt = &yt; // &YTMusic is Send+Sync — all spawn closures share the borrow
 
-    let playlists = match api::get_playlists(yt) {
+    let cookie_refresh = {
+        let path = browser_json.to_owned();
+        std::thread::spawn(move || {
+            if let Err(e) = setup::refresh_cookies(&path) {
+                log::warn!("cookie refresh failed (using cached): {e}");
+            }
+        })
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let playlists = match rt.block_on(api::get_playlists(&yt)) {
         Ok(p) => p,
-        Err(e) if e.downcast_ref::<api::ApiError>().map_or(false, |ae| matches!(ae, api::ApiError::SessionExpired)) => {
-            reauth()?;
+        Err(e)
+            if e.downcast_ref::<api::ApiError>()
+                .map_or(false, |ae| matches!(ae, api::ApiError::SessionExpired)) =>
+        {
+            eprintln!("\nSession expired — re-authenticating.");
+            reauth(browser_json)?;
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -75,26 +93,30 @@ fn main() -> anyhow::Result<()> {
         .map(|pl| pl["playlistId"].as_str().unwrap_or("").to_string())
         .collect();
 
-    // Fetch every playlist's tracks in parallel.
-    // YTMusic is Send+Sync; requests releases the GIL during socket I/O so
-    // threads genuinely overlap their network waits.
-    let all_songs: Vec<Vec<_>> = std::thread::scope(|s| {
+    let yt = Arc::new(yt);
+
+    let all_songs: Vec<Vec<_>> = rt.block_on(async {
         let handles: Vec<_> = pl_ids
             .iter()
             .map(|id| {
-                s.spawn(move || {
-                    api::get_songs(yt, id).unwrap_or_else(|e| {
-                        log::error!("failed to fetch songs for {id}: {e:#}");
-                        Vec::new()
-                    })
-                })
+                let yt = Arc::clone(&yt);
+                let id = id.clone();
+                tokio::spawn(async move { api::get_songs(&yt, &id).await })
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("song-fetch thread panicked"))
-            .collect()
+
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.await.unwrap_or_default());
+        }
+        out
     });
 
-    app::App::new(playlists, all_songs).run()
+    let result = app::App::new(playlists, all_songs).run();
+
+    // Wait for the cookie refresh to finish writing before the process exits,
+    // so browser.json is never left in a partial state.
+    let _ = cookie_refresh.join();
+
+    result
 }

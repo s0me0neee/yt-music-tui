@@ -1,47 +1,153 @@
 use anyhow::{bail, Result};
+use inquire::{Select, Text};
 use std::collections::HashMap;
-use std::io::BufRead;
 use std::process::Stdio;
 
-/// Refresh the `cookie` field in browser.json by extracting live cookies
-/// from Chrome via yt-dlp. Called at every startup so the session never
-/// expires as long as the user is signed in to YouTube Music in Chrome.
-pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
-    let tmp = format!("/tmp/yt-tui-cookies-{}.txt", std::process::id());
+/// Sidecar file that remembers which browser was chosen during yt-dlp setup.
+/// Absent when the user chose the manual cURL-paste method.
+pub const BROWSER_FILE: &str = ".yt-tui-browser";
 
-    // yt-dlp exits non-zero for the unsupported URL but still writes the
-    // cookie file — so we ignore the exit code and check for file content.
-    std::process::Command::new("yt-dlp")
+// ── RAII helpers ──────────────────────────────────────────────────────────────
+
+struct FileGuard(String);
+impl Drop for FileGuard {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
+
+// ── public API ────────────────────────────────────────────────────────────────
+
+pub fn run_setup(browser_json_path: &str) -> Result<()> {
+    let options = vec![
+        "Auto   — extract cookies from browser via yt-dlp  (recommended)",
+        "Manual — paste a cURL command from browser DevTools",
+    ];
+
+    let choice = Select::new("Authentication method:", options)
+        .with_help_message("yt-dlp reads cookies directly from your browser profile")
+        .prompt()?;
+
+    std::fs::remove_file(BROWSER_FILE).ok();
+
+    match choice {
+        c if c.starts_with("Auto") => setup_via_ytdlp(browser_json_path),
+        _                          => setup_via_headers(browser_json_path),
+    }
+}
+
+/// Refresh the `cookie` field in browser.json via yt-dlp.
+/// No-op (returns Ok) when setup was done with the manual cURL method.
+pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
+    let browser = match std::fs::read_to_string(BROWSER_FILE) {
+        Ok(b) => b.trim().to_string(),
+        Err(_) => {
+            log::info!("[setup] no browser file — skipping cookie refresh (manual setup)");
+            return Ok(());
+        }
+    };
+
+    log::info!("[setup] refreshing cookies from {browser} via yt-dlp");
+    let cookie_header = extract_cookies_via_ytdlp(&browser)?;
+
+    let json_str = std::fs::read_to_string(browser_json_path)?;
+    let mut json: serde_json::Value = serde_json::from_str(&json_str)?;
+    json["cookie"] = serde_json::Value::String(cookie_header);
+    std::fs::write(browser_json_path, serde_json::to_string_pretty(&json)?)?;
+    log::info!("[setup] cookies refreshed");
+    Ok(())
+}
+
+// ── setup methods ─────────────────────────────────────────────────────────────
+
+fn setup_via_ytdlp(browser_json_path: &str) -> Result<()> {
+    let browsers = vec![
+        "Chrome", "Firefox", "Edge", "Brave",
+        "Opera",  "Chromium", "Vivaldi", "Safari",
+    ];
+
+    let chosen = Select::new("Browser you are signed in to YouTube Music with:", browsers)
+        .prompt()?;
+
+    let browser = chosen.to_lowercase();
+
+    let cookie_header = extract_cookies_via_ytdlp(&browser)?;
+    let headers = build_default_headers(cookie_header);
+    std::fs::write(browser_json_path, serde_json::to_string_pretty(&headers)?)?;
+    std::fs::write(BROWSER_FILE, &browser)?;
+    Ok(())
+}
+
+fn setup_via_headers(browser_json_path: &str) -> Result<()> {
+    let curl = Text::new("Paste cURL command:")
+        .with_help_message(
+            "music.youtube.com → DevTools (F12) → Network → any request \
+             → right-click → Copy as cURL (bash)",
+        )
+        .prompt()?;
+
+    let headers = parse_curl(curl.trim())?;
+    std::fs::write(browser_json_path, serde_json::to_string_pretty(&headers)?)?;
+    Ok(())
+}
+
+// ── yt-dlp cookie extraction ──────────────────────────────────────────────────
+
+fn extract_cookies_via_ytdlp(browser: &str) -> Result<String> {
+    let tmp = format!("/tmp/yt-tui-cookies-{}.txt", std::process::id());
+    let _guard = FileGuard(tmp.clone());
+
+    let mut child = std::process::Command::new("yt-dlp")
         .args([
-            "--cookies-from-browser", "chrome",
+            "--cookies-from-browser", browser,
             "--cookies", &tmp,
             "--skip-download",
             "https://music.youtube.com/",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .ok(); // ignore spawn / exit errors; we check the output file below
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "yt-dlp failed to start: {e}\n\
+                 Install it with:  pip install yt-dlp  or  brew install yt-dlp"
+            )
+        })?;
 
-    let cookie_content = match std::fs::read_to_string(&tmp) {
-        Ok(c) => { std::fs::remove_file(&tmp).ok(); c }
-        Err(e) => bail!("yt-dlp did not write cookie file: {e}"),
-    };
+    // Always wait() — never leave a zombie.
+    // yt-dlp exits non-zero for this URL but still writes the cookie file.
+    let _ = child.wait();
 
-    // Netscape format: domain \t subdomain_flag \t path \t secure \t expiry \t name \t value
-    let cookie_header: String = cookie_content
+    let content = std::fs::read_to_string(&tmp).map_err(|_| {
+        anyhow::anyhow!(
+            "yt-dlp did not write a cookie file — \
+             make sure you are signed in to YouTube Music in {browser}"
+        )
+    })?;
+
+    let header = parse_netscape_cookies(&content);
+    if header.is_empty() {
+        bail!(
+            "no youtube.com cookies found — \
+             are you signed in to YouTube Music in {browser}?"
+        );
+    }
+    Ok(header)
+}
+
+fn parse_netscape_cookies(content: &str) -> String {
+    content
         .lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
         .filter_map(|l| {
             let mut parts = l.splitn(7, '\t');
-            let domain = parts.next()?;
+            let domain  = parts.next()?;
             let _subdom = parts.next()?;
             let _path   = parts.next()?;
             let _secure = parts.next()?;
             let _expiry = parts.next()?;
             let name    = parts.next()?;
             let value   = parts.next()?;
-            // keep all youtube.com cookies (covers music.youtube.com too)
             if domain.ends_with("youtube.com") {
                 Some(format!("{name}={value}"))
             } else {
@@ -49,51 +155,27 @@ pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
             }
         })
         .collect::<Vec<_>>()
-        .join("; ");
-
-    if cookie_header.is_empty() {
-        bail!("no youtube.com cookies found — is Chrome logged in to YouTube Music?");
-    }
-
-    let json_str = std::fs::read_to_string(browser_json_path)?;
-    let mut json: serde_json::Value = serde_json::from_str(&json_str)?;
-    json["cookie"] = serde_json::Value::String(cookie_header);
-    std::fs::write(browser_json_path, serde_json::to_string_pretty(&json)?)?;
-    log::info!("[setup] refreshed cookies from Chrome");
-    Ok(())
+        .join("; ")
 }
 
-pub fn run_setup(browser_json_path: &str) -> Result<()> {
-    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    if is_tty {
-        eprintln!("No browser.json found.");
-        eprintln!("Open music.youtube.com, open DevTools (F12) → Network,");
-        eprintln!("click any request → right-click → Copy as cURL (bash),");
-        eprintln!("paste below and press Enter:\n");
-    }
-
-    // Read until a line with no trailing backslash (end of the curl command).
-    // Blank lines before content are skipped; a blank line after content also stops.
-    // This means the user just pastes and presses Enter — no Ctrl+D required.
-    let mut lines: Vec<String> = Vec::new();
-    for raw in std::io::stdin().lock().lines() {
-        let line = raw?;
-        let cont = line.trim_end().ends_with('\\');
-        let empty = line.trim().is_empty();
-        if empty {
-            if !lines.is_empty() { break; } // blank line after content = done
-            continue;                        // skip leading blank lines
-        }
-        lines.push(line);
-        if !cont { break; } // non-continuation line = end of curl command
-    }
-    let text = lines.join("\n");
-
-    let headers = parse_curl(&text)?;
-    let json = serde_json::to_string_pretty(&headers)?;
-    std::fs::write(browser_json_path, &json)?;
-    Ok(())
+fn build_default_headers(cookie: String) -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("cookie".into(), cookie);
+    h.insert("x-goog-authuser".into(), "0".into());
+    h.insert("x-origin".into(), "https://music.youtube.com".into());
+    h.insert(
+        "user-agent".into(),
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            .into(),
+    );
+    h.insert("accept".into(), "*/*".into());
+    h.insert("accept-language".into(), "en-US,en;q=0.9".into());
+    h.insert("content-type".into(), "application/json".into());
+    h
 }
+
+// ── cURL header parsing ───────────────────────────────────────────────────────
 
 fn parse_curl(text: &str) -> Result<HashMap<String, String>> {
     let mut headers = HashMap::new();
@@ -119,7 +201,8 @@ fn parse_curl(text: &str) -> Result<HashMap<String, String>> {
         .collect();
     if !missing.is_empty() {
         bail!(
-            "required headers missing: {}\nCopy a request from music.youtube.com while logged in.",
+            "required headers missing: {}\n\
+             Copy a request from music.youtube.com while logged in.",
             missing.join(", ")
         );
     }
@@ -127,7 +210,6 @@ fn parse_curl(text: &str) -> Result<HashMap<String, String>> {
     Ok(headers)
 }
 
-/// Finds all `flag 'value'` occurrences and returns the quoted values.
 fn extract_single_quoted(text: &str, flag: &str) -> Vec<String> {
     let needle = format!("{flag} '");
     let mut results = Vec::new();
