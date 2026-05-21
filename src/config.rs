@@ -47,14 +47,19 @@ pub fn ensure_config_toml() -> Result<()> {
 
 // ── Queue persistence ─────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
-pub struct QueueState {
-    /// Playlist ID the queue belongs to.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QueueEntry {
     pub playlist_id: Option<String>,
-    /// Video IDs in queue playback order.
-    pub video_ids:   Vec<String>,
-    /// Current position within `video_ids`.
-    pub position:    Option<usize>,
+    pub video_id:    String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QueueState {
+    /// Ordered queue entries — each carries its own playlist ID so the queue
+    /// can span multiple playlists.
+    pub entries:  Vec<QueueEntry>,
+    /// Current position within `entries`.
+    pub position: Option<usize>,
 }
 
 pub fn save_queue(state: &QueueState) -> Result<()> {
