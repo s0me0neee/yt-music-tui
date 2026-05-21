@@ -110,6 +110,8 @@ pub struct App {
     playing_pl:     Option<usize>,
     playing_song:   Option<usize>,
     volume:         u8,
+    muted:          bool,
+    pre_mute_vol:   u8,
     mode:           PlayMode,
     throbber_state: ThrobberState,
     // cached totals — computed once, not every frame
@@ -145,6 +147,8 @@ impl App {
             playing_pl:     None,
             playing_song:   None,
             volume:         80,
+            muted:          false,
+            pre_mute_vol:   80,
             mode:           PlayMode::Cycle,
             throbber_state: ThrobberState::default(),
             playlist_total_secs,
@@ -275,10 +279,21 @@ impl App {
                         }
                         KeyCode::Char('p') => self.play_prev(),
                         KeyCode::Char('n') => self.play_next(),
-                        KeyCode::Char('m') => {
+                        KeyCode::Char('t') => {
                             let old = self.mode;
                             self.mode = self.mode.next();
                             self.sync_queue_to_mode(old);
+                        }
+                        KeyCode::Char('m') => {
+                            if self.muted {
+                                self.muted = false;
+                                self.volume = self.pre_mute_vol;
+                            } else {
+                                self.pre_mute_vol = self.volume;
+                                self.muted = true;
+                                self.volume = 0;
+                            }
+                            self.audio.send(AudioCmd::Volume(self.volume));
                         }
                         // ── queue edit ────────────────────────────────────────────
                         KeyCode::Char('a') if self.active_panel == Panel::Songs && !self.show_queue => {
@@ -313,10 +328,12 @@ impl App {
                         KeyCode::Right => self.audio.send(AudioCmd::Seek(5)),
                         // ── volume ────────────────────────────────────────────────
                         KeyCode::Up => {
+                            self.muted = false;
                             self.volume = self.volume.saturating_add(5).min(100);
                             self.audio.send(AudioCmd::Volume(self.volume));
                         }
                         KeyCode::Down => {
+                            self.muted = false;
                             self.volume = self.volume.saturating_sub(5);
                             self.audio.send(AudioCmd::Volume(self.volume));
                         }
@@ -643,9 +660,9 @@ impl App {
                 (Panel::Playlists, _) =>
                     "j/k nav · l/↵ open · q quit",
                 (Panel::Songs, false) =>
-                    "j/k nav · ↵ play · / filter · a +queue · o queue · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode",
+                    "j/k nav · ↵ play · / filter · a +queue · o queue · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mute · t mode",
                 (Panel::Songs, true)  =>
-                    "j/k nav · ↵ play · / filter · d remove · o songs · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mode",
+                    "j/k nav · ↵ play · / filter · d remove · o songs · Space pause · p/n skip · ←/→ seek · ↑/↓ vol · m mute · t mode",
             };
             Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
         };
@@ -1039,7 +1056,8 @@ impl App {
 
         // ── row 3: time (left)  ·  volume + mode (right) ───────────────────
         let time_str   = format!("{elapsed_str} / {total_str}");
-        let extras_str = format!("{}%   {}", self.volume, self.mode.label());
+        let vol_label  = if self.muted { "MUTE".to_string() } else { format!("{}%", self.volume) };
+        let extras_str = format!("{}   {}", vol_label, self.mode.label());
         let w          = extra_area.width as usize;
         let pad        = w.saturating_sub(time_str.chars().count() + extras_str.chars().count());
 
