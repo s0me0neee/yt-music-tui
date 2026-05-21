@@ -150,6 +150,8 @@ pub struct App {
     queue_view_state: ListState,
     notification: Option<(String, Instant)>,
     reauth_requested: bool,
+    // true once do_play fires; false on restore so Space starts rather than pauses
+    playback_started: bool,
     // background song loading
     songs_rx:              std::sync::mpsc::Receiver<(usize, Vec<Value>)>,
     songs_loaded:          Vec<bool>,
@@ -201,6 +203,7 @@ impl App {
             queue_view_state: ListState::default(),
             notification: None,
             reauth_requested: false,
+            playback_started: false,
             songs_rx,
             songs_loaded: vec![false; n],
             pending_queue_restore: saved_queue,
@@ -286,6 +289,32 @@ impl App {
         self.queue_pos = pos;
         self.queue_pl = Some(pl_idx);
         self.queue_view_state.select(pos);
+
+        // Show the track in the player bar and navigate to its playlist,
+        // but don't start audio — playback_started stays false.
+        if let Some(q_pos) = pos {
+            if let Some(&song_idx) = self.queue.get(q_pos) {
+                self.playing_pl = Some(pl_idx);
+                self.playing_song = Some(song_idx);
+                self.playback_started = false;
+
+                // Navigate the playlists panel to this playlist.
+                self.list_state.select(Some(pl_idx));
+
+                // Warm up the CDN URL so the first play is instant.
+                if let Some(vid) = self
+                    .all_songs
+                    .get(pl_idx)
+                    .and_then(|s| s.get(song_idx))
+                    .and_then(|t| t["videoId"].as_str())
+                {
+                    if !vid.is_empty() {
+                        self.audio.send(AudioCmd::Prefetch(vid.to_string()));
+                    }
+                }
+            }
+        }
+
         log::info!(
             "try_restore_queue: pl={pl_idx} len={} pos={:?}",
             self.queue.len(),
@@ -447,17 +476,27 @@ impl App {
                             }
                             // ── playback ──────────────────────────────────────────────
                             KeyCode::Char(' ') => {
-                                if self.playing_song.is_some() {
-                                    let ast =
-                                        self.audio.state.lock().unwrap_or_else(|p| p.into_inner());
-                                    if !ast.loading {
-                                        let paused = ast.paused;
-                                        drop(ast);
-                                        self.audio.send(if paused {
-                                            AudioCmd::Resume
-                                        } else {
-                                            AudioCmd::Pause
-                                        });
+                                if let (Some(pl), Some(song)) =
+                                    (self.playing_pl, self.playing_song)
+                                {
+                                    if !self.playback_started {
+                                        // Restored from saved state — start playback now.
+                                        self.do_play(pl, song);
+                                    } else {
+                                        let ast = self
+                                            .audio
+                                            .state
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        if !ast.loading {
+                                            let paused = ast.paused;
+                                            drop(ast);
+                                            self.audio.send(if paused {
+                                                AudioCmd::Resume
+                                            } else {
+                                                AudioCmd::Pause
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -630,6 +669,7 @@ impl App {
         }
         self.playing_pl = Some(pl_idx);
         self.playing_song = Some(song_idx);
+        self.playback_started = true;
         self.prefetch_next_in_queue();
     }
 
