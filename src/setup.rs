@@ -3,9 +3,7 @@ use inquire::{Select, Text};
 use std::collections::HashMap;
 use std::process::Stdio;
 
-/// Sidecar file that remembers which browser was chosen during yt-dlp setup.
-/// Absent when the user chose the manual cURL-paste method.
-pub const BROWSER_FILE: &str = ".yt-tui-browser";
+fn browser_file() -> std::path::PathBuf { crate::config::browser_file_path() }
 
 // ── RAII helpers ──────────────────────────────────────────────────────────────
 
@@ -28,7 +26,7 @@ pub fn run_setup(browser_json_path: &str) -> Result<()> {
         .with_help_message("yt-dlp reads cookies directly from your browser profile")
         .prompt()?;
 
-    std::fs::remove_file(BROWSER_FILE).ok();
+    std::fs::remove_file(browser_file()).ok();
 
     match choice {
         c if c.starts_with("Auto") => setup_via_ytdlp(browser_json_path),
@@ -39,7 +37,7 @@ pub fn run_setup(browser_json_path: &str) -> Result<()> {
 /// Refresh the `cookie` field in browser.json via yt-dlp.
 /// No-op (returns Ok) when setup was done with the manual cURL method.
 pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
-    let browser = match std::fs::read_to_string(BROWSER_FILE) {
+    let browser = match std::fs::read_to_string(browser_file()) {
         Ok(b) => b.trim().to_string(),
         Err(_) => {
             log::info!("[setup] no browser file — skipping cookie refresh (manual setup)");
@@ -74,7 +72,7 @@ fn setup_via_ytdlp(browser_json_path: &str) -> Result<()> {
     let cookie_header = extract_cookies_via_ytdlp(&browser)?;
     let headers = build_default_headers(cookie_header);
     std::fs::write(browser_json_path, serde_json::to_string_pretty(&headers)?)?;
-    std::fs::write(BROWSER_FILE, &browser)?;
+    std::fs::write(browser_file(), &browser)?;
     Ok(())
 }
 
