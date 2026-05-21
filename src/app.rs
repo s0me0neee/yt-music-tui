@@ -890,13 +890,25 @@ impl App {
     }
 
     /// Append the song at `song_idx` in `pl_idx` to the end of the current queue.
-    /// If no queue exists yet for this playlist, start one.
+    /// If no queue exists yet, start one. Refuses cross-playlist adds so the
+    /// existing queue is never silently replaced — only Enter rebuilds the queue.
     fn append_to_queue(&mut self, pl_idx: usize, song_idx: usize) {
-        if self.queue_pl != Some(pl_idx) {
-            // No queue for this playlist yet — initialise an empty one
-            self.queue_pl = Some(pl_idx);
-            self.queue = Vec::new();
-            self.queue_pos = None;
+        match self.queue_pl {
+            None => {
+                self.queue_pl = Some(pl_idx);
+                self.queue = Vec::new();
+                self.queue_pos = None;
+            }
+            Some(existing) if existing != pl_idx => {
+                let pl_name = self
+                    .playlists
+                    .get(existing)
+                    .and_then(|pl| pl["title"].as_str())
+                    .unwrap_or("another playlist");
+                self.notify(format!("Queue is from \"{pl_name}\" — Enter to start a new queue"));
+                return;
+            }
+            Some(_) => {}
         }
         self.queue.push(song_idx);
         let q_len = self.queue.len();
