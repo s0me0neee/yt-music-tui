@@ -3,9 +3,7 @@
   
   1. (actually tier 1.5) Search — s opens a search bar, results show in the songs panel. Without this you're stuck browsing playlists only. ytmusicapi.search() is already
   wired.
-  2. Help bar — a single footer line showing active keybindings. Right now nothing is discoverable.
-  3. Like / unlike current song — L toggles. rate_song() is already in the API. Most common action while listening.
-  4. Re-auth / session expired notice — right now it silently shows empty playlists. Show a clear error and prompt to re-run the browser auth setup.
+  2. Like / unlike current song — L toggles. rate_song() is already in the API. Most common action while listening.
 
   ---
   Tier 2 — Library navigation

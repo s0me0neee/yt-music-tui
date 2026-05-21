@@ -43,6 +43,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Refresh cookies from Chrome before every session so the stored
+    // browser.json never goes stale — requires the user to be signed in
+    // to YouTube Music in Chrome. Failures are non-fatal.
+    if let Err(e) = setup::refresh_cookies("browser.json") {
+        log::warn!("cookie refresh failed (using cached): {e}");
+    }
+
     let yt = match YTMusic::authenticated("browser.json") {
         Ok(yt) => yt,
         Err(e) => {

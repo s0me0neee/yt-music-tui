@@ -1,6 +1,67 @@
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
+use std::process::Stdio;
+
+/// Refresh the `cookie` field in browser.json by extracting live cookies
+/// from Chrome via yt-dlp. Called at every startup so the session never
+/// expires as long as the user is signed in to YouTube Music in Chrome.
+pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
+    let tmp = format!("/tmp/yt-tui-cookies-{}.txt", std::process::id());
+
+    // yt-dlp exits non-zero for the unsupported URL but still writes the
+    // cookie file — so we ignore the exit code and check for file content.
+    std::process::Command::new("yt-dlp")
+        .args([
+            "--cookies-from-browser", "chrome",
+            "--cookies", &tmp,
+            "--skip-download",
+            "https://music.youtube.com/",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok(); // ignore spawn / exit errors; we check the output file below
+
+    let cookie_content = match std::fs::read_to_string(&tmp) {
+        Ok(c) => { std::fs::remove_file(&tmp).ok(); c }
+        Err(e) => bail!("yt-dlp did not write cookie file: {e}"),
+    };
+
+    // Netscape format: domain \t subdomain_flag \t path \t secure \t expiry \t name \t value
+    let cookie_header: String = cookie_content
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .filter_map(|l| {
+            let mut parts = l.splitn(7, '\t');
+            let domain = parts.next()?;
+            let _subdom = parts.next()?;
+            let _path   = parts.next()?;
+            let _secure = parts.next()?;
+            let _expiry = parts.next()?;
+            let name    = parts.next()?;
+            let value   = parts.next()?;
+            // keep all youtube.com cookies (covers music.youtube.com too)
+            if domain.ends_with("youtube.com") {
+                Some(format!("{name}={value}"))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if cookie_header.is_empty() {
+        bail!("no youtube.com cookies found — is Chrome logged in to YouTube Music?");
+    }
+
+    let json_str = std::fs::read_to_string(browser_json_path)?;
+    let mut json: serde_json::Value = serde_json::from_str(&json_str)?;
+    json["cookie"] = serde_json::Value::String(cookie_header);
+    std::fs::write(browser_json_path, serde_json::to_string_pretty(&json)?)?;
+    log::info!("[setup] refreshed cookies from Chrome");
+    Ok(())
+}
 
 pub fn run_setup(browser_json_path: &str) -> Result<()> {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
