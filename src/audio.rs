@@ -1,6 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+
+#[cfg(unix)]
+type IpcStream = UnixStream;
+#[cfg(windows)]
+type IpcStream = std::fs::File;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -103,6 +109,15 @@ impl Drop for MpvGuard {
 
 // ── URL resolution ────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
+fn ipc_connect(path: &str) -> std::io::Result<IpcStream> {
+    UnixStream::connect(path)
+}
+#[cfg(windows)]
+fn ipc_connect(path: &str) -> std::io::Result<IpcStream> {
+    std::fs::OpenOptions::new().read(true).write(true).open(path)
+}
+
 fn resolve_url(video_id: &str) -> Option<String> {
     // Don't start new yt-dlp work if the app is shutting down.
     if crate::QUIT.load(Ordering::Relaxed) {
@@ -149,8 +164,12 @@ fn lock_state(state: &Mutex<AudioState>) -> std::sync::MutexGuard<'_, AudioState
 }
 
 fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
+    #[cfg(windows)]
+    let which_cmd = "where";
+    #[cfg(not(windows))]
+    let which_cmd = "which";
     for bin in ["mpv", "yt-dlp"] {
-        match Command::new("which").arg(bin).output() {
+        match Command::new(which_cmd).arg(bin).output() {
             Ok(o) if o.status.success() => {
                 log::info!("[audio] {bin} found at {}", String::from_utf8_lossy(&o.stdout).trim());
             }
@@ -162,7 +181,10 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         }
     }
 
+    #[cfg(not(windows))]
     let socket = format!("/tmp/yt-tui-{}.sock", std::process::id());
+    #[cfg(windows)]
+    let socket = format!(r"\\.\pipe\yt-tui-{}", std::process::id());
 
     // ── spawn mpv ────────────────────────────────────────────────────────────
     let mpv_child = match Command::new("mpv")
@@ -203,7 +225,7 @@ fn run(rx: std::sync::mpsc::Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         let mut conn = None;
         for attempt in 0..250 {
             thread::sleep(Duration::from_millis(10));
-            match UnixStream::connect(&socket) {
+            match ipc_connect(&socket) {
                 Ok(s) => {
                     log::info!("[audio] IPC connected after {}ms", (attempt + 1) * 10);
                     conn = Some(s);

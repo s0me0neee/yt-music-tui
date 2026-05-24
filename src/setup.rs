@@ -92,7 +92,10 @@ fn setup_via_headers(browser_json_path: &str) -> Result<()> {
 // ── yt-dlp cookie extraction ──────────────────────────────────────────────────
 
 fn extract_cookies_via_ytdlp(browser: &str) -> Result<String> {
-    let tmp = format!("/tmp/yt-tui-cookies-{}.txt", std::process::id());
+    let tmp = std::env::temp_dir()
+        .join(format!("yt-tui-cookies-{}.txt", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     let _guard = FileGuard(tmp.clone());
 
     let mut child = std::process::Command::new("yt-dlp")
