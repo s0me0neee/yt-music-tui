@@ -1,2 +1,4 @@
 /target
 tokencache.json
+.DS_Store
+.yt-tui-browser
