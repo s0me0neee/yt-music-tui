@@ -71,6 +71,7 @@ impl Drop for AudioEngine {
 
 // ── URL resolution ──────────────────────────────────────────────────────────────
 
+#[hotpath::measure]
 fn resolve_url(video_id: &str) -> Option<String> {
     // Don't start new yt-dlp work if the app is shutting down.
     if crate::QUIT.load(Ordering::Relaxed) {
@@ -109,7 +110,9 @@ fn resolve_url(video_id: &str) -> Option<String> {
 
 fn lock_state(state: &Mutex<AudioState>) -> std::sync::MutexGuard<'_, AudioState> {
     // Recover from a poisoned lock rather than panicking the audio thread.
-    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Set an mpv property, logging (but not propagating) any error.
@@ -161,6 +164,11 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         init.set_property("cache", "yes")?;
         init.set_property("demuxer-readahead-secs", 30i64)?;
         init.set_property("cache-pause-initial", "no")?; // start ASAP, don't pre-fill
+        // Probe only a little before starting — YouTube audio is detected from the
+        // first packets, so this avoids ffmpeg reading megabytes up front. The
+        // LOADING_FAILED retry re-resolves if a stream ever needs more.
+        init.set_property("demuxer-lavf-probesize", 65536i64)?;
+        init.set_property("demuxer-lavf-analyzeduration", 0.1f64)?;
         init.set_property("idle", "yes")?;
         init.set_property("keep-open", "yes")?;
         Ok(())
@@ -367,23 +375,21 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                 Ok(_) => {}
                 // -13 = LOADING_FAILED: the cached URL is bad. Drop it and retry
                 // once via mpv's ytdl_hook so the song still plays.
-                Err(libmpv2::Error::Raw(-13)) => {
-                    match current_id.clone() {
-                        Some(id) if !load_retried => {
-                            log::warn!("[audio] load failed for {id} — retrying via ytdl_hook");
-                            load_retried = true;
-                            url_cache.remove(&id);
-                            load_url(&mpv, &format!("https://music.youtube.com/watch?v={id}"));
-                        }
-                        Some(id) => {
-                            log::error!("[audio] load failed for {id} after retry — giving up");
-                            let mut s = lock_state(&state);
-                            s.loading = false;
-                            s.error = Some("playback failed".into());
-                        }
-                        None => log::warn!("[audio] load failed with no current track"),
+                Err(libmpv2::Error::Raw(-13)) => match current_id.clone() {
+                    Some(id) if !load_retried => {
+                        log::warn!("[audio] load failed for {id} — retrying via ytdl_hook");
+                        load_retried = true;
+                        url_cache.remove(&id);
+                        load_url(&mpv, &format!("https://music.youtube.com/watch?v={id}"));
                     }
-                }
+                    Some(id) => {
+                        log::error!("[audio] load failed for {id} after retry — giving up");
+                        let mut s = lock_state(&state);
+                        s.loading = false;
+                        s.error = Some("playback failed".into());
+                    }
+                    None => log::warn!("[audio] load failed with no current track"),
+                },
                 Err(e) => log::warn!("[audio] mpv event error: {e}"),
             }
         }

@@ -152,8 +152,8 @@ pub struct App {
     // true once do_play fires; false on restore so Space starts rather than pauses
     playback_started: bool,
     // background song loading
-    songs_rx:              std::sync::mpsc::Receiver<(usize, Vec<Value>)>,
-    songs_loaded:          Vec<bool>,
+    songs_rx: std::sync::mpsc::Receiver<(usize, Vec<Value>)>,
+    songs_loaded: Vec<bool>,
     pending_queue_restore: Option<crate::config::QueueState>,
     // filter
     filter: String,
@@ -223,9 +223,10 @@ impl App {
                 *loaded = true;
             }
             // Recompute total duration for this playlist now that songs are known.
-            if let (Some(songs_ref), Some(total_slot)) =
-                (self.all_songs.get(idx), self.playlist_total_secs.get_mut(idx))
-            {
+            if let (Some(songs_ref), Some(total_slot)) = (
+                self.all_songs.get(idx),
+                self.playlist_total_secs.get_mut(idx),
+            ) {
                 *total_slot = songs_ref
                     .iter()
                     .filter_map(|t| t["duration_seconds"].as_u64())
@@ -247,7 +248,9 @@ impl App {
 
         // For each entry, check whether its playlist's songs are loaded.
         for entry in &qs.entries {
-            let Some(ref pl_id) = entry.playlist_id else { continue };
+            let Some(ref pl_id) = entry.playlist_id else {
+                continue;
+            };
             let Some(pl_idx) = self
                 .playlists
                 .iter()
@@ -294,21 +297,23 @@ impl App {
 
         // Show the track in the player bar without starting audio.
         if let Some(q_pos) = pos
-            && let Some(&(pl_idx, song_idx)) = self.queue.get(q_pos) {
-                self.playing_pl = Some(pl_idx);
-                self.playing_song = Some(song_idx);
-                self.playback_started = false;
-                self.list_state.select(Some(pl_idx));
+            && let Some(&(pl_idx, song_idx)) = self.queue.get(q_pos)
+        {
+            self.playing_pl = Some(pl_idx);
+            self.playing_song = Some(song_idx);
+            self.playback_started = false;
+            self.list_state.select(Some(pl_idx));
 
-                if let Some(vid) = self
-                    .all_songs
-                    .get(pl_idx)
-                    .and_then(|s| s.get(song_idx))
-                    .and_then(|t| t["videoId"].as_str())
-                    && !vid.is_empty() {
-                        self.audio.send(AudioCmd::Prefetch(vid.to_string()));
-                    }
+            if let Some(vid) = self
+                .all_songs
+                .get(pl_idx)
+                .and_then(|s| s.get(song_idx))
+                .and_then(|t| t["videoId"].as_str())
+                && !vid.is_empty()
+            {
+                self.audio.send(AudioCmd::Prefetch(vid.to_string()));
             }
+        }
 
         log::info!(
             "try_restore_queue: len={} pos={:?}",
@@ -326,10 +331,7 @@ impl App {
             .queue
             .iter()
             .filter_map(|&(pl_idx, song_idx)| {
-                let video_id = self
-                    .all_songs
-                    .get(pl_idx)?
-                    .get(song_idx)?["videoId"]
+                let video_id = self.all_songs.get(pl_idx)?.get(song_idx)?["videoId"]
                     .as_str()?
                     .to_string();
                 if video_id.is_empty() {
@@ -340,13 +342,19 @@ impl App {
                     .get(pl_idx)
                     .and_then(|pl| pl["playlistId"].as_str())
                     .map(str::to_string);
-                Some(crate::config::QueueEntry { playlist_id, video_id })
+                Some(crate::config::QueueEntry {
+                    playlist_id,
+                    video_id,
+                })
             })
             .collect();
         if entries.is_empty() {
             return None;
         }
-        Some(crate::config::QueueState { entries, position: self.queue_pos })
+        Some(crate::config::QueueState {
+            entries,
+            position: self.queue_pos,
+        })
     }
 
     pub fn run(mut self) -> anyhow::Result<()> {
@@ -359,9 +367,10 @@ impl App {
 
         // Persist queue before anything else so a crash during reauth doesn't lose it.
         if let Some(state) = self.queue_state()
-            && let Err(e) = crate::config::save_queue(&state) {
-                log::warn!("failed to save queue: {e}");
-            }
+            && let Err(e) = crate::config::save_queue(&state)
+        {
+            log::warn!("failed to save queue: {e}");
+        }
 
         result?;
         if self.reauth_requested {
@@ -473,8 +482,7 @@ impl App {
                             }
                             // ── playback ──────────────────────────────────────────────
                             KeyCode::Char(' ') => {
-                                if let (Some(pl), Some(song)) =
-                                    (self.playing_pl, self.playing_song)
+                                if let (Some(pl), Some(song)) = (self.playing_pl, self.playing_song)
                                 {
                                     if self.playback_started {
                                         let ast = self
@@ -728,7 +736,11 @@ impl App {
 
     fn handle_song_end(&mut self) {
         let ended = {
-            let mut ast = self.audio.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut ast = self
+                .audio
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if ast.song_ended {
                 ast.song_ended = false;
                 true
@@ -778,6 +790,7 @@ impl App {
 
     /// Original song indices in `all_songs[pl]` that match the current filter.
     /// Returns all indices when the filter is empty.
+    #[hotpath::measure]
     fn filtered_songs(&self, pl: usize) -> Vec<usize> {
         let songs = self.all_songs.get(pl).map(Vec::as_slice).unwrap_or(&[]);
         if self.filter.is_empty() {
@@ -852,9 +865,10 @@ impl App {
         for display_idx in [base, base + 1] {
             if let Some(&real_idx) = filtered.get(display_idx)
                 && let Some(id) = songs.get(real_idx).and_then(|t| t["videoId"].as_str())
-                    && !id.is_empty() {
-                        self.audio.send(AudioCmd::Prefetch(id.to_string()));
-                    }
+                && !id.is_empty()
+            {
+                self.audio.send(AudioCmd::Prefetch(id.to_string()));
+            }
         }
     }
 
@@ -1074,6 +1088,7 @@ impl App {
 
     // ── layout ────────────────────────────────────────────────────────────────
 
+    #[hotpath::measure]
     fn render(&mut self, frame: &mut Frame) {
         // No vertical spacing — player sits flush below the main panels
         let vertical = Layout::vertical([Constraint::Fill(1), Constraint::Length(6)]);
@@ -1396,7 +1411,9 @@ impl App {
             .is_some_and(|&loaded| !loaded);
         if is_loading {
             let border_style = if self.active_panel == Panel::Songs {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -1585,7 +1602,8 @@ impl App {
         let base_title = {
             let n = self.queue.len();
             let pos_str = self
-                .queue_pos.map_or_else(|| format!("0/{n}"), |p| format!("{}/{n}", p + 1));
+                .queue_pos
+                .map_or_else(|| format!("0/{n}"), |p| format!("{}/{n}", p + 1));
             match self.mode {
                 PlayMode::Shuffle => format!("Queue  [{pos_str}]  ⇌ Shuffle"),
                 PlayMode::Single => format!("Queue  [{pos_str}]  ⊙ Single"),

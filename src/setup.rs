@@ -1,9 +1,12 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use inquire::{Select, Text};
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::time::Duration;
 
-fn browser_file() -> std::path::PathBuf { crate::config::browser_file_path() }
+fn browser_file() -> std::path::PathBuf {
+    crate::config::browser_file_path()
+}
 
 // ── RAII helpers ──────────────────────────────────────────────────────────────
 
@@ -30,17 +33,31 @@ pub fn run_setup(browser_json_path: &str) -> Result<()> {
 
     match choice {
         c if c.starts_with("Auto") => setup_via_ytdlp(browser_json_path),
-        _                          => setup_via_headers(browser_json_path),
+        _ => setup_via_headers(browser_json_path),
     }
 }
 
 /// Refresh the `cookie` field in browser.json via yt-dlp.
 /// No-op (returns Ok) when setup was done with the manual cURL method.
 pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
-    let browser = if let Ok(b) = std::fs::read_to_string(browser_file()) { b.trim().to_string() } else {
+    let browser = if let Ok(b) = std::fs::read_to_string(browser_file()) {
+        b.trim().to_string()
+    } else {
         log::info!("[setup] no browser file — skipping cookie refresh (manual setup)");
         return Ok(());
     };
+
+    // The yt-dlp extraction takes ~15-20s; skip it while the cookies are still
+    // fresh (browser.json's mtime is the last setup/refresh time).
+    const REFRESH_AFTER: Duration = Duration::from_secs(6 * 3600);
+    if let Ok(meta) = std::fs::metadata(browser_json_path)
+        && let Ok(modified) = meta.modified()
+        && let Ok(age) = modified.elapsed()
+        && age < REFRESH_AFTER
+    {
+        log::info!("[setup] cookies {}m old — skipping refresh", age.as_secs() / 60);
+        return Ok(());
+    }
 
     log::info!("[setup] refreshing cookies from {browser} via yt-dlp");
     let cookie_header = extract_cookies_via_ytdlp(&browser)?;
@@ -57,12 +74,11 @@ pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
 
 fn setup_via_ytdlp(browser_json_path: &str) -> Result<()> {
     let browsers = vec![
-        "Chrome", "Firefox", "Edge", "Brave",
-        "Opera",  "Chromium", "Vivaldi", "Safari",
+        "Chrome", "Firefox", "Edge", "Brave", "Opera", "Chromium", "Vivaldi", "Safari",
     ];
 
-    let chosen = Select::new("Browser you are signed in to YouTube Music with:", browsers)
-        .prompt()?;
+    let chosen =
+        Select::new("Browser you are signed in to YouTube Music with:", browsers).prompt()?;
 
     let browser = chosen.to_lowercase();
 
@@ -88,6 +104,7 @@ fn setup_via_headers(browser_json_path: &str) -> Result<()> {
 
 // ── yt-dlp cookie extraction ──────────────────────────────────────────────────
 
+#[hotpath::measure]
 fn extract_cookies_via_ytdlp(browser: &str) -> Result<String> {
     let tmp = std::env::temp_dir()
         .join(format!("yt-tui-cookies-{}.txt", std::process::id()))
@@ -97,8 +114,10 @@ fn extract_cookies_via_ytdlp(browser: &str) -> Result<String> {
 
     let mut child = std::process::Command::new("yt-dlp")
         .args([
-            "--cookies-from-browser", browser,
-            "--cookies", &tmp,
+            "--cookies-from-browser",
+            browser,
+            "--cookies",
+            &tmp,
             "--skip-download",
             "https://music.youtube.com/",
         ])
@@ -139,13 +158,13 @@ fn parse_netscape_cookies(content: &str) -> String {
         .filter(|l| !l.starts_with('#') && !l.is_empty())
         .filter_map(|l| {
             let mut parts = l.splitn(7, '\t');
-            let domain  = parts.next()?;
+            let domain = parts.next()?;
             let _subdom = parts.next()?;
-            let _path   = parts.next()?;
+            let _path = parts.next()?;
             let _secure = parts.next()?;
             let _expiry = parts.next()?;
-            let name    = parts.next()?;
-            let value   = parts.next()?;
+            let name = parts.next()?;
+            let value = parts.next()?;
             if domain.ends_with("youtube.com") {
                 Some(format!("{name}={value}"))
             } else {
@@ -180,7 +199,10 @@ fn parse_curl(text: &str) -> Result<HashMap<String, String>> {
 
     for value in extract_single_quoted(text, "-H") {
         if let Some(colon) = value.find(": ") {
-            headers.insert(value[..colon].to_lowercase(), value[colon + 2..].to_string());
+            headers.insert(
+                value[..colon].to_lowercase(),
+                value[colon + 2..].to_string(),
+            );
         }
     }
 

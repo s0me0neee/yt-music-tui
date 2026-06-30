@@ -27,6 +27,7 @@ fn reauth(browser_json: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[hotpath::main]
 fn main() -> anyhow::Result<()> {
     // Ensure config dir exists before anything else touches it.
     let config_dir = config::ensure_config_dir()?;
@@ -102,8 +103,8 @@ fn main() -> anyhow::Result<()> {
     // immediately rather than waiting for all network calls to complete.
     let (songs_tx, songs_rx) = std::sync::mpsc::channel::<(usize, Vec<serde_json::Value>)>();
     for (idx, id) in pl_ids.into_iter().enumerate() {
-        let yt  = Arc::clone(&yt);
-        let tx  = songs_tx.clone();
+        let yt = Arc::clone(&yt);
+        let tx = songs_tx.clone();
         rt.spawn(async move {
             let songs = api::get_songs(&yt, &id).await;
             let _ = tx.send((idx, songs));
@@ -112,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     drop(songs_tx); // close sender side so the channel ends when all tasks finish
 
     let saved_queue = config::load_queue();
-    let all_songs   = vec![vec![]; playlists.len()];
+    let all_songs = vec![vec![]; playlists.len()];
 
     let result = app::App::new(playlists, all_songs, saved_queue, songs_rx).run();
 
