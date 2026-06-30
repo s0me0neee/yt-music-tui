@@ -476,15 +476,12 @@ impl App {
                                 if let (Some(pl), Some(song)) =
                                     (self.playing_pl, self.playing_song)
                                 {
-                                    if !self.playback_started {
-                                        // Restored from saved state — start playback now.
-                                        self.do_play(pl, song);
-                                    } else {
+                                    if self.playback_started {
                                         let ast = self
                                             .audio
                                             .state
                                             .lock()
-                                            .unwrap_or_else(|p| p.into_inner());
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                                         if !ast.loading {
                                             let paused = ast.paused;
                                             drop(ast);
@@ -494,6 +491,9 @@ impl App {
                                                 AudioCmd::Pause
                                             });
                                         }
+                                    } else {
+                                        // Restored from saved state — start playback now.
+                                        self.do_play(pl, song);
                                     }
                                 }
                             }
@@ -633,7 +633,7 @@ impl App {
     /// current position regardless of order.
     fn build_queue(&mut self, pl_idx: usize, start_song: usize) {
         use rand::seq::SliceRandom;
-        let n = self.all_songs.get(pl_idx).map(Vec::len).unwrap_or(0);
+        let n = self.all_songs.get(pl_idx).map_or(0, Vec::len);
         self.queue = (0..n).map(|i| (pl_idx, i)).collect();
         if matches!(self.mode, PlayMode::Shuffle) {
             self.queue.shuffle(&mut rand::thread_rng());
@@ -660,11 +660,11 @@ impl App {
         };
         let video_id = track["videoId"].as_str().unwrap_or("").to_string();
         log::info!("do_play: pl={pl_idx} song={song_idx} videoId={video_id:?}");
-        if !video_id.is_empty() {
+        if video_id.is_empty() {
+            log::warn!("do_play: videoId missing — no Play sent");
+        } else {
             self.audio.send(AudioCmd::Play(video_id));
             self.audio.send(AudioCmd::Volume(self.volume));
-        } else {
-            log::warn!("do_play: videoId missing — no Play sent");
         }
         self.playing_pl = Some(pl_idx);
         self.playing_song = Some(song_idx);
@@ -728,7 +728,7 @@ impl App {
 
     fn handle_song_end(&mut self) {
         let ended = {
-            let mut ast = self.audio.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut ast = self.audio.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if ast.song_ended {
                 ast.song_ended = false;
                 true
@@ -909,7 +909,7 @@ impl App {
 
     /// Remove the entry at `q_pos` from the queue and fix up `queue_pos`.
     /// If the removed entry was currently playing, immediately switch to whatever
-    /// queue_pos now points at (or stop if the queue became empty).
+    /// `queue_pos` now points at (or stop if the queue became empty).
     fn remove_from_queue(&mut self, q_pos: usize) {
         if q_pos >= self.queue.len() {
             return;
@@ -973,8 +973,7 @@ impl App {
         let show_notif = self
             .notification
             .as_ref()
-            .map(|(_, t)| t.elapsed() < Duration::from_secs(2))
-            .unwrap_or(false);
+            .is_some_and(|(_, t)| t.elapsed() < Duration::from_secs(2));
 
         if !show_notif {
             self.notification = None;
@@ -1160,7 +1159,7 @@ impl App {
             .enumerate()
             .map(|(i, pl)| {
                 let name = pl["title"].as_str().unwrap_or("Untitled");
-                let count = self.all_songs.get(i).map(Vec::len).unwrap_or(0);
+                let count = self.all_songs.get(i).map_or(0, Vec::len);
                 Row::new([
                     Cell::from(Span::styled(
                         name.to_string(),
@@ -1251,7 +1250,7 @@ impl App {
             return 0;
         };
         let total_secs = self.playlist_total_secs.get(i).copied().unwrap_or(0);
-        2 + if total_secs > 0 { 1 } else { 0 }
+        2 + u16::from(total_secs > 0)
     }
 
     fn song_info_rows(&self, width: u16) -> u16 {
@@ -1261,11 +1260,10 @@ impl App {
         let title_rows = text_rows(track["title"].as_str().unwrap_or("Unknown"), width).min(2);
         let has_artists = track["artists"]
             .as_array()
-            .map(|arr| arr.iter().any(|a| a["name"].as_str().is_some()))
-            .unwrap_or(false);
+            .is_some_and(|arr| arr.iter().any(|a| a["name"].as_str().is_some()));
         let has_duration =
             track["duration"].as_str().is_some() || track["duration_seconds"].as_u64().is_some();
-        title_rows + has_artists as u16 + has_duration as u16
+        title_rows + u16::from(has_artists) + u16::from(has_duration)
     }
 
     fn selected_song(&self) -> Option<&Value> {
@@ -1395,8 +1393,7 @@ impl App {
         // Show loading spinner while background fetch is in progress.
         let is_loading = current_pl
             .and_then(|i| self.songs_loaded.get(i))
-            .map(|&loaded| !loaded)
-            .unwrap_or(false);
+            .is_some_and(|&loaded| !loaded);
         if is_loading {
             let border_style = if self.active_panel == Panel::Songs {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -1588,9 +1585,7 @@ impl App {
         let base_title = {
             let n = self.queue.len();
             let pos_str = self
-                .queue_pos
-                .map(|p| format!("{}/{n}", p + 1))
-                .unwrap_or_else(|| format!("0/{n}"));
+                .queue_pos.map_or_else(|| format!("0/{n}"), |p| format!("{}/{n}", p + 1));
             match self.mode {
                 PlayMode::Shuffle => format!("Queue  [{pos_str}]  ⇌ Shuffle"),
                 PlayMode::Single => format!("Queue  [{pos_str}]  ⊙ Single"),
@@ -1636,7 +1631,7 @@ impl App {
             .audio
             .state
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
         let title = if ast.error.is_some() {

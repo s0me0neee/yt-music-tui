@@ -109,7 +109,7 @@ fn resolve_url(video_id: &str) -> Option<String> {
 
 fn lock_state(state: &Mutex<AudioState>) -> std::sync::MutexGuard<'_, AudioState> {
     // Recover from a poisoned lock rather than panicking the audio thread.
-    state.lock().unwrap_or_else(|p| p.into_inner())
+    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Set an mpv property, logging (but not propagating) any error.

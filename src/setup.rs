@@ -37,12 +37,9 @@ pub fn run_setup(browser_json_path: &str) -> Result<()> {
 /// Refresh the `cookie` field in browser.json via yt-dlp.
 /// No-op (returns Ok) when setup was done with the manual cURL method.
 pub fn refresh_cookies(browser_json_path: &str) -> Result<()> {
-    let browser = match std::fs::read_to_string(browser_file()) {
-        Ok(b) => b.trim().to_string(),
-        Err(_) => {
-            log::info!("[setup] no browser file — skipping cookie refresh (manual setup)");
-            return Ok(());
-        }
+    let browser = if let Ok(b) = std::fs::read_to_string(browser_file()) { b.trim().to_string() } else {
+        log::info!("[setup] no browser file — skipping cookie refresh (manual setup)");
+        return Ok(());
     };
 
     log::info!("[setup] refreshing cookies from {browser} via yt-dlp");
