@@ -1683,9 +1683,9 @@ impl App {
                 0.0
             };
             let state_icon = if ast.paused {
-                "⏸"
-            } else if ast.total > 0.0 {
                 "▶"
+            } else if ast.total > 0.0 {
+                "⏸"
             } else {
                 ""
             };

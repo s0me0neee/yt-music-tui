@@ -15,37 +15,41 @@ pub enum Cmd {
     Prefetch(String), // pre-resolve CDN URL before the user presses play
     Pause,
     Resume,
-    Seek(i64),        // relative seconds
-    Volume(u8),       // 0-100
+    Seek(i64),  // relative seconds
+    Volume(u8), // 0-100
     Stop,
 }
 
 #[derive(Clone, Default)]
 pub struct AudioState {
-    pub elapsed:    f64,
-    pub total:      f64,
-    pub paused:     bool,
-    pub loading:    bool,
-    pub error:      Option<String>,
+    pub elapsed: f64,
+    pub total: f64,
+    pub paused: bool,
+    pub loading: bool,
+    pub error: Option<String>,
     pub song_ended: bool, // set on natural eof; caller must reset after reading
 }
 
 pub struct AudioEngine {
-    cmd_tx:       Option<std::sync::mpsc::Sender<Cmd>>,
-    pub state:    Arc<Mutex<AudioState>>,
+    cmd_tx: Option<std::sync::mpsc::Sender<Cmd>>,
+    pub state: Arc<Mutex<AudioState>>,
     audio_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl AudioEngine {
     pub fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        let state    = Arc::new(Mutex::new(AudioState::default()));
-        let state2   = Arc::clone(&state);
+        let state = Arc::new(Mutex::new(AudioState::default()));
+        let state2 = Arc::clone(&state);
         let handle = thread::Builder::new()
             .name("audio".into())
             .spawn(move || run(rx, state2))
             .expect("spawn audio thread");
-        Self { cmd_tx: Some(tx), state, audio_thread: Some(handle) }
+        Self {
+            cmd_tx: Some(tx),
+            state,
+            audio_thread: Some(handle),
+        }
     }
 
     pub fn send(&self, cmd: Cmd) {
@@ -57,11 +61,10 @@ impl AudioEngine {
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
-        // Dropping the sender disconnects the channel; the audio thread detects
-        // Disconnected and drops the embedded mpv (clean teardown, no process).
+        // Dropping the sender ends the audio thread, which drops the embedded mpv.
         drop(self.cmd_tx.take());
         if let Some(h) = self.audio_thread.take() {
-            let _ = h.join(); // returns Err if the thread panicked — ignored intentionally
+            let _ = h.join();
         }
     }
 }
@@ -78,7 +81,8 @@ fn resolve_url(video_id: &str) -> Option<String> {
     log::debug!("[audio] yt-dlp resolving {video_id}");
     let out = Command::new("yt-dlp")
         .args([
-            "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
+            "-f",
+            "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
             "--get-url",
             "--no-playlist",
             &yt_url,
@@ -93,15 +97,18 @@ fn resolve_url(video_id: &str) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8(out.stdout).ok()?;
-    let url    = stdout.trim().lines().next()?.to_string();
-    if url.starts_with("http") { Some(url) } else { None }
+    let url = stdout.trim().lines().next()?.to_string();
+    if url.starts_with("http") {
+        Some(url)
+    } else {
+        None
+    }
 }
 
 // ── audio thread ──────────────────────────────────────────────────────────────
 
 fn lock_state(state: &Mutex<AudioState>) -> std::sync::MutexGuard<'_, AudioState> {
-    // If another thread panicked while holding this lock, recover the inner
-    // value rather than propagating the poison and panicking the audio thread.
+    // Recover from a poisoned lock rather than panicking the audio thread.
     state.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -112,6 +119,14 @@ fn set_prop<V: libmpv2::SetData>(mpv: &Mpv, name: &str, value: V) {
     }
 }
 
+/// Load `url` into mpv (replacing whatever is playing) and unpause.
+fn load_url(mpv: &Mpv, url: &str) {
+    if let Err(e) = mpv.command("loadfile", &[url, "replace"]) {
+        log::warn!("[audio] loadfile failed: {e}");
+    }
+    set_prop(mpv, "pause", false);
+}
+
 fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     #[cfg(windows)]
     let which_cmd = "where";
@@ -119,7 +134,10 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     let which_cmd = "which";
     match Command::new(which_cmd).arg("yt-dlp").output() {
         Ok(o) if o.status.success() => {
-            log::info!("[audio] yt-dlp found at {}", String::from_utf8_lossy(&o.stdout).trim());
+            log::info!(
+                "[audio] yt-dlp found at {}",
+                String::from_utf8_lossy(&o.stdout).trim()
+            );
         }
         _ => {
             let msg = "yt-dlp not found — install with: brew install yt-dlp".to_string();
@@ -128,18 +146,21 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         }
     }
 
-    // ── create embedded mpv ────────────────────────────────────────────────────
-    // ytdl/format/vo options must be set before init, so use with_initializer.
+    // ── create embedded mpv (options must be set before init) ──────────────────
     let mpv = match Mpv::with_initializer(|init| {
         init.set_property("vid", "no")?;
         init.set_property("vo", "null")?;
         init.set_property("ytdl", "yes")?;
-        init.set_property("ytdl-format", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio")?;
+        init.set_property(
+            "ytdl-format",
+            "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
+        )?;
         init.set_property("script-opts", "ytdl_hook-ytdl_path=yt-dlp")?;
         init.set_property("gapless-audio", "yes")?;
         init.set_property("audio-display", "no")?;
         init.set_property("cache", "yes")?;
         init.set_property("demuxer-readahead-secs", 30i64)?;
+        init.set_property("cache-pause-initial", "no")?; // start ASAP, don't pre-fill
         init.set_property("idle", "yes")?;
         init.set_property("keep-open", "yes")?;
         Ok(())
@@ -167,11 +188,15 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
 
     // ── background URL resolution ─────────────────────────────────────────────
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
-    let mut url_cache:       HashMap<String, String> = HashMap::new();
-    let mut fetching:        HashSet<String>          = HashSet::new();
-    let mut pending_resolve: Option<String>           = None;
+    let mut url_cache: HashMap<String, String> = HashMap::new();
+    let mut fetching: HashSet<String> = HashSet::new();
+    let mut pending_resolve: Option<String> = None;
+    // Track of the song mpv is loading, so a load failure can be retried once.
+    let mut current_id: Option<String> = None;
+    let mut load_retried = false;
 
-    const MAX_PREFETCH: usize = 2;
+    // Max concurrent yt-dlp resolves (play-resolve + prefetches share `fetching`).
+    const MAX_PREFETCH: usize = 3;
 
     // ── main loop ─────────────────────────────────────────────────────────────
     loop {
@@ -185,22 +210,23 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
             fetching.remove(&id);
             match maybe_url {
                 Some(url) => {
+                    // If the user is waiting on this song, load it now.
                     if pending_resolve.as_deref() == Some(id.as_str()) {
-                        if lock_state(&state).loading {
-                            log::info!("[audio] upgrading in-flight play to direct URL for {id}");
-                            if let Err(e) = mpv.command("loadfile", &[url.as_str(), "replace"]) {
-                                log::warn!("[audio] loadfile upgrade failed: {e}");
-                            }
-                        }
+                        log::info!("[audio] loading resolved CDN URL for {id}");
+                        load_url(&mpv, &url);
                         pending_resolve = None;
                     }
                     log::info!("[audio] cached CDN URL for {id}");
                     url_cache.insert(id, url);
                 }
                 None => {
-                    log::warn!("[audio] resolve failed for {id} — mpv will use its own yt-dlp");
                     if pending_resolve.as_deref() == Some(id.as_str()) {
+                        // Fall back to mpv's own ytdl_hook so playback still works.
+                        log::warn!("[audio] resolve failed for {id} — falling back to ytdl_hook");
+                        load_url(&mpv, &format!("https://music.youtube.com/watch?v={id}"));
                         pending_resolve = None;
+                    } else {
+                        log::warn!("[audio] prefetch resolve failed for {id}");
                     }
                 }
             }
@@ -219,52 +245,67 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                 Ok(cmd) => match cmd {
                     Cmd::Play(id) => {
                         pending_resolve = None;
+                        current_id = Some(id.clone());
+                        load_retried = false;
+                        {
+                            let mut s = lock_state(&state);
+                            s.loading = true;
+                            s.paused = false;
+                            s.elapsed = 0.0;
+                            s.total = 0.0;
+                            s.error = None;
+                            s.song_ended = false;
+                        }
 
-                        let url = if let Some(cached) = url_cache.get(&id) {
+                        if let Some(cached) = url_cache.get(&id).cloned() {
                             log::info!("[audio] Play {id}: cache HIT — instant CDN URL");
-                            cached.clone()
+                            load_url(&mpv, &cached);
                         } else {
+                            // Cache miss: resolve ourselves and load when it lands.
+                            // Don't hand mpv the watch URL — that spawns a second,
+                            // competing yt-dlp via its ytdl_hook.
+                            log::info!("[audio] Play {id}: cache miss — resolving (single yt-dlp)");
+                            pending_resolve = Some(id.clone());
                             if !fetching.contains(&id) {
                                 fetching.insert(id.clone());
-                                pending_resolve = Some(id.clone());
-                                let tx  = fetch_tx.clone();
+                                let tx = fetch_tx.clone();
                                 let id2 = id.clone();
                                 thread::Builder::new()
                                     .name(format!("resolve-{id2}"))
-                                    .spawn(move || { let _ = tx.send((id2.clone(), resolve_url(&id2))); })
+                                    .spawn(move || {
+                                        let _ = tx.send((id2.clone(), resolve_url(&id2)));
+                                    })
                                     .ok();
                             }
-                            log::info!("[audio] Play {id}: cache miss — YouTube URL (resolving in background)");
-                            format!("https://music.youtube.com/watch?v={id}")
-                        };
-
-                        if let Err(e) = mpv.command("loadfile", &[url.as_str(), "replace"]) {
-                            log::warn!("[audio] loadfile failed: {e}");
                         }
-                        set_prop(&mpv, "pause", false);
-                        let mut s = lock_state(&state);
-                        s.loading    = true;
-                        s.paused     = false;
-                        s.elapsed    = 0.0;
-                        s.total      = 0.0;
-                        s.error      = None;
-                        s.song_ended = false;
                     }
 
                     Cmd::Prefetch(id) => {
-                        if url_cache.contains_key(&id) || fetching.contains(&id) { continue; }
-                        if fetching.len() >= MAX_PREFETCH { continue; }
+                        if url_cache.contains_key(&id) || fetching.contains(&id) {
+                            continue;
+                        }
+                        if fetching.len() >= MAX_PREFETCH {
+                            continue;
+                        }
                         fetching.insert(id.clone());
-                        let tx  = fetch_tx.clone();
+                        let tx = fetch_tx.clone();
                         let id2 = id.clone();
                         thread::Builder::new()
                             .name(format!("prefetch-{id2}"))
-                            .spawn(move || { let _ = tx.send((id2.clone(), resolve_url(&id2))); })
+                            .spawn(move || {
+                                let _ = tx.send((id2.clone(), resolve_url(&id2)));
+                            })
                             .ok();
                     }
 
-                    Cmd::Pause   => { log::debug!("[audio] Pause");       set_prop(&mpv, "pause", true); }
-                    Cmd::Resume  => { log::debug!("[audio] Resume");      set_prop(&mpv, "pause", false); }
+                    Cmd::Pause => {
+                        log::debug!("[audio] Pause");
+                        set_prop(&mpv, "pause", true);
+                    }
+                    Cmd::Resume => {
+                        log::debug!("[audio] Resume");
+                        set_prop(&mpv, "pause", false);
+                    }
                     Cmd::Seek(d) => {
                         log::debug!("[audio] Seek {d:+}s");
                         let ds = d.to_string();
@@ -272,9 +313,14 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                             log::warn!("[audio] seek failed: {e}");
                         }
                     }
-                    Cmd::Volume(v) => { log::debug!("[audio] Volume {v}"); set_prop(&mpv, "volume", i64::from(v)); }
-                    Cmd::Stop    => {
+                    Cmd::Volume(v) => {
+                        log::debug!("[audio] Volume {v}");
+                        set_prop(&mpv, "volume", i64::from(v));
+                    }
+                    Cmd::Stop => {
                         log::debug!("[audio] Stop");
+                        pending_resolve = None; // don't auto-play a late resolve
+                        current_id = None;
                         if let Err(e) = mpv.command("stop", &[]) {
                             log::warn!("[audio] stop failed: {e}");
                         }
@@ -293,10 +339,10 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                     let mut s = lock_state(&state);
                     match (name, change) {
                         ("time-pos", PropertyData::Double(v)) => s.elapsed = v,
-                        ("pause", PropertyData::Flag(b))       => s.paused = b,
+                        ("pause", PropertyData::Flag(b)) => s.paused = b,
                         ("duration", PropertyData::Double(v)) => {
                             log::info!("[audio] duration: {v:.1}s");
-                            s.total   = v;
+                            s.total = v;
                             s.loading = false;
                             pending_resolve = None;
                         }
@@ -319,6 +365,25 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                 }
                 Ok(Event::FileLoaded) => log::info!("[audio] file-loaded"),
                 Ok(_) => {}
+                // -13 = LOADING_FAILED: the cached URL is bad. Drop it and retry
+                // once via mpv's ytdl_hook so the song still plays.
+                Err(libmpv2::Error::Raw(-13)) => {
+                    match current_id.clone() {
+                        Some(id) if !load_retried => {
+                            log::warn!("[audio] load failed for {id} — retrying via ytdl_hook");
+                            load_retried = true;
+                            url_cache.remove(&id);
+                            load_url(&mpv, &format!("https://music.youtube.com/watch?v={id}"));
+                        }
+                        Some(id) => {
+                            log::error!("[audio] load failed for {id} after retry — giving up");
+                            let mut s = lock_state(&state);
+                            s.loading = false;
+                            s.error = Some("playback failed".into());
+                        }
+                        None => log::warn!("[audio] load failed with no current track"),
+                    }
+                }
                 Err(e) => log::warn!("[audio] mpv event error: {e}"),
             }
         }

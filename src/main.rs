@@ -3,7 +3,6 @@ mod app;
 mod audio;
 mod config;
 mod setup;
-mod ytm;
 
 use simplelog::{Config, LevelFilter, WriteLogger};
 use std::fs::File;
