@@ -27,7 +27,7 @@ fn text_rows(text: &str, width: u16) -> u16 {
     text.lines()
         .map(|line| {
             let len = line.chars().count();
-            if len == 0 { 1 } else { (len + w - 1) / w }
+            if len == 0 { 1 } else { len.div_ceil(w) }
         })
         .sum::<usize>()
         .max(1) as u16
@@ -293,8 +293,8 @@ impl App {
         self.queue_view_state.select(pos);
 
         // Show the track in the player bar without starting audio.
-        if let Some(q_pos) = pos {
-            if let Some(&(pl_idx, song_idx)) = self.queue.get(q_pos) {
+        if let Some(q_pos) = pos
+            && let Some(&(pl_idx, song_idx)) = self.queue.get(q_pos) {
                 self.playing_pl = Some(pl_idx);
                 self.playing_song = Some(song_idx);
                 self.playback_started = false;
@@ -305,13 +305,10 @@ impl App {
                     .get(pl_idx)
                     .and_then(|s| s.get(song_idx))
                     .and_then(|t| t["videoId"].as_str())
-                {
-                    if !vid.is_empty() {
+                    && !vid.is_empty() {
                         self.audio.send(AudioCmd::Prefetch(vid.to_string()));
                     }
-                }
             }
-        }
 
         log::info!(
             "try_restore_queue: len={} pos={:?}",
@@ -361,11 +358,10 @@ impl App {
         ratatui::restore();
 
         // Persist queue before anything else so a crash during reauth doesn't lose it.
-        if let Some(state) = self.queue_state() {
-            if let Err(e) = crate::config::save_queue(&state) {
+        if let Some(state) = self.queue_state()
+            && let Err(e) = crate::config::save_queue(&state) {
                 log::warn!("failed to save queue: {e}");
             }
-        }
 
         result?;
         if self.reauth_requested {
@@ -854,13 +850,11 @@ impl App {
         let filtered = self.filtered_songs(pl);
         let base = self.songs_state.selected().unwrap_or(0);
         for display_idx in [base, base + 1] {
-            if let Some(&real_idx) = filtered.get(display_idx) {
-                if let Some(id) = songs.get(real_idx).and_then(|t| t["videoId"].as_str()) {
-                    if !id.is_empty() {
+            if let Some(&real_idx) = filtered.get(display_idx)
+                && let Some(id) = songs.get(real_idx).and_then(|t| t["videoId"].as_str())
+                    && !id.is_empty() {
                         self.audio.send(AudioCmd::Prefetch(id.to_string()));
                     }
-                }
-            }
         }
     }
 

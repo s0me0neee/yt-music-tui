@@ -82,7 +82,7 @@ fn main() -> anyhow::Result<()> {
         Ok(p) => p,
         Err(e)
             if e.downcast_ref::<api::ApiError>()
-                .map_or(false, |ae| matches!(ae, api::ApiError::SessionExpired)) =>
+                .is_some_and(|ae| matches!(ae, api::ApiError::SessionExpired)) =>
         {
             eprintln!("\nSession expired — re-authenticating.");
             reauth(&browser_json_str)?;
