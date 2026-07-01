@@ -1,69 +1,133 @@
 ---
-  Tier 1 — Core usability (gaps that hurt daily use)
-  
-  1. (actually tier 1.5) Search — s opens a search bar, results show in the songs panel. Without this you're stuck browsing playlists only. ytmusicapi.search() is already
-  wired.
-  2. Like / unlike current song — L toggles. rate_song() is already in the API. Most common action while listening.
+# yt-music-tui — feature plan
+Last updated: 2026-07-01
 
-  ---
-  Tier 2 — Library navigation
-  
-  1. Library views — get_liked_songs(), get_history(), get_library_albums() already exist. A tab bar (or 1/2/3 keys) to switch between Playlists / Liked
-   / History / Albums.
-  2. Album drill-down — press Enter on an album to see its tracks. get_album() returns them.
-  3. Radio / "Up next" — r starts a radio from the current song using get_watch_playlist(video_id=...). Fills the queue automatically.
+Legend: ✅ done  🔄 in progress  ❌ not started
 
-  ---
-  Tier 3 — Polish
+---
 
-  1. Persistent queue — write queue to a JSON file on exit, restore on startup. Survives crashes.
-  2. Lyrics panel — y fetches lyrics via get_lyrics() and shows them in the right panel, scrollable. Very popular in terminal players.
-  3. Config file — ~/.config/yt-tui/config.toml: default volume, keybindings, auth path. Avoids hardcoded values.
+## Completed
 
-  ---
-  Tier 4 — Playback power features
+- ✅ libmpv2 embedding — no longer spawning the mpv binary, lower latency, cleaner cleanup
+- ✅ Persistent queue — queue.json written on exit, restored on startup (without auto-play)
+- ✅ Prefetch / hot CDN URL — j/k navigation fires `Cmd::Prefetch`; concurrent resolution capped at 2
+- ✅ Cookie-refresh gating — yt-dlp cookie extraction skipped when cookies are fresh enough
+- ✅ Mouse support — scroll wheel maps to j/k, click selects panels
+- ✅ Config dir — `~/.config/yt-music-tui/` with `config.toml` stub, `queue.json`, `browser.json`
+- ✅ Cross-playlist queue — queue entries track (playlist_idx, song_idx) pairs
+- ✅ Hotpath profiling — `#[hotpath::measure]` on `resolve_url`, gated behind `--features hotpath`
 
-  1. Download / offline cache — D on a song runs yt-dlp -x --audio-format opus -o
-     ~/.cache/yt-tui/%(id)s.%(ext)s. On Cmd::Play, check cache first before resolving URL —
-     instant start, works offline. Show ↓ indicator next to cached songs in the list.
-     Progress shown in notification bar during download.
+---
 
-  2. Crossfade — buffer next song early via mpv audio-device switching or a second mpv
-     instance. C key cycles 0 / 2s / 5s crossfade. Requires coordinating two mpv instances
-     or using mpv's --blend-subtitles / lavfi crossfade filter. Store in config.
+## In progress
 
-  3. Speed control — [ / ] adjusts playback rate 0.5×–2× via mpv set_property speed.
-     Display current speed in the player bar extra row (replaces or alongside volume).
+🔄 **rustypipe URL resolution** (current branch: `rustypipe`)
+- Goal: replace the `yt-dlp --get-url` subprocess in `resolve_url()` with the rustypipe crate
+- Why: removes the yt-dlp runtime dependency for stream resolution; faster, no subprocess overhead
+- Files: `src/audio.rs:75` (`resolve_url`), `rustypipe_cache.json`, `rustypipe_reports/`
+- Blocking issue to resolve: rustypipe crate is not yet in `Cargo.toml`; verify API stability before pinning
 
-  4. Local history — every do_play() appends {video_id, title, artist, timestamp} to
-     ~/.local/share/yt-tui/history.json (capped at 1000 entries, deduplicated by recency).
-     Shown as a tab (key 4) alongside Playlists/Liked/Albums. No API call needed.
+---
 
-  5. Mouse support — ratatui has MouseEvent support. Enable with
-     crossterm::event::EnableMouseCapture. Click playlist to select, click song to play,
-     scroll wheel for j/k, click player bar to seek to position. Low cost since all state
-     is already index-driven.
+## Tier 1 — Core usability
 
-  ---
-  Tier 5 — Auth improvements
+❌ **Search** (`s` key)
+- Open a search bar at the bottom; results populate the songs panel
+- `ytmusicapi::search()` is already available on the `YtMusic` client
+- Need a new `View::Search` variant in `App`; run search in a background thread to avoid blocking the TUI
 
-  Context: ytmusicapi OAuth is broken upstream. Cookie/header auth (browser.json) works but expires ~1yr
-  and requires a manual DevTools cURL copy-paste. Goal: eliminate that friction.
+❌ **Like / unlike current song** (`L` key)
+- `rate_song(video_id, "LIKE" | "INDIFFERENT")` is in the ytmusicapi crate
+- Show a heart indicator in the player bar next to the title
+- Need to track `liked: bool` on the currently playing song
 
-  1. Chrome CDP auto-auth — spawn the user's existing Chrome with --remote-debugging-port, user logs in
-     normally (real browser, no bot detection), we intercept the first music.youtube.com/youtubei/ request
-     via CDP WebSocket to extract cookies + headers, write browser.json, kill Chrome. Zero manual steps.
-     New deps: ureq = "2" (sync HTTP for /json/version poll), tungstenite = "0.24" (CDP WebSocket).
-     Falls back to existing cURL flow if Chrome not found.
-     Flow in src/setup.rs:
-       find_chrome() → spawn Chrome → poll /json/version → connect WebSocket →
-       Network.enable → navigate music.youtube.com → await requestWillBeSent on youtubei/ →
-       Network.getAllCookies → merge headers + cookie string → write browser.json → kill Chrome
-     Edge cases: port 9222 in use (use port=0, parse actual port), 60s timeout, missing x-goog-authuser
-     (default "0"), Chrome crash (wait() + fall back to manual).
+---
 
-  2. Session expiry warning — on startup, parse cookie expiry dates from browser.json and warn
-     "session expires in N days" in the help bar before it goes stale.
+## Tier 2 — Library navigation
 
-  3. Upstream OAuth — if/when ytmusicapi fixes OAuth, switch to yup_oauth2 (already scaffolded in
-     src/auth.rs with tokencache.json). Gives automatic silent token refresh with no user action.
+❌ **Library views** (keys `1`/`2`/`3`/`4` or a tab bar)
+- Tab 1: Playlists (current default)
+- Tab 2: Liked Songs — `get_liked_songs()`
+- Tab 3: History — `get_history()`
+- Tab 4: Albums — `get_library_albums()`
+- Add a `LibraryTab` enum; render a tab header row at the top of the playlist panel
+
+❌ **Album drill-down**
+- Press `Enter` on an album entry to load tracks via `get_album(browse_id)`
+- Push a new songs view; `Backspace` pops back to the album list
+
+❌ **Radio / "Up next"** (`r` key)
+- `get_watch_playlist(video_id=current)` returns a "Up next" list
+- Append results to the queue automatically
+- Show "Radio seeded from <title>" in the notification bar
+
+---
+
+## Tier 3 — Polish
+
+❌ **Lyrics panel** (`y` key)
+- Toggle a right-side panel that shows lyrics fetched via `get_lyrics(browse_id)`
+- Scrollable with `j`/`k`; `y` again closes it
+- `browse_id` is returned alongside song metadata — cache per video_id to avoid repeated fetches
+
+❌ **Config file** (`~/.config/yt-music-tui/config.toml`)
+- The file is created but not read yet
+- Values to support: `default_volume`, `keybindings` (map), `browser` (chrome/firefox/brave), `auth_path`
+- Parse with `toml` crate on startup; merge over hardcoded defaults
+
+❌ **Session expiry warning**
+- On startup, parse the `expires` fields in `browser.json` cookies
+- If any cookie expires within 7 days, show a warning in the help bar: "session expires in N days"
+
+---
+
+## Tier 4 — Playback power features
+
+❌ **Speed control** (`[` / `]` keys)
+- Adjust `speed` property on the libmpv2 handle: 0.5× → 0.75× → 1.0× → 1.25× → 1.5× → 2.0×
+- Display current speed in the player bar (only when ≠ 1.0× to avoid clutter)
+- Persist speed setting across sessions in `config.toml`
+
+❌ **Local playback history** (automatic, no key)
+- On every `do_play()`, append `{video_id, title, artist, timestamp}` to
+  `~/.local/share/yt-music-tui/history.json`
+- Cap at 1000 entries; deduplicate by recency (most-recent occurrence wins)
+- Show as Library tab 3 or 4; no API call needed, instant load
+
+❌ **Download / offline cache** (`D` key)
+- Run `yt-dlp -x --audio-format opus -o ~/.cache/yt-music-tui/<id>.opus`
+- Check cache in `resolve_url()` before calling yt-dlp or rustypipe
+- Show ↓ indicator next to cached songs in the list
+- Progress shown in the notification bar during download (background thread)
+
+❌ **Crossfade** (`C` key cycles: off → 2s → 5s)
+- Pre-load next song in a second libmpv2 instance; fade volume of the first out
+- Store crossfade duration in `config.toml`
+- Complex: requires careful state management for two mpv handles; implement after speed control
+
+---
+
+## Tier 5 — Auth improvements
+
+❌ **Chrome CDP auto-auth** (fallback in `src/setup.rs`)
+- Spawn Chrome with `--remote-debugging-port=9222`, navigate to `music.youtube.com`
+- Connect to CDP WebSocket, enable `Network`, intercept first `youtubei/` request
+- Extract cookies + headers, write `browser.json`, kill Chrome
+- Zero manual steps; fall back to existing yt-dlp / cURL flow if Chrome not found
+- New deps: `ureq = "2"` (HTTP poll of `/json/version`), `tungstenite = "0.24"` (CDP WebSocket)
+- Edge cases: port 9222 in use, 60s timeout, Chrome crash
+
+❌ **Upstream OAuth**
+- `src/auth.rs` already scaffolds `yup_oauth2` with `tokencache.json`
+- Wire up once `ytmusicapi` upstream fixes their OAuth flow
+- Gives automatic silent token refresh with no user action
+
+---
+
+## Backlog / nice-to-have
+
+- Playlist management from the TUI (create playlist, add/remove songs)
+- macOS/Linux native notifications on track change (`notify-rust` crate)
+- Visualizer bar in the player area (requires PCM data from mpv's audio output)
+- Vim-style `gg`/`G` jump-to-top/bottom in any list
+- `?` opens a keybinding help overlay
