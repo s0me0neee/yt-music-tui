@@ -488,6 +488,15 @@ impl TrackLyrics {
         }
     }
 
+    /// How many lines of lyrics this record carries, timed or not.
+    pub fn line_count(&self) -> usize {
+        match &self.kind {
+            LyricsKind::Synced(lines) => lines.len(),
+            LyricsKind::Plain(lines) => lines.len(),
+            LyricsKind::Instrumental => 0,
+        }
+    }
+
     pub fn synced_lines(&self) -> Option<&[LyricLine]> {
         match &self.kind {
             LyricsKind::Synced(lines) => Some(lines),
@@ -643,6 +652,7 @@ pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
     // precise query fail, so it would never compare equal.
     let title = strip_title_noise(&q.title).to_lowercase();
     let artist = primary_artist(&q.artist).to_lowercase();
+    let typical = typical_line_count(&items, q.duration);
 
     // Stable, so equal keys preserve LRCLIB's relevance ordering.
     items.sort_by(|a, b| {
@@ -651,29 +661,126 @@ pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
                 // Synced first — an unsynced match is a worse experience than a
                 // slightly mistimed synced one.
                 !c.is_synced(),
+                // Then whether the record is even this artist's. Above length
+                // because a record for a *different song of the same name* can
+                // match the duration exactly, and several did: a track called
+                // "Ride It" by another artist beat the right one by 0.2s, and
+                // "Do Better" matched a K-pop group over Feint.
+                !credits_artist(&c.artist_name.to_lowercase(), &artist),
+                // Then whether it looks like a fragment of the song rather than
+                // the song. Above length for the same reason: a stub can carry
+                // a perfect duration and half the words.
+                is_stub(c, q.duration, typical),
                 // Then closest length. Rounded to the second so a 0.4s
-                // difference doesn't outweigh an artist match. Records with no
+                // difference doesn't outweigh a title match. Records with no
                 // duration sort last rather than being treated as a perfect
                 // match, which is what `unwrap_or(0.0)` used to do.
                 c.duration_delta(q.duration)
                     .map_or(f64::INFINITY, |d| d.round()),
-                !c.artist_name.to_lowercase().contains(&artist),
                 !c.track_name.to_lowercase().eq(&title),
                 // Last word goes to lrclib's own relevance ranking.
                 c.relevance,
             )
         };
-        let (a_sync, a_delta, a_art, a_tit, a_rel) = key(a);
-        let (b_sync, b_delta, b_art, b_tit, b_rel) = key(b);
+        let (a_sync, a_art, a_stub, a_delta, a_tit, a_rel) = key(a);
+        let (b_sync, b_art, b_stub, b_delta, b_tit, b_rel) = key(b);
         a_sync
             .cmp(&b_sync)
-            .then(a_delta.total_cmp(&b_delta))
             .then(a_art.cmp(&b_art))
+            .then(a_stub.cmp(&b_stub))
+            .then(a_delta.total_cmp(&b_delta))
             .then(a_tit.cmp(&b_tit))
             .then(a_rel.cmp(&b_rel))
     });
 
     items
+}
+
+/// A record carrying fewer than this share of the typical line count is a
+/// fragment — a first verse, a chorus, an abandoned transcription.
+///
+/// Deliberately well below half. lrclib records of the same song vary a lot in
+/// how they treat repeats and backing vocals, and the gaps that matter are not
+/// subtle: the records corrected by hand ran 1.8x to 2.6x the length of what
+/// was picked automatically.
+const STUB_LINE_RATIO: f64 = 0.6;
+
+/// Whether `c` is close enough in length to be a transcription of this exact
+/// recording, and so a fair yardstick for how long its lyrics should be.
+///
+/// The ladder's broad rungs deliberately return records for *other songs that
+/// share a title*, and their line counts say nothing about this one. Measured
+/// against the whole pool the rule below actively misfires: for a cover of
+/// `GURU` the pool held four unrelated songs of that name and the median came
+/// out at 54 lines, making the correct 24-line record look like a fragment.
+fn is_peer(c: &TrackLyrics, want: Option<f64>) -> bool {
+    !matches!(c.kind, LyricsKind::Instrumental)
+        && c.duration_delta(want)
+            .is_some_and(|d| d <= SYNC_DURATION_DELTA)
+}
+
+/// The line count a complete record of this song has, judged from the peers.
+/// `None` when there are too few to tell an outlier from an ordinary spread.
+///
+/// Counted once per *distinct* set of lyrics: two thirds of what lrclib returns
+/// for a popular track is the same record re-uploaded, so counting every copy
+/// would let a fragment uploaded a dozen times set the standard it is measured
+/// against.
+fn typical_line_count(items: &[TrackLyrics], want: Option<f64>) -> Option<usize> {
+    let mut seen = HashSet::new();
+    let mut counts: Vec<usize> = items
+        .iter()
+        .filter(|c| is_peer(c, want))
+        .filter(|c| seen.insert(c.content_fingerprint()))
+        .map(TrackLyrics::line_count)
+        .collect();
+
+    if counts.len() < 3 {
+        return None;
+    }
+    counts.sort_unstable();
+    Some(counts[counts.len() / 2])
+}
+
+/// Whether `c` holds markedly less of the song than its peers do.
+fn is_stub(c: &TrackLyrics, want: Option<f64>, typical: Option<usize>) -> bool {
+    match typical {
+        Some(typical) if is_peer(c, want) => {
+            (c.line_count() as f64) < STUB_LINE_RATIO * typical as f64
+        }
+        _ => false,
+    }
+}
+
+/// Whether a record credits `artist`, which is already lowercased and reduced
+/// by [`primary_artist`].
+///
+/// Bounded on both sides so `Ado` doesn't match `Adore`, and so a promoted
+/// artist key can't be won by an accident of spelling. Only ASCII letters and
+/// digits count as continuing a word: Japanese credits run names straight into
+/// punctuation and each other, and demanding a break there would match nothing.
+fn credits_artist(record_lower: &str, artist: &str) -> bool {
+    if artist.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(rel) = record_lower[from..].find(artist) {
+        let at = from + rel;
+        let end = at + artist.len();
+        let before_ok = record_lower[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        let after_ok = record_lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// Drops every record whose lyrics duplicate one already in the list.
@@ -1607,6 +1714,148 @@ mod tests {
             MAX_RETRIES as i32 + 1,
             "a server that stays down must not be hammered"
         );
+    }
+
+    /// A synced record with `n` distinct lines, so copies don't collide.
+    fn with_lines(id: u64, duration: f64, n: usize) -> TrackLyrics {
+        let lines: Vec<(f64, String)> = (0..n).map(|i| (i as f64, format!("line {i}"))).collect();
+        timed(
+            id,
+            duration,
+            &lines
+                .iter()
+                .map(|(at, t)| (*at, t.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn by(id: u64, duration: f64, artist: &str) -> TrackLyrics {
+        TrackLyrics {
+            artist_name: artist.into(),
+            ..rec(id, duration, true)
+        }
+    }
+
+    #[test]
+    fn the_right_artist_beats_the_closer_duration() {
+        // Both reported: a different "Ride It" matched the length exactly and
+        // won, and "Do Better" matched a K-pop group over Feint. A record for
+        // another artist's song is not a better match for being the right
+        // number of seconds long.
+        let out = rank(
+            vec![by(1, 245.0, "Somebody Else"), by(2, 246.0, "Crusher-P")],
+            &q(Some(245.0)),
+        );
+        assert_eq!(ids(&out), [2, 1]);
+    }
+
+    #[test]
+    fn artist_matching_does_not_fire_on_a_substring() {
+        assert!(credits_artist("crusher-p", "crusher-p"));
+        assert!(credits_artist(
+            "larissa lambert, jay sean",
+            "larissa lambert"
+        ));
+        assert!(credits_artist("feint & laura brehm", "feint"));
+        // The reason this is boundary-checked at all: promoted to a primary
+        // sort key, an accidental match would decide the ranking.
+        assert!(!credits_artist("adore", "ado"));
+        assert!(!credits_artist("shadow", "ado"));
+        assert!(!credits_artist(
+            "shaneil muir, vybz kartel",
+            "larissa lambert"
+        ));
+        // Japanese credits run names straight into punctuation and each other,
+        // so only ASCII counts as continuing a word.
+        assert!(credits_artist("理芽, guiano", "理芽"));
+        assert!(credits_artist("重音テト、音街ウナ", "重音テト"));
+        // Nothing to match on means no record can claim the artist.
+        assert!(!credits_artist("anyone", ""));
+    }
+
+    #[test]
+    fn a_fragment_loses_to_the_whole_song() {
+        // The reported アイドル case: a 33-line record whose timings start 22s
+        // in, picked over a complete 78-line one because its length matched.
+        let out = rank(
+            vec![
+                with_lines(1, 245.0, 10),
+                with_lines(2, 246.0, 40),
+                with_lines(3, 247.0, 38),
+                with_lines(4, 248.0, 42),
+            ],
+            &q(Some(245.0)),
+        );
+        assert_eq!(
+            out[0].id,
+            2,
+            "a complete record should lead: {:?}",
+            ids(&out)
+        );
+        assert_eq!(out.last().unwrap().id, 1, "the fragment sorts last");
+    }
+
+    #[test]
+    fn a_fragment_uploaded_many_times_cannot_set_the_standard() {
+        // Two thirds of lrclib's results for a popular track are copies. If
+        // every copy counted, a stub re-uploaded five times would look typical
+        // and the complete records would be the outliers.
+        let mut items: Vec<TrackLyrics> = (1..=5).map(|i| with_lines(i, 245.0, 10)).collect();
+        items.push(with_lines(6, 245.0, 40));
+        items.push(with_lines(7, 245.0, 41));
+        assert_eq!(typical_line_count(&items, Some(245.0)), Some(40));
+
+        // Counting every copy would have made the median 10.
+        assert!(is_stub(
+            &items[0],
+            Some(245.0),
+            typical_line_count(&items, Some(245.0))
+        ));
+        assert!(!is_stub(
+            &items[5],
+            Some(245.0),
+            typical_line_count(&items, Some(245.0))
+        ));
+    }
+
+    #[test]
+    fn a_different_song_of_the_same_name_is_no_yardstick() {
+        // The reported `GURU` cover: the pool held several unrelated songs of
+        // that name, whose line counts pushed the median to 54 and made the
+        // correct 24-line record look like a fragment. Only records close
+        // enough in length to be this recording set the standard.
+        let items = vec![
+            with_lines(1, 197.0, 24), // this recording
+            with_lines(2, 212.0, 54), // another song that shares the title
+            with_lines(3, 215.0, 60),
+            with_lines(4, 220.0, 68),
+        ];
+        let typical = typical_line_count(&items, Some(197.0));
+        assert_eq!(typical, None, "none of them are this recording");
+        assert!(!is_stub(&items[0], Some(197.0), typical));
+
+        // Ranked, the short record still wins on length.
+        let out = rank(items, &q(Some(197.0)));
+        assert_eq!(out[0].id, 1);
+    }
+
+    #[test]
+    fn too_few_candidates_to_call_anything_a_fragment() {
+        // With one or two records there is no spread to judge against, and a
+        // short song would be demoted for being short.
+        let items = vec![with_lines(1, 245.0, 4), with_lines(2, 245.0, 40)];
+        assert_eq!(typical_line_count(&items, Some(245.0)), None);
+        assert!(!is_stub(&items[0], Some(245.0), None));
+    }
+
+    #[test]
+    fn an_instrumental_is_not_a_fragment() {
+        // It has no words to be missing.
+        let inst = TrackLyrics {
+            kind: LyricsKind::Instrumental,
+            ..rec(9, 245.0, false)
+        };
+        assert!(!is_stub(&inst, Some(245.0), Some(40)));
     }
 
     #[test]

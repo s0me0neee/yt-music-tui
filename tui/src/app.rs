@@ -558,6 +558,9 @@ pub struct App {
     lyrics_picker: Option<LyricsPicker>,
     lyrics_overrides: LyricsOverrides,
     lyrics_dirty: bool,
+    /// When we started waiting for mpv to report the playing track's real
+    /// duration, so the wait can't become a permanent block if it never does.
+    lyrics_duration_wait: Option<(String, Instant)>,
     /// User settings from `config.toml`, read once at startup.
     config: ytm_core::Config,
 }
@@ -612,6 +615,7 @@ impl App {
             lyrics_following: true,
             lyrics_picker: None,
             lyrics_overrides: persistence::load_lyrics_overrides(),
+            lyrics_duration_wait: None,
             config,
             lyrics_dirty: false,
         }
@@ -636,6 +640,11 @@ impl App {
         self.library.track(pl, song)?.video_id.clone()
     }
 
+    /// How long to wait for mpv's duration before falling back to YouTube's.
+    /// Long enough to cover a yt-dlp resolve, short enough that a track which
+    /// never plays still gets its lyrics looked up.
+    const DURATION_WAIT: Duration = Duration::from_secs(4);
+
     /// Starts a lyrics fetch for `video_id` unless one is already cached or in
     /// flight. The single `Occupied` arm is what makes repeated `y` toggles and
     /// skip-away-and-back free.
@@ -651,13 +660,41 @@ impl App {
         let Some((pl, song)) = self.player.playing() else {
             return;
         };
-        let Some(query) = self
+        let Some(mut query) = self
             .library
             .track(pl, song)
             .and_then(LyricsQuery::from_track)
         else {
             return;
         };
+
+        // Rank against the real audio length rather than YouTube's, which
+        // rounds *up* — measured across this library it runs 0 to 1.0s long,
+        // 0.54s on average. Matching lrclib records against the inflated
+        // figure favours the ones whose own duration is inflated too, and
+        // rejects the accurate ones: of the pairs the user corrected by hand,
+        // theirs was the closer record 7 times to 1 against the true length,
+        // and only 2 to 6 against YouTube's.
+        //
+        // mpv reports it a moment after the file loads, so this waits a tick
+        // or two — invisible next to the second the lookup itself takes, and
+        // bounded so a track that never starts still gets its lyrics.
+        let total = self.player.audio_state().total;
+        if total <= 0.0 {
+            let waited = match &self.lyrics_duration_wait {
+                Some((id, since)) if id == video_id => since.elapsed(),
+                _ => {
+                    self.lyrics_duration_wait = Some((video_id.to_string(), Instant::now()));
+                    Duration::ZERO
+                }
+            };
+            if waited < Self::DURATION_WAIT {
+                return; // not cached, not in flight — we retry next tick
+            }
+            log::debug!("lyrics: no duration from mpv after {waited:?} — using YouTube's");
+        } else {
+            query.duration = Some(total);
+        }
 
         self.lyrics_cache
             .insert(video_id.to_string(), LyricsEntry::Loading);
