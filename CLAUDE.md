@@ -14,6 +14,22 @@ cargo test <name>    # run a single test by name
 cargo test -p lrclib -- --ignored   # the live lrclib.net API tests
 ```
 
+### Linking libmpv
+
+libmpv is linked, not spawned, so the build needs the *library* — the mpv player on its own
+is not enough. `ytm-core/build.rs` finds it in one of two ways:
+
+- **`LIBMPV_DIR`**, if set: the directory holding the import library. Checked first, and on
+  Windows it is the only option — there is no pkg-config, and the mpv player builds ship no
+  import library at all. Unpack the **mpv-dev** package (`libmpv-2.dll`, `libmpv.dll.a`,
+  `include/mpv/`) from [shinchiro/mpv-winbuild-cmake][mpv-win] and point `LIBMPV_DIR` at it;
+  the same directory has to be on `PATH` at runtime so `libmpv-2.dll` can be loaded.
+  A missing DLL shows up as a bare `STATUS_DLL_NOT_FOUND` exit, with no message.
+- **pkg-config** otherwise, which is what picks up Homebrew's libmpv on macOS
+  (`brew install mpv`) and the distro package on Linux (`libmpv-dev`).
+
+[mpv-win]: https://github.com/shinchiro/mpv-winbuild-cmake/releases
+
 ## Credential Setup
 
 Auth uses cookie-based auth via `browser.json` (ytmusicapi style — no OAuth).
