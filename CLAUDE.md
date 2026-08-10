@@ -81,6 +81,10 @@ tui/        the ratatui frontend — single `ytm` binary
   - **Lyrics**: `y` replaces the right column with a synced-lyrics panel that auto-centres the
     active line; `c` opens a modal to pick a different lrclib record; `r` retries a failed
     fetch. Results are cached per video ID and never re-fetched, so toggling is free.
+    The picker collapses records carrying identical lyrics — two thirds of what lrclib
+    returns for a popular track — and its left column marks `IN USE` (what the panel is
+    showing) and `AUTO` (the record automatic matching resolved to). The record on screen
+    is guaranteed a row, since it is often the `/get` hit the search ladder never sees.
 
 ### Event loop cadence
 

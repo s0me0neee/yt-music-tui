@@ -109,7 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             }
         };
-        let all = match svc.candidates(&q).await {
+        // Deliberately no `on_screen`: protecting the chosen record from
+        // de-duplication would let it displace the copy the ranker actually
+        // prefers, and the ranker is what is being measured. Choices that get
+        // collapsed are compared on content instead.
+        let all = match svc.candidates(&q, None).await {
             Ok(all) => all,
             Err(e) => {
                 eprintln!("  candidates errored: {e}");

@@ -685,18 +685,41 @@ pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
 /// popular track is the same file under a different album name, which buries
 /// the records that genuinely differ and turns choosing into a scroll through
 /// twenty identical rows.
-pub fn dedupe_by_content(items: Vec<TrackLyrics>) -> Vec<TrackLyrics> {
+/// `keep` names the record currently on screen. It survives its group even
+/// when a better-ranked copy exists, because the picker has to be able to mark
+/// which one is in use — you cannot see what you are choosing away from, or
+/// notice you have re-picked what you already have, if it isn't listed.
+pub fn dedupe_by_content(items: Vec<TrackLyrics>, keep: Option<u64>) -> Vec<TrackLyrics> {
+    let protected = keep.and_then(|id| {
+        items
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.content_fingerprint())
+    });
+
     let mut seen = HashSet::new();
     items
         .into_iter()
-        .filter(|c| seen.insert(c.content_fingerprint()))
+        .filter(|c| {
+            let fingerprint = c.content_fingerprint();
+            if protected == Some(fingerprint) {
+                // Exactly one record represents this group, and it is the one
+                // the user is looking at.
+                return Some(c.id) == keep;
+            }
+            seen.insert(fingerprint)
+        })
         .collect()
 }
 
 /// Orders candidates and then drops duplicated lyrics — what every caller
 /// wanting a final, user-facing list needs.
-fn rank_and_dedupe(items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
-    dedupe_by_content(rank(items, q))
+fn rank_and_dedupe(
+    items: Vec<TrackLyrics>,
+    q: &LyricsQuery,
+    keep: Option<u64>,
+) -> Vec<TrackLyrics> {
+    dedupe_by_content(rank(items, q), keep)
 }
 
 // ── service ──────────────────────────────────────────────────────────────────
@@ -830,7 +853,7 @@ impl LyricsService {
         // Errors propagate rather than being swallowed into an empty list: a
         // network failure and "lrclib genuinely has nothing" are different
         // things, and the UI shows them differently.
-        let mut found = match self.search_ladder(q, true).await {
+        let mut found = match self.search_ladder(q, true, None).await {
             Ok(found) => found,
             // The ladder failed for real, retries included. Anything the exact
             // lookup is still holding beats reporting nothing: it is the same
@@ -853,7 +876,7 @@ impl LyricsService {
             if !found.iter().any(|c| c.id == exact.id) {
                 found.push(exact);
             }
-            found = rank_and_dedupe(found, q);
+            found = rank_and_dedupe(found, q, None);
         }
 
         if !found.is_empty() {
@@ -906,7 +929,12 @@ impl LyricsService {
     /// transcription a second out, or an unsynced upload) while the exact one
     /// sits under looser metadata — a plain `Sway` where the track is
     /// `Sway (feat. Nevve)` — and is only reachable from a broader rung.
-    async fn search_ladder(&self, q: &LyricsQuery, stop_early: bool) -> Result<Vec<TrackLyrics>> {
+    async fn search_ladder(
+        &self,
+        q: &LyricsQuery,
+        stop_early: bool,
+        keep: Option<u64>,
+    ) -> Result<Vec<TrackLyrics>> {
         let mut seen: HashSet<u64> = HashSet::new();
         let mut pool: Vec<TrackLyrics> = Vec::new();
         let mut last_err = None;
@@ -937,7 +965,7 @@ impl LyricsService {
                             pool.iter().find(|c| Self::is_decisive(c, q)).map(|c| c.id)
                     {
                         log::debug!("lyrics: decisive match #{id} on {attempt:?}");
-                        return Ok(rank_and_dedupe(pool, q));
+                        return Ok(rank_and_dedupe(pool, q, keep));
                     }
                 }
                 // One failing rung shouldn't abort the ladder — a later,
@@ -954,21 +982,48 @@ impl LyricsService {
             Some(e) if pool.is_empty() => Err(e.into()),
             _ => {
                 log::debug!("lyrics: {} candidates across the ladder", pool.len());
-                Ok(rank_and_dedupe(pool, q))
+                Ok(rank_and_dedupe(pool, q, keep))
             }
         }
     }
 
-    /// Every candidate the ladder can reach, de-duplicated and ranked.
+    /// Every candidate the ladder can reach, de-duplicated and ranked, always
+    /// including the record `on_screen` names.
     ///
     /// Unlike the automatic match this never stops early, so the picker offers
     /// everything a manual lrclib search would turn up. It is only invoked when
     /// the user presses `c`, so the extra requests are paid for deliberately.
     ///
-    /// Returns *full* records — LRCLIB's search response already includes
-    /// `syncedLyrics`, so committing a choice needs no further request.
-    pub async fn candidates(&self, q: &LyricsQuery) -> Result<Vec<TrackLyrics>> {
-        self.search_ladder(q, false).await
+    /// `on_screen` is the record the lyrics panel is currently showing. It is
+    /// guaranteed a row of its own — it survives de-duplication, and is fetched
+    /// by id when the ladder can't reach it at all. Both happen routinely: the
+    /// automatic match is often the exact `/get` lookup's hit, which never goes
+    /// through search, and a previous manual choice resolves the same way. A
+    /// picker that silently omitted it would offer no way to tell which lyrics
+    /// are already in use, or to notice that a row is the one you have.
+    pub async fn candidates(
+        &self,
+        q: &LyricsQuery,
+        on_screen: Option<u64>,
+    ) -> Result<Vec<TrackLyrics>> {
+        let mut found = self.search_ladder(q, false, on_screen).await?;
+
+        if let Some(id) = on_screen
+            && !found.iter().any(|c| c.id == id)
+        {
+            match self.by_id(id).await {
+                Ok(Some(current)) => {
+                    found.push(current);
+                    found = rank_and_dedupe(found, q, on_screen);
+                }
+                // Not fatal: the list is still useful, it just can't mark the
+                // record in use.
+                Ok(None) => log::warn!("lyrics: record #{id} on screen no longer resolves"),
+                Err(e) => log::warn!("lyrics: could not fetch the record on screen #{id}: {e}"),
+            }
+        }
+
+        Ok(found)
     }
 }
 
@@ -1014,10 +1069,14 @@ pub fn spawn_choices(
     svc: Arc<LyricsService>,
     video_id: String,
     query: LyricsQuery,
+    on_screen: Option<u64>,
     tx: Sender<LyricsMsg>,
 ) {
     handle.spawn(async move {
-        let result = svc.candidates(&query).await.map_err(|e| e.to_string());
+        let result = svc
+            .candidates(&query, on_screen)
+            .await
+            .map_err(|e| e.to_string());
         let _ = tx.send(LyricsMsg::Choices { video_id, result });
     });
 }
@@ -1371,7 +1430,7 @@ mod tests {
         let mut third = timed(3, 245.0, lines);
         third.album_name = "Greatest Hits".into();
 
-        let out = dedupe_by_content(rank(vec![first, second, third], &q(Some(245.0))));
+        let out = dedupe_by_content(rank(vec![first, second, third], &q(Some(245.0))), None);
         assert_eq!(ids(&out), [1], "the best-ranked copy is the one kept");
     }
 
@@ -1381,7 +1440,7 @@ mod tests {
         // scrolls correctly is exactly what the user is choosing between.
         let a = timed(1, 245.0, &[(0.0, "a"), (1.5, "b")]);
         let b = timed(2, 245.0, &[(0.0, "a"), (2.5, "b")]);
-        let out = dedupe_by_content(rank(vec![a, b], &q(Some(245.0))));
+        let out = dedupe_by_content(rank(vec![a, b], &q(Some(245.0))), None);
         assert_eq!(ids(&out), [1, 2]);
     }
 
@@ -1393,7 +1452,7 @@ mod tests {
             kind: LyricsKind::Plain(vec!["a".into()]),
             ..rec(2, 245.0, false)
         };
-        let out = dedupe_by_content(vec![synced, plain]);
+        let out = dedupe_by_content(vec![synced, plain], None);
         assert_eq!(ids(&out), [1, 2]);
 
         // Instrumentals carry nothing to tell apart, so one row is enough.
@@ -1401,7 +1460,35 @@ mod tests {
             kind: LyricsKind::Instrumental,
             ..rec(id, 245.0, false)
         };
-        assert_eq!(ids(&dedupe_by_content(vec![inst(1), inst(2)])), [1]);
+        assert_eq!(ids(&dedupe_by_content(vec![inst(1), inst(2)], None)), [1]);
+    }
+
+    #[test]
+    fn the_record_on_screen_survives_deduplication() {
+        let lines = &[(0.0, "a"), (1.5, "b")][..];
+        let copies = || {
+            vec![
+                timed(1, 245.0, lines),
+                timed(2, 245.0, lines),
+                timed(3, 245.0, lines),
+            ]
+        };
+
+        // #3 is what the panel is showing. #1 ranks better, but collapsing to
+        // it would leave the picker unable to say which row is in use.
+        assert_eq!(ids(&dedupe_by_content(copies(), Some(3))), [3]);
+        // Exactly one row still represents the group.
+        assert_eq!(ids(&dedupe_by_content(copies(), Some(1))), [1]);
+        // A record that isn't in the list changes nothing.
+        assert_eq!(ids(&dedupe_by_content(copies(), Some(99))), [1]);
+
+        // Protecting one group leaves the others alone.
+        let mixed = vec![
+            timed(1, 245.0, lines),
+            timed(4, 245.0, &[(0.0, "z")]),
+            timed(3, 245.0, lines),
+        ];
+        assert_eq!(ids(&dedupe_by_content(mixed, Some(3))), [4, 3]);
     }
 
     #[test]
@@ -1414,7 +1501,7 @@ mod tests {
         b.album_name = "Other".into();
         let distinct = timed(3, 245.0, &[(0.0, "y")]);
 
-        let out = dedupe_by_content(vec![a, distinct, b]);
+        let out = dedupe_by_content(vec![a, distinct, b], None);
         assert_eq!(ids(&out), [1, 3], "order of survivors is untouched");
     }
 
@@ -1638,7 +1725,13 @@ mod tests {
             found.track_name
         );
         // The picker must offer the alternatives too.
-        assert!(svc.candidates(&q).await.expect("search errored").len() > 1);
+        assert!(
+            svc.candidates(&q, None)
+                .await
+                .expect("search errored")
+                .len()
+                > 1
+        );
     }
 
     /// A single malformed record (lrclib returns `duration: null` for some)
@@ -1724,8 +1817,11 @@ mod tests {
             duration: Some(244.0),
         };
 
-        let first = svc.search_ladder(&q, true).await.expect("search errored");
-        let all = svc.candidates(&q).await.expect("search errored");
+        let first = svc
+            .search_ladder(&q, true, None)
+            .await
+            .expect("search errored");
+        let all = svc.candidates(&q, None).await.expect("search errored");
         assert!(
             all.len() > first.len(),
             "picker showed {} but the ladder reaches {}",
@@ -1755,7 +1851,7 @@ mod tests {
         };
         // lrclib has three records: two at 174s and one at 181s. All three are
         // offered — 7s is the same song — but the 181s one loses its timings.
-        let all = svc.candidates(&q).await.expect("search errored");
+        let all = svc.candidates(&q, None).await.expect("search errored");
         let summary: Vec<_> = all
             .iter()
             .map(|c| (c.id, c.duration, c.is_synced(), c.timing_mismatch))
@@ -1816,7 +1912,11 @@ mod tests {
                 found.id
             );
             assert!(
-                svc.candidates(&q).await.expect("search errored").len() > 1,
+                svc.candidates(&q, None)
+                    .await
+                    .expect("search errored")
+                    .len()
+                    > 1,
                 "{title:?} offered only one choice"
             );
         }
@@ -1968,7 +2068,7 @@ mod tests {
         assert!(found.timing_mismatch);
 
         // The picker offers alternatives, and none of them claims timings.
-        let all = svc.candidates(&q).await.expect("search errored");
+        let all = svc.candidates(&q, None).await.expect("search errored");
         assert!(all.len() > 1, "only {} candidate(s)", all.len());
         assert!(
             all.iter().all(|c| !c.is_synced()),
@@ -1984,6 +2084,39 @@ mod tests {
         );
     }
 
+    /// The picker must always be able to show what is already in use — both
+    /// the automatic match, which is frequently the `/get` hit the ladder never
+    /// sees, and a previous manual choice, which resolves the same way.
+    #[tokio::test]
+    #[ignore = "hits the live lrclib.net API"]
+    async fn the_picker_always_lists_the_record_in_use() {
+        let svc = LyricsService::new();
+        let q = LyricsQuery {
+            title: "Bohemian Rhapsody".into(),
+            artist: "Queen".into(),
+            album: String::new(),
+            duration: Some(354.0),
+        };
+
+        let best = svc
+            .best_for(&q, None)
+            .await
+            .expect("lookup errored")
+            .expect("no lyrics");
+
+        let all = svc
+            .candidates(&q, Some(best.id))
+            .await
+            .expect("search errored");
+        assert!(
+            all.iter().any(|c| c.id == best.id),
+            "the automatic match #{} is missing from its own picker",
+            best.id
+        );
+        // And it appears exactly once, not alongside its own duplicates.
+        assert_eq!(all.iter().filter(|c| c.id == best.id).count(), 1);
+    }
+
     #[tokio::test]
     #[ignore = "hits the live lrclib.net API"]
     async fn candidates_returns_multiple_ranked_records() {
@@ -1995,7 +2128,7 @@ mod tests {
             duration: Some(354.0),
         };
 
-        let found = svc.candidates(&query).await.expect("search failed");
+        let found = svc.candidates(&query, None).await.expect("search failed");
         assert!(
             found.len() > 1,
             "picker needs several options, got {}",

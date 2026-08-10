@@ -412,9 +412,108 @@ struct LyricsPicker {
     /// are stale and dropped.
     video_id: String,
     items: Vec<TrackLyrics>,
+    /// The record the panel was showing when the picker opened. It is
+    /// guaranteed a row, so the list can mark what is already in use.
+    on_screen: Option<u64>,
+    /// Whether that record came from a manual choice rather than the automatic
+    /// match — which of the two the "Automatic" row is ticked against.
+    overridden: bool,
     state: TableState,
     loading: bool,
     error: Option<String>,
+}
+
+/// The picker's rows: the pinned "Automatic" entry, then one per candidate.
+///
+/// Which row is in use gets its own column rather than a badge at the end of
+/// the line. The name/artist/album line is free to overflow and be clipped,
+/// which is exactly where a trailing marker would end up — and the point of
+/// the marker is to stop you re-picking what is already playing, so it has to
+/// be readable without reaching the end of the row.
+fn picker_rows(
+    items: &[TrackLyrics],
+    current_id: Option<u64>,
+    overridden: bool,
+    track_secs: Option<f64>,
+    name_w: usize,
+) -> Vec<Row<'static>> {
+    let badge = |text: &'static str, style: Style| Cell::from(Line::styled(text, style));
+
+    // Row 0 is pinned: the only way back to automatic matching after a
+    // choice has been made, and what's in use until one is.
+    let mut rows = vec![Row::new(vec![
+        badge(if overridden { "" } else { "IN USE" }, theme::PLAYING),
+        Cell::from(Line::styled("Automatic (best match)", theme::KEY)),
+        Cell::from(""),
+    ])];
+
+    rows.extend(items.iter().map(|c| {
+        let (marker, marker_style) = match c.kind {
+            ytm_core::LyricsKind::Synced(_) => ("♪ ", theme::ACCENT),
+            ytm_core::LyricsKind::Plain(_) => ("¶ ", theme::WARN),
+            ytm_core::LyricsKind::Instrumental => ("· ", theme::DIM),
+        };
+
+        let mut spans = vec![
+            Span::styled(marker, marker_style),
+            Span::styled(truncate_line(&c.track_name, name_w), theme::PRIMARY),
+        ];
+        if !c.artist_name.is_empty() {
+            spans.push(Span::styled(SEP, theme::DIM));
+            spans.push(Span::styled(c.artist_name.clone(), theme::META));
+        }
+        if !c.album_name.is_empty() {
+            spans.push(Span::styled(SEP, theme::DIM));
+            spans.push(Span::styled(c.album_name.clone(), theme::DIM));
+        }
+        // Green when the length matches the track — a one-glance cue that
+        // this is the right edit. Yellow when the gap is why the record
+        // lost its timings, so the trade-off is visible before choosing.
+        let close = c.duration_delta(track_secs).is_some_and(|d| d <= 2.0);
+        let dur_style = if close {
+            theme::PLAYING
+        } else if c.timing_mismatch {
+            theme::WARN
+        } else {
+            theme::DIM
+        };
+
+        // Two different facts, so two different words. On a manual choice this
+        // row *is* the choice; on automatic it is what the matcher resolved to
+        // — worth showing, since otherwise there is no way to tell which
+        // record "Automatic" means, but not the same as having picked it.
+        let (label, style) = match (Some(c.id) == current_id, overridden) {
+            (false, _) => ("", theme::DIM),
+            (true, true) => ("IN USE", theme::PLAYING),
+            (true, false) => ("AUTO", theme::ACCENT),
+        };
+
+        Row::new(vec![
+            badge(label, style),
+            Cell::from(Line::from(spans)),
+            Cell::from(
+                Line::styled(
+                    c.duration.map_or_else(|| "—".to_string(), fmt_secs),
+                    dur_style,
+                )
+                .right_aligned(),
+            ),
+        ])
+    }));
+
+    rows
+}
+
+/// Row to start the picker on: whatever is already in use, so re-picking it
+/// takes a deliberate keypress. Row 0 is the pinned "Automatic" entry, so the
+/// candidates are offset by one.
+fn initial_picker_row(items: &[TrackLyrics], on_screen: Option<u64>, overridden: bool) -> usize {
+    if !overridden {
+        return 0;
+    }
+    on_screen
+        .and_then(|id| items.iter().position(|c| c.id == id))
+        .map_or(0, |i| i + 1)
 }
 
 // ── app ───────────────────────────────────────────────────────────────────────
@@ -602,7 +701,9 @@ impl App {
                         picker.loading = false;
                         match result {
                             Ok(items) => {
-                                picker.state.select((!items.is_empty()).then_some(0));
+                                let start =
+                                    initial_picker_row(&items, picker.on_screen, picker.overridden);
+                                picker.state.select(Some(start));
                                 picker.items = items;
                             }
                             Err(e) => picker.error = Some(e),
@@ -1110,9 +1211,14 @@ impl App {
             return;
         };
 
+        let on_screen = self.current_lyrics().map(|l| l.id);
+        let overridden = self.lyrics_overrides.get(&video_id).is_some();
+
         self.lyrics_picker = Some(LyricsPicker {
             video_id: video_id.clone(),
             items: Vec::new(),
+            on_screen,
+            overridden,
             state: TableState::default(),
             loading: true,
             error: None,
@@ -1122,6 +1228,7 @@ impl App {
             std::sync::Arc::clone(&self.lyrics_svc),
             video_id,
             query,
+            on_screen,
             self.lyrics_tx.clone(),
         );
     }
@@ -1904,69 +2011,28 @@ impl App {
             return;
         }
 
-        let name_w = modal.width.saturating_sub(12) as usize;
-
-        // Row 0 is pinned: the only way back to automatic matching after a
-        // choice has been made.
-        let mut rows = vec![Row::new(vec![
-            Cell::from(Line::styled("Automatic (best match)", theme::KEY)),
-            Cell::from(""),
-        ])];
-
-        rows.extend(picker.items.iter().map(|c| {
-            let (marker, marker_style) = match c.kind {
-                ytm_core::LyricsKind::Synced(_) => ("♪ ", theme::ACCENT),
-                ytm_core::LyricsKind::Plain(_) => ("¶ ", theme::WARN),
-                ytm_core::LyricsKind::Instrumental => ("· ", theme::DIM),
-            };
-
-            let mut spans = vec![
-                Span::styled(marker, marker_style),
-                Span::styled(truncate_line(&c.track_name, name_w), theme::PRIMARY),
-            ];
-            if !c.artist_name.is_empty() {
-                spans.push(Span::styled(SEP, theme::DIM));
-                spans.push(Span::styled(c.artist_name.clone(), theme::META));
-            }
-            if !c.album_name.is_empty() {
-                spans.push(Span::styled(SEP, theme::DIM));
-                spans.push(Span::styled(c.album_name.clone(), theme::DIM));
-            }
-            if Some(c.id) == current_id {
-                spans.push(Span::styled("  ✓", theme::PLAYING));
-            }
-
-            // Green when the length matches the track — a one-glance cue that
-            // this is the right edit. Yellow when the gap is why the record
-            // lost its timings, so the trade-off is visible before choosing.
-            let close = c.duration_delta(track_secs).is_some_and(|d| d <= 2.0);
-            let dur_style = if close {
-                theme::PLAYING
-            } else if c.timing_mismatch {
-                theme::WARN
-            } else {
-                theme::DIM
-            };
-
-            Row::new(vec![
-                Cell::from(Line::from(spans)),
-                Cell::from(
-                    Line::styled(
-                        c.duration.map_or_else(|| "—".to_string(), fmt_secs),
-                        dur_style,
-                    )
-                    .right_aligned(),
-                ),
-            ])
-        }));
+        let rows = picker_rows(
+            &picker.items,
+            current_id,
+            picker.overridden,
+            track_secs,
+            modal.width.saturating_sub(20) as usize,
+        );
 
         let count = rows.len();
         frame.render_stateful_widget(
-            Table::new(rows, [Constraint::Fill(1), Constraint::Length(8)])
-                .block(block)
-                .row_highlight_style(theme::SELECTED)
-                .highlight_symbol("▶ ")
-                .column_spacing(1),
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(6),
+                    Constraint::Fill(1),
+                    Constraint::Length(8),
+                ],
+            )
+            .block(block)
+            .row_highlight_style(theme::SELECTED)
+            .highlight_symbol("▶ ")
+            .column_spacing(1),
             modal,
             &mut picker.state,
         );
@@ -2336,6 +2402,122 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    // ── lyrics picker ─────────────────────────────────────────────────────
+
+    fn candidate(id: u64, track: &str, album: &str) -> TrackLyrics {
+        TrackLyrics {
+            id,
+            track_name: track.into(),
+            artist_name: "Lia".into(),
+            album_name: album.into(),
+            duration: Some(245.0),
+            timing_mismatch: false,
+            relevance: id as usize,
+            kind: ytm_core::LyricsKind::Plain(vec!["x".into()]),
+        }
+    }
+
+    /// Renders the picker's rows the way `render_lyrics_picker` does.
+    fn draw_picker(w: u16, items: &[TrackLyrics], current: Option<u64>, over: bool) -> Vec<String> {
+        let rows = picker_rows(items, current, over, Some(245.0), 30);
+        draw(w, (rows.len() + 2) as u16, |frame| {
+            frame.render_widget(
+                Table::new(
+                    rows,
+                    [
+                        Constraint::Length(6),
+                        Constraint::Fill(1),
+                        Constraint::Length(8),
+                    ],
+                )
+                .column_spacing(1),
+                frame.area(),
+            );
+        })
+    }
+
+    #[test]
+    fn the_picker_marks_the_record_in_use() {
+        let items = [
+            candidate(1, "Song", "Album One"),
+            candidate(2, "Song", "Album Two"),
+        ];
+
+        // A manual choice: the badge sits on that record, not on "Automatic".
+        let out = draw_picker(60, &items, Some(2), true);
+        assert!(
+            !out[0].contains("IN USE"),
+            "automatic is not in use: {out:?}"
+        );
+        assert!(!out[1].contains("IN USE"));
+        assert!(out[2].contains("IN USE"), "row for #2 unmarked: {out:?}");
+
+        // No override: "Automatic" is what's in use, and the record it
+        // resolved to is marked so you can see which one that is.
+        let out = draw_picker(60, &items, Some(1), false);
+        assert!(out[0].contains("IN USE"), "{out:?}");
+        assert_eq!(
+            out.iter().filter(|r| r.contains("IN USE")).count(),
+            1,
+            "only one row can be in use: {out:?}"
+        );
+        assert!(
+            out[1].contains("AUTO"),
+            "automatic's record unmarked: {out:?}"
+        );
+        assert!(!out[2].contains("AUTO"));
+    }
+
+    #[test]
+    #[ignore = "visual smoke check — prints the picker, asserts nothing"]
+    fn render_picker() {
+        let items = [
+            candidate(1, "\u{9ce5}\u{306e}\u{8a69}", "AIR ORIGINAL SOUNDTRACK"),
+            candidate(2, "\u{9ce5}\u{306e}\u{8a69}", "Key BEST SELECTION"),
+            candidate(
+                3,
+                "\u{9ce5}\u{306e}\u{8a69} (TV size)",
+                "KeyBOX -for two decades-",
+            ),
+        ];
+        for (label, current, over) in [
+            ("automatic", Some(2), false),
+            ("manual choice", Some(3), true),
+        ] {
+            println!("\n--- {label} ---");
+            for row in draw_picker(64, &items, current, over) {
+                println!("|{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_in_use_badge_survives_a_narrow_modal() {
+        // The badge led the row precisely so a long name can't push it out of
+        // view. 40 columns is the narrowest the modal goes.
+        let items = [candidate(
+            1,
+            "A Very Long Track Name That Runs Past The Edge",
+            "And A Long Album Name Too",
+        )];
+        let out = draw_picker(40, &items, Some(1), true);
+        assert!(out[1].starts_with("IN USE"), "{out:?}");
+    }
+
+    #[test]
+    fn the_picker_opens_on_whatever_is_in_use() {
+        let items = [candidate(1, "Song", "One"), candidate(2, "Song", "Two")];
+
+        // Row 0 is "Automatic", so candidates are offset by one.
+        assert_eq!(initial_picker_row(&items, Some(2), true), 2);
+        assert_eq!(initial_picker_row(&items, Some(1), true), 1);
+        // No override means automatic is in use, whatever is on screen.
+        assert_eq!(initial_picker_row(&items, Some(2), false), 0);
+        // An override the list doesn't contain falls back to the pinned row.
+        assert_eq!(initial_picker_row(&items, Some(99), true), 0);
+        assert_eq!(initial_picker_row(&[], Some(1), true), 0);
     }
 
     /// Renders a representative screen so the layout can be eyeballed:
