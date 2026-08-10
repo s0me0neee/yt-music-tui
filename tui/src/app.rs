@@ -12,10 +12,11 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
     },
 };
-use serde_json::Value;
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
-use crate::audio::{AudioEngine, Cmd as AudioCmd};
+use ytm_core::library::SongBatch;
+use ytm_core::persistence::{self, QueueState, RestoreOutcome};
+use ytm_core::{AppendOutcome, AudioState, Library, PlayMode, Player, RemoveOutcome, Track};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -89,30 +90,11 @@ fn fmt_secs(secs: f64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-// ── play mode ─────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-enum PlayMode {
-    Cycle,
-    Single,
-    Shuffle,
-}
-
-impl PlayMode {
-    fn next(self) -> Self {
-        match self {
-            Self::Cycle => Self::Single,
-            Self::Single => Self::Shuffle,
-            Self::Shuffle => Self::Cycle,
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Self::Cycle => "↺ Cycle",
-            Self::Single => "⊙ Single",
-            Self::Shuffle => "⇌ Shuffle",
-        }
-    }
+fn track_duration(track: &Track) -> Option<String> {
+    track
+        .duration
+        .clone()
+        .or_else(|| track.duration_seconds.map(|s| format!("{}:{:02}", s / 60, s % 60)))
 }
 
 // ── panel ─────────────────────────────────────────────────────────────────────
@@ -126,35 +108,20 @@ enum Panel {
 // ── app ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    playlists: Vec<Value>,
+    library: Library,
     list_state: TableState,
-    all_songs: Vec<Vec<Value>>,
     songs_state: TableState,
     active_panel: Panel,
-    // audio
-    audio: AudioEngine,
-    playing_pl: Option<usize>,
-    playing_song: Option<usize>,
-    volume: u8,
-    muted: bool,
-    pre_mute_vol: u8,
-    mode: PlayMode,
+    player: Player,
     throbber_state: ThrobberState,
-    // cached totals — computed once, not every frame
-    playlist_total_secs: Vec<u64>,
     // queue
-    queue: Vec<(usize, usize)>, // (pl_idx, song_idx) pairs in playback order
-    queue_pos: Option<usize>,   // current position in queue
     show_queue: bool,
     queue_view_state: ListState,
     notification: Option<(String, Instant)>,
     reauth_requested: bool,
-    // true once do_play fires; false on restore so Space starts rather than pauses
-    playback_started: bool,
     // background song loading
-    songs_rx: std::sync::mpsc::Receiver<(usize, Vec<Value>)>,
-    songs_loaded: Vec<bool>,
-    pending_queue_restore: Option<crate::config::QueueState>,
+    songs_rx: std::sync::mpsc::Receiver<SongBatch>,
+    pending_queue_restore: Option<QueueState>,
     // filter
     filter: String,
     filter_mode: bool,
@@ -165,45 +132,29 @@ pub struct App {
 
 impl App {
     pub fn new(
-        playlists: Vec<Value>,
-        all_songs: Vec<Vec<Value>>,
-        saved_queue: Option<crate::config::QueueState>,
-        songs_rx: std::sync::mpsc::Receiver<(usize, Vec<Value>)>,
+        library: Library,
+        saved_queue: Option<QueueState>,
+        songs_rx: std::sync::mpsc::Receiver<SongBatch>,
     ) -> Self {
-        let n = playlists.len();
+        let n = library.len();
         let selected = (n > 0).then_some(0);
-        let audio = AudioEngine::new();
-        audio.send(AudioCmd::Volume(80));
-        let playlist_total_secs = vec![0u64; n];
 
         Self {
-            playlists,
+            library,
             list_state: {
                 let mut s = TableState::default();
                 s.select(selected);
                 s
             },
-            all_songs,
             songs_state: TableState::default(),
             active_panel: Panel::Playlists,
-            audio,
-            playing_pl: None,
-            playing_song: None,
-            volume: 80,
-            muted: false,
-            pre_mute_vol: 80,
-            mode: PlayMode::Cycle,
+            player: Player::new(),
             throbber_state: ThrobberState::default(),
-            playlist_total_secs,
-            queue: Vec::new(),
-            queue_pos: None,
             show_queue: false,
             queue_view_state: ListState::default(),
             notification: None,
             reauth_requested: false,
-            playback_started: false,
             songs_rx,
-            songs_loaded: vec![false; n],
             pending_queue_restore: saved_queue,
             filter: String::new(),
             filter_mode: false,
@@ -216,22 +167,7 @@ impl App {
     /// Called each event-loop tick so the UI stays up-to-date without blocking.
     fn drain_song_channel(&mut self) {
         while let Ok((idx, songs)) = self.songs_rx.try_recv() {
-            if let Some(slot) = self.all_songs.get_mut(idx) {
-                *slot = songs;
-            }
-            if let Some(loaded) = self.songs_loaded.get_mut(idx) {
-                *loaded = true;
-            }
-            // Recompute total duration for this playlist now that songs are known.
-            if let (Some(songs_ref), Some(total_slot)) = (
-                self.all_songs.get(idx),
-                self.playlist_total_secs.get_mut(idx),
-            ) {
-                *total_slot = songs_ref
-                    .iter()
-                    .filter_map(|t| t["duration_seconds"].as_u64())
-                    .sum();
-            }
+            self.library.apply_song_batch(idx, songs);
         }
         if self.pending_queue_restore.is_some() {
             self.try_restore_queue();
@@ -241,120 +177,28 @@ impl App {
     /// Attempt to restore a saved queue. Called after every song-batch arrival;
     /// waits until ALL playlists referenced in the saved queue have loaded.
     fn try_restore_queue(&mut self) {
-        let qs = match self.pending_queue_restore.clone() {
-            Some(q) => q,
-            None => return,
+        let Some(qs) = self.pending_queue_restore.clone() else {
+            return;
         };
 
-        // For each entry, check whether its playlist's songs are loaded.
-        for entry in &qs.entries {
-            let Some(ref pl_id) = entry.playlist_id else {
-                continue;
-            };
-            let Some(pl_idx) = self
-                .playlists
-                .iter()
-                .position(|pl| pl["playlistId"].as_str() == Some(pl_id.as_str()))
-            else {
-                // Playlist no longer exists — drop the whole restore.
+        match persistence::try_restore(&self.library, &qs) {
+            RestoreOutcome::Pending => {}
+            RestoreOutcome::Abandoned => {
                 self.pending_queue_restore = None;
-                return;
-            };
-            if !self.songs_loaded.get(pl_idx).copied().unwrap_or(false) {
-                return; // still waiting for this playlist
+            }
+            RestoreOutcome::Ready { queue, position } => {
+                self.pending_queue_restore = None;
+                self.player.restore(&self.library, queue, position);
+                self.queue_view_state.select(position);
+                self.list_state
+                    .select(self.player.playing().map(|(pl, _)| pl));
+                log::info!(
+                    "try_restore_queue: len={} pos={:?}",
+                    self.player.queue().len(),
+                    position
+                );
             }
         }
-
-        // All needed playlists are loaded — resolve entries to (pl_idx, song_idx).
-        self.pending_queue_restore = None;
-
-        let queue: Vec<(usize, usize)> = qs
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                let pl_id = entry.playlist_id.as_deref()?;
-                let pl_idx = self
-                    .playlists
-                    .iter()
-                    .position(|pl| pl["playlistId"].as_str() == Some(pl_id))?;
-                let songs = self.all_songs.get(pl_idx)?;
-                let song_idx = songs
-                    .iter()
-                    .position(|s| s["videoId"].as_str() == Some(entry.video_id.as_str()))?;
-                Some((pl_idx, song_idx))
-            })
-            .collect();
-
-        if queue.is_empty() {
-            return;
-        }
-
-        // Default to position 0 if none was saved, so Space always works.
-        let pos = qs.position.filter(|&p| p < queue.len()).or(Some(0));
-        self.queue = queue;
-        self.queue_pos = pos;
-        self.queue_view_state.select(pos);
-
-        // Show the track in the player bar without starting audio.
-        if let Some(q_pos) = pos
-            && let Some(&(pl_idx, song_idx)) = self.queue.get(q_pos)
-        {
-            self.playing_pl = Some(pl_idx);
-            self.playing_song = Some(song_idx);
-            self.playback_started = false;
-            self.list_state.select(Some(pl_idx));
-
-            if let Some(vid) = self
-                .all_songs
-                .get(pl_idx)
-                .and_then(|s| s.get(song_idx))
-                .and_then(|t| t["videoId"].as_str())
-                && !vid.is_empty()
-            {
-                self.audio.send(AudioCmd::Prefetch(vid.to_string()));
-            }
-        }
-
-        log::info!(
-            "try_restore_queue: len={} pos={:?}",
-            self.queue.len(),
-            self.queue_pos
-        );
-    }
-
-    /// Serialise the current queue into a `QueueState` for persistence.
-    fn queue_state(&self) -> Option<crate::config::QueueState> {
-        if self.queue.is_empty() {
-            return None;
-        }
-        let entries: Vec<crate::config::QueueEntry> = self
-            .queue
-            .iter()
-            .filter_map(|&(pl_idx, song_idx)| {
-                let video_id = self.all_songs.get(pl_idx)?.get(song_idx)?["videoId"]
-                    .as_str()?
-                    .to_string();
-                if video_id.is_empty() {
-                    return None;
-                }
-                let playlist_id = self
-                    .playlists
-                    .get(pl_idx)
-                    .and_then(|pl| pl["playlistId"].as_str())
-                    .map(str::to_string);
-                Some(crate::config::QueueEntry {
-                    playlist_id,
-                    video_id,
-                })
-            })
-            .collect();
-        if entries.is_empty() {
-            return None;
-        }
-        Some(crate::config::QueueState {
-            entries,
-            position: self.queue_pos,
-        })
     }
 
     pub fn run(mut self) -> anyhow::Result<()> {
@@ -366,17 +210,20 @@ impl App {
         ratatui::restore();
 
         // Persist queue before anything else so a crash during reauth doesn't lose it.
-        if let Some(state) = self.queue_state()
-            && let Err(e) = crate::config::save_queue(&state)
+        if let Some(state) = persistence::build_queue_state(
+            &self.library,
+            self.player.queue(),
+            self.player.queue_position(),
+        ) && let Err(e) = persistence::save_queue(&state)
         {
             log::warn!("failed to save queue: {e}");
         }
 
         result?;
         if self.reauth_requested {
-            let path = crate::config::browser_json_path();
-            std::fs::remove_file(&path).ok();
-            crate::setup::run_setup(&path.to_string_lossy())?;
+            std::fs::remove_file(ytm_core::session::browser_json_path()).ok();
+            let session = ytm_core::Session::new()?;
+            session.run_setup()?;
             eprintln!("\nSetup complete. Run the app again to start.");
         }
         Ok(())
@@ -385,17 +232,18 @@ impl App {
     // ── event loop ────────────────────────────────────────────────────────────
 
     fn event_loop(&mut self, term: &mut DefaultTerminal) -> std::io::Result<()> {
-        use std::sync::atomic::Ordering;
         loop {
             // Check for SIGTERM / SIGHUP — breaks cleanly so Drop runs and mpv is killed.
-            if crate::QUIT.load(Ordering::Relaxed) {
+            if ytm_core::shutdown::is_shutdown_requested() {
                 break Ok(());
             }
 
             self.drain_song_channel();
             self.throbber_state.calc_next();
             term.draw(|frame| self.render(frame))?;
-            self.handle_song_end();
+            if self.player.handle_song_end(&self.library) {
+                self.sync_queue_view();
+            }
             if event::poll(Duration::from_millis(200))? {
                 match event::read()? {
                     Event::Mouse(me) => self.handle_mouse(me),
@@ -458,10 +306,7 @@ impl App {
                                     if let Some(display_idx) = self.queue_view_state.selected() {
                                         let filtered = self.filtered_queue_positions();
                                         if let Some(&q_pos) = filtered.get(display_idx) {
-                                            self.queue_pos = Some(q_pos);
-                                            if let Some(&(pl, song)) = self.queue.get(q_pos) {
-                                                self.do_play(pl, song);
-                                            }
+                                            self.player.jump_to(&self.library, q_pos);
                                         }
                                     }
                                 }
@@ -471,7 +316,8 @@ impl App {
                                     {
                                         let filtered = self.filtered_songs(pl);
                                         if let Some(&song) = filtered.get(display_idx) {
-                                            self.play_song(pl, song);
+                                            self.player.play(&self.library, pl, song);
+                                            self.sync_queue_view();
                                         }
                                     }
                                 }
@@ -482,47 +328,28 @@ impl App {
                             }
                             // ── playback ──────────────────────────────────────────────
                             KeyCode::Char(' ') => {
-                                if let (Some(pl), Some(song)) = (self.playing_pl, self.playing_song)
-                                {
-                                    if self.playback_started {
-                                        let ast = self
-                                            .audio
-                                            .state
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        if !ast.loading {
-                                            let paused = ast.paused;
-                                            drop(ast);
-                                            self.audio.send(if paused {
-                                                AudioCmd::Resume
-                                            } else {
-                                                AudioCmd::Pause
-                                            });
-                                        }
+                                if self.player.playing().is_some() {
+                                    if self.player.playback_started() {
+                                        self.player.toggle_pause();
                                     } else {
                                         // Restored from saved state — start playback now.
-                                        self.do_play(pl, song);
+                                        self.player.start_current(&self.library);
                                     }
                                 }
                             }
-                            KeyCode::Char('p') => self.play_prev(),
-                            KeyCode::Char('n') => self.play_next(),
+                            KeyCode::Char('p') => {
+                                self.player.prev(&self.library);
+                                self.sync_queue_view();
+                            }
+                            KeyCode::Char('n') => {
+                                self.player.next(&self.library);
+                                self.sync_queue_view();
+                            }
                             KeyCode::Char('t') => {
-                                let old = self.mode;
-                                self.mode = self.mode.next();
-                                self.sync_queue_to_mode(old);
+                                self.player.cycle_mode();
+                                self.sync_queue_view();
                             }
-                            KeyCode::Char('m') => {
-                                if self.muted {
-                                    self.muted = false;
-                                    self.volume = self.pre_mute_vol;
-                                } else {
-                                    self.pre_mute_vol = self.volume;
-                                    self.muted = true;
-                                    self.volume = 0;
-                                }
-                                self.audio.send(AudioCmd::Volume(self.volume));
-                            }
+                            KeyCode::Char('m') => self.player.toggle_mute(),
                             // ── queue edit ────────────────────────────────────────────
                             KeyCode::Char('a')
                                 if self.active_panel == Panel::Songs && !self.show_queue =>
@@ -532,7 +359,7 @@ impl App {
                                 {
                                     let filtered = self.filtered_songs(pl);
                                     if let Some(&song) = filtered.get(display_idx) {
-                                        self.append_to_queue(pl, song);
+                                        self.do_append_to_queue(pl, song);
                                     }
                                 }
                             }
@@ -542,7 +369,7 @@ impl App {
                                 if let Some(display_idx) = self.queue_view_state.selected() {
                                     let filtered = self.filtered_queue_positions();
                                     if let Some(&q_pos) = filtered.get(display_idx) {
-                                        self.remove_from_queue(q_pos);
+                                        self.do_remove_from_queue(q_pos);
                                     }
                                 }
                             }
@@ -551,30 +378,22 @@ impl App {
                                 self.filter.clear();
                                 self.filter_mode = false;
                                 if self.show_queue {
-                                    self.queue_view_state.select(self.queue_pos);
+                                    self.queue_view_state.select(self.player.queue_position());
                                 }
                             }
                             // ── seek ──────────────────────────────────────────────────
-                            KeyCode::Left => self.audio.send(AudioCmd::Seek(-5)),
-                            KeyCode::Right => self.audio.send(AudioCmd::Seek(5)),
+                            KeyCode::Left => self.player.seek(-5),
+                            KeyCode::Right => self.player.seek(5),
                             // ── volume ────────────────────────────────────────────────
-                            KeyCode::Up => {
-                                self.muted = false;
-                                self.volume = self.volume.saturating_add(5).min(100);
-                                self.audio.send(AudioCmd::Volume(self.volume));
-                            }
-                            KeyCode::Down => {
-                                self.muted = false;
-                                self.volume = self.volume.saturating_sub(5);
-                                self.audio.send(AudioCmd::Volume(self.volume));
-                            }
+                            KeyCode::Up => self.player.adjust_volume(5),
+                            KeyCode::Down => self.player.adjust_volume(-5),
                             // ── quit ──────────────────────────────────────────────────
                             KeyCode::Esc => match self.active_panel {
                                 Panel::Songs if !self.filter.is_empty() => self.clear_filter(),
                                 Panel::Songs => self.active_panel = Panel::Playlists,
                                 Panel::Playlists => break Ok(()),
                             },
-                            KeyCode::Char('r') if self.playlists.is_empty() => {
+                            KeyCode::Char('r') if self.library.is_empty() => {
                                 self.reauth_requested = true;
                                 break Ok(());
                             }
@@ -629,135 +448,48 @@ impl App {
 
     // ── playback helpers ──────────────────────────────────────────────────────
 
-    /// Called when the user explicitly selects a song (Enter).
-    /// Always rebuilds the queue for the playlist in the current mode.
-    fn play_song(&mut self, pl_idx: usize, song_idx: usize) {
-        self.build_queue(pl_idx, song_idx);
-        self.do_play(pl_idx, song_idx);
-    }
-
-    /// Build (or rebuild) the playback queue for `pl_idx`.
-    /// In Shuffle mode the order is randomised; `start_song` marks the
-    /// current position regardless of order.
-    fn build_queue(&mut self, pl_idx: usize, start_song: usize) {
-        use rand::seq::SliceRandom;
-        let n = self.all_songs.get(pl_idx).map_or(0, Vec::len);
-        self.queue = (0..n).map(|i| (pl_idx, i)).collect();
-        if matches!(self.mode, PlayMode::Shuffle) {
-            self.queue.shuffle(&mut rand::thread_rng());
-        }
-        self.queue_pos = self
-            .queue
-            .iter()
-            .position(|&(p, s)| p == pl_idx && s == start_song);
+    /// Keeps the queue panel's visual cursor pinned to whatever is currently
+    /// playing. No-op while the queue panel isn't visible.
+    fn sync_queue_view(&mut self) {
         if self.show_queue {
-            self.queue_view_state.select(self.queue_pos);
+            self.queue_view_state.select(self.player.queue_position());
         }
-        log::info!(
-            "build_queue: pl={pl_idx} n={n} mode={} pos={:?}",
-            self.mode.label(),
-            self.queue_pos
-        );
     }
 
-    /// Send the audio command and update playing state — does not touch the queue.
-    fn do_play(&mut self, pl_idx: usize, song_idx: usize) {
-        let Some(track) = self.all_songs.get(pl_idx).and_then(|s| s.get(song_idx)) else {
-            log::warn!("do_play: no track at pl={pl_idx} song={song_idx}");
-            return;
-        };
-        let video_id = track["videoId"].as_str().unwrap_or("").to_string();
-        log::info!("do_play: pl={pl_idx} song={song_idx} videoId={video_id:?}");
-        if video_id.is_empty() {
-            log::warn!("do_play: videoId missing — no Play sent");
+    fn do_append_to_queue(&mut self, pl_idx: usize, song_idx: usize) {
+        let title = self
+            .library
+            .track(pl_idx, song_idx)
+            .and_then(|t| t.title.clone())
+            .unwrap_or_else(|| "song".to_string());
+        match self.player.append_to_queue(&self.library, pl_idx, song_idx) {
+            AppendOutcome::StartedPlaying { .. } => self.notify(format!("Playing: {title}")),
+            AppendOutcome::Queued { queue_len } => {
+                self.notify(format!("+ queue #{queue_len}: {title}"));
+            }
+        }
+    }
+
+    fn do_remove_from_queue(&mut self, q_pos: usize) {
+        let outcome = self.player.remove_from_queue(&self.library, q_pos);
+
+        // Keep the visual cursor near where the user just deleted from —
+        // independent of `queue_pos`, which tracks what's playing.
+        let queue_len = self.player.queue().len();
+        self.queue_view_state.select(if queue_len == 0 {
+            None
         } else {
-            self.audio.send(AudioCmd::Play(video_id));
-            self.audio.send(AudioCmd::Volume(self.volume));
-        }
-        self.playing_pl = Some(pl_idx);
-        self.playing_song = Some(song_idx);
-        self.playback_started = true;
-        self.prefetch_next_in_queue();
-    }
+            Some(q_pos.min(queue_len - 1))
+        });
 
-    /// Step through the queue by `delta` positions and play.
-    fn advance_queue(&mut self, delta: i64) {
-        let n = self.queue.len();
-        if n == 0 {
-            return;
-        }
-        let pos = match self.queue_pos {
-            Some(p) => ((p as i64 + delta).rem_euclid(n as i64)) as usize,
-            None => 0,
-        };
-        self.queue_pos = Some(pos);
-        if self.show_queue {
-            self.queue_view_state.select(Some(pos));
-        }
-        let (pl, song) = self.queue[pos];
-        log::info!("advance_queue: delta={delta} pos={pos} pl={pl} song={song}");
-        self.do_play(pl, song);
-    }
-
-    fn play_next(&mut self) {
-        self.advance_queue(1);
-    }
-    fn play_prev(&mut self) {
-        self.advance_queue(-1);
-    }
-
-    /// Called after `self.mode` is updated. Reorders the live queue so that
-    /// Shuffle gives a random order and Cycle gives the original index order.
-    /// `queue_pos` is re-pinned to the currently playing song so playback
-    /// state stays consistent.
-    fn sync_queue_to_mode(&mut self, old_mode: PlayMode) {
-        use rand::seq::SliceRandom;
-        match (old_mode, self.mode) {
-            (_, PlayMode::Shuffle) => {
-                self.queue.shuffle(&mut rand::thread_rng());
-            }
-            (PlayMode::Shuffle, _) => {
-                // Restore original playlist order (queue entries are song indices).
-                self.queue.sort_unstable();
-            }
-            _ => {} // Single↔Cycle switch doesn't need a reorder
-        }
-        // Re-find where the current song ended up in the new order.
-        if let (Some(song_pl), Some(song)) = (self.playing_pl, self.playing_song) {
-            self.queue_pos = self
-                .queue
-                .iter()
-                .position(|&(p, s)| p == song_pl && s == song);
-            if self.show_queue {
-                self.queue_view_state.select(self.queue_pos);
-            }
-        }
-    }
-
-    fn handle_song_end(&mut self) {
-        let ended = {
-            let mut ast = self
-                .audio
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if ast.song_ended {
-                ast.song_ended = false;
-                true
-            } else {
-                false
-            }
-        };
-        if !ended {
-            return;
-        }
-        match self.mode {
-            PlayMode::Single => {
-                if let (Some(pl), Some(song)) = (self.playing_pl, self.playing_song) {
-                    self.do_play(pl, song);
-                }
-            }
-            PlayMode::Cycle | PlayMode::Shuffle => self.advance_queue(1),
+        if let RemoveOutcome::Switched { track } = outcome {
+            let title = self
+                .library
+                .track(track.0, track.1)
+                .and_then(|t| t.title.as_deref())
+                .unwrap_or("next song")
+                .to_string();
+            self.notify(format!("▶  {title}"));
         }
     }
 
@@ -788,11 +520,11 @@ impl App {
         }
     }
 
-    /// Original song indices in `all_songs[pl]` that match the current filter.
-    /// Returns all indices when the filter is empty.
+    /// Original song indices in the selected playlist that match the current
+    /// filter. Returns all indices when the filter is empty.
     #[hotpath::measure]
     fn filtered_songs(&self, pl: usize) -> Vec<usize> {
-        let songs = self.all_songs.get(pl).map(Vec::as_slice).unwrap_or(&[]);
+        let songs = self.library.songs(pl);
         if self.filter.is_empty() {
             return (0..songs.len()).collect();
         }
@@ -801,17 +533,8 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                let title = t["title"].as_str().unwrap_or("").to_lowercase();
-                let artists = t["artists"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x["name"].as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .to_lowercase()
-                    })
-                    .unwrap_or_default();
+                let title = t.title.as_deref().unwrap_or("").to_lowercase();
+                let artists = t.artist_names().to_lowercase();
                 title.contains(&q) || artists.contains(&q)
             })
             .map(|(i, _)| i)
@@ -821,29 +544,21 @@ impl App {
     /// Queue positions whose songs match the current filter.
     /// Returns all positions when the filter is empty.
     fn filtered_queue_positions(&self) -> Vec<usize> {
+        let queue = self.player.queue();
         if self.filter.is_empty() {
-            return (0..self.queue.len()).collect();
+            return (0..queue.len()).collect();
         }
         let q = self.filter.to_lowercase();
-        self.queue
+        queue
             .iter()
             .enumerate()
             .filter(|&(_, &(pl, song_idx))| {
-                let track = self.all_songs.get(pl).and_then(|s| s.get(song_idx));
+                let track = self.library.track(pl, song_idx);
                 let title = track
-                    .and_then(|t| t["title"].as_str())
+                    .and_then(|t| t.title.as_deref())
                     .unwrap_or("")
                     .to_lowercase();
-                let artists = track
-                    .and_then(|t| t["artists"].as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x["name"].as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .to_lowercase()
-                    })
-                    .unwrap_or_default();
+                let artists = track.map(|t| t.artist_names().to_lowercase()).unwrap_or_default();
                 title.contains(&q) || artists.contains(&q)
             })
             .map(|(i, _)| i)
@@ -857,38 +572,14 @@ impl App {
         let Some(pl) = self.list_state.selected() else {
             return;
         };
-        let Some(songs) = self.all_songs.get(pl) else {
-            return;
-        };
+        let songs = self.library.songs(pl);
         let filtered = self.filtered_songs(pl);
         let base = self.songs_state.selected().unwrap_or(0);
         for display_idx in [base, base + 1] {
             if let Some(&real_idx) = filtered.get(display_idx)
-                && let Some(id) = songs.get(real_idx).and_then(|t| t["videoId"].as_str())
-                && !id.is_empty()
+                && let Some(id) = songs.get(real_idx).and_then(|t| t.video_id.as_deref())
             {
-                self.audio.send(AudioCmd::Prefetch(id.to_string()));
-            }
-        }
-    }
-
-    /// Prefetch the next song in the queue so it starts instantly when needed.
-    fn prefetch_next_in_queue(&self) {
-        let n = self.queue.len();
-        if n == 0 {
-            return;
-        }
-        let next_pos = match self.queue_pos {
-            Some(p) => (p + 1) % n,
-            None => return,
-        };
-        let Some(&(pl, next_song)) = self.queue.get(next_pos) else {
-            return;
-        };
-        if let Some(track) = self.all_songs.get(pl).and_then(|s| s.get(next_song)) {
-            let id = track["videoId"].as_str().unwrap_or("").to_string();
-            if !id.is_empty() {
-                self.audio.send(AudioCmd::Prefetch(id));
+                self.player.prefetch(id);
             }
         }
     }
@@ -897,87 +588,11 @@ impl App {
         self.notification = Some((msg.into(), Instant::now()));
     }
 
-    /// Append the song at `song_idx` in `pl_idx` to the end of the queue.
-    /// Works across playlists — only Enter rebuilds/replaces the queue.
-    fn append_to_queue(&mut self, pl_idx: usize, song_idx: usize) {
-        self.queue.push((pl_idx, song_idx));
-        let q_len = self.queue.len();
-        let title = self
-            .all_songs
-            .get(pl_idx)
-            .and_then(|s| s.get(song_idx))
-            .and_then(|t| t["title"].as_str())
-            .unwrap_or("song")
-            .to_string();
-        log::info!("append_to_queue: pl={pl_idx} song={song_idx} queue_len={q_len}");
-
-        if self.playing_song.is_none() {
-            // Nothing playing — start this song immediately
-            self.queue_pos = Some(q_len - 1);
-            self.do_play(pl_idx, song_idx);
-            self.notify(format!("Playing: {title}"));
-        } else {
-            self.notify(format!("+ queue #{q_len}: {title}"));
-        }
-    }
-
-    /// Remove the entry at `q_pos` from the queue and fix up `queue_pos`.
-    /// If the removed entry was currently playing, immediately switch to whatever
-    /// `queue_pos` now points at (or stop if the queue became empty).
-    fn remove_from_queue(&mut self, q_pos: usize) {
-        if q_pos >= self.queue.len() {
-            return;
-        }
-
-        let was_playing = self.queue_pos == Some(q_pos);
-
-        self.queue.remove(q_pos);
-        log::info!(
-            "remove_from_queue: removed q_pos={q_pos} remaining={}",
-            self.queue.len()
-        );
-
-        // Adjust queue_pos so it still refers to the same logical position.
-        self.queue_pos = match self.queue_pos {
-            None => None,
-            Some(p) if p == q_pos && self.queue.is_empty() => None,
-            Some(p) if p >= self.queue.len() => Some(self.queue.len() - 1),
-            Some(p) if p > q_pos => Some(p - 1),
-            Some(p) => Some(p),
-        };
-
-        // Keep queue_view_state in bounds.
-        let new_sel = q_pos.min(self.queue.len().saturating_sub(1));
-        self.queue_view_state.select(if self.queue.is_empty() {
-            None
-        } else {
-            Some(new_sel)
-        });
-
-        // If we removed the actively playing entry, audio must actually switch.
-        if was_playing {
-            match self.queue_pos {
-                None => {
-                    self.audio.send(AudioCmd::Stop);
-                    self.playing_pl = None;
-                    self.playing_song = None;
-                    log::info!("remove_from_queue: queue empty — stopped playback");
-                }
-                Some(pos) => {
-                    let (pl, song) = self.queue[pos];
-                    let title = self
-                        .all_songs
-                        .get(pl)
-                        .and_then(|s| s.get(song))
-                        .and_then(|t| t["title"].as_str())
-                        .unwrap_or("next song")
-                        .to_string();
-                    log::info!("remove_from_queue: switching to pl={pl} song={song}");
-                    self.do_play(pl, song);
-                    self.notify(format!("▶  {title}"));
-                }
-            }
-        }
+    fn selected_song(&self) -> Option<&Track> {
+        let pl = self.list_state.selected()?;
+        let display_idx = self.songs_state.selected()?;
+        let real_idx = *self.filtered_songs(pl).get(display_idx)?;
+        self.library.track(pl, real_idx)
     }
 
     // ── help / notification bar ───────────────────────────────────────────────
@@ -1122,7 +737,7 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
-        if self.playlists.is_empty() {
+        if self.library.is_empty() {
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(Span::styled(
@@ -1169,12 +784,13 @@ impl App {
         }
 
         let rows: Vec<Row> = self
-            .playlists
+            .library
+            .entries()
             .iter()
             .enumerate()
-            .map(|(i, pl)| {
-                let name = pl["title"].as_str().unwrap_or("Untitled");
-                let count = self.all_songs.get(i).map_or(0, Vec::len);
+            .map(|(i, entry)| {
+                let name = entry.playlist.title.as_str();
+                let count = self.library.songs(i).len();
                 Row::new([
                     Cell::from(Span::styled(
                         name.to_string(),
@@ -1264,7 +880,7 @@ impl App {
         let Some(i) = self.list_state.selected() else {
             return 0;
         };
-        let total_secs = self.playlist_total_secs.get(i).copied().unwrap_or(0);
+        let total_secs = self.library.total_duration_secs(i);
         2 + u16::from(total_secs > 0)
     }
 
@@ -1272,20 +888,10 @@ impl App {
         let Some(track) = self.selected_song() else {
             return 0;
         };
-        let title_rows = text_rows(track["title"].as_str().unwrap_or("Unknown"), width).min(2);
-        let has_artists = track["artists"]
-            .as_array()
-            .is_some_and(|arr| arr.iter().any(|a| a["name"].as_str().is_some()));
-        let has_duration =
-            track["duration"].as_str().is_some() || track["duration_seconds"].as_u64().is_some();
+        let title_rows = text_rows(track.title.as_deref().unwrap_or("Unknown"), width).min(2);
+        let has_artists = !track.artists.is_empty();
+        let has_duration = track_duration(track).is_some();
         title_rows + u16::from(has_artists) + u16::from(has_duration)
-    }
-
-    fn selected_song(&self) -> Option<&Value> {
-        let pl = self.list_state.selected()?;
-        let display_idx = self.songs_state.selected()?;
-        let real_idx = *self.filtered_songs(pl).get(display_idx)?;
-        self.all_songs.get(pl)?.get(real_idx)
     }
 
     /// Build a panel title that shows the active filter query.
@@ -1304,20 +910,11 @@ impl App {
         let Some(i) = self.list_state.selected() else {
             return;
         };
-        let pl = &self.playlists[i];
-        let songs = self.all_songs.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        let Some(entry) = self.library.entry(i) else {
+            return;
+        };
 
-        let title = pl["title"].as_str().unwrap_or("Untitled");
-        let author = pl["author"].as_array().and_then(|arr| {
-            let s = arr
-                .iter()
-                .filter_map(|a| a["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if s.is_empty() { None } else { Some(s) }
-        });
-
-        let total_secs = self.playlist_total_secs.get(i).copied().unwrap_or(0);
+        let total_secs = entry.total_duration_secs;
         let duration = (total_secs > 0).then(|| {
             let h = total_secs / 3600;
             let m = (total_secs % 3600) / 60;
@@ -1328,16 +925,10 @@ impl App {
             }
         });
 
-        let title_line = if let Some(a) = author {
-            Line::from(vec![
-                Span::from(title.to_string()).bold(),
-                Span::from(format!("  by {a}")).dim(),
-            ])
-        } else {
-            Line::from(Span::from(title.to_string()).bold())
-        };
-
-        let mut lines = vec![title_line, Line::from(format!("{} songs", songs.len()))];
+        let mut lines = vec![
+            Line::from(Span::from(entry.playlist.title.clone()).bold()),
+            Line::from(format!("{} songs", entry.songs.len())),
+        ];
         if let Some(d) = duration {
             lines.push(Line::from(d));
         }
@@ -1357,22 +948,14 @@ impl App {
         };
         let w = area.width.saturating_sub(2) as usize;
 
-        let title = track["title"].as_str().unwrap_or("Unknown");
+        let title = track.title.as_deref().unwrap_or("Unknown");
         let title_lines = wrap_n_lines(title, w, 2);
 
-        let artists = track["artists"].as_array().and_then(|arr| {
-            let s = arr
-                .iter()
-                .filter_map(|a| a["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if s.is_empty() { None } else { Some(s) }
-        });
-        let duration = track["duration"].as_str().map(str::to_string).or_else(|| {
-            track["duration_seconds"]
-                .as_u64()
-                .map(|s| format!("{}:{:02}", s / 60, s % 60))
-        });
+        let artists = {
+            let s = track.artist_names();
+            (!s.is_empty()).then_some(s)
+        };
+        let duration = track_duration(track);
 
         let mut lines: Vec<Line> = title_lines
             .into_iter()
@@ -1406,9 +989,7 @@ impl App {
         let current_pl = self.list_state.selected();
 
         // Show loading spinner while background fetch is in progress.
-        let is_loading = current_pl
-            .and_then(|i| self.songs_loaded.get(i))
-            .is_some_and(|&loaded| !loaded);
+        let is_loading = current_pl.is_some_and(|i| !self.library.is_loaded(i));
         if is_loading {
             let border_style = if self.active_panel == Panel::Songs {
                 Style::default()
@@ -1430,13 +1011,9 @@ impl App {
             return;
         }
 
-        let playing_pl = self.playing_pl;
-        let playing_song = self.playing_song;
+        let playing = self.player.playing();
 
-        let all_songs = current_pl
-            .and_then(|i| self.all_songs.get(i))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        let all_songs = current_pl.map_or(&[][..], |i| self.library.songs(i));
 
         let filtered = current_pl
             .map(|pl| self.filtered_songs(pl))
@@ -1447,17 +1024,9 @@ impl App {
             .iter()
             .map(|&i| {
                 let track = &all_songs[i];
-                let is_playing = current_pl == playing_pl && Some(i) == playing_song;
-                let title = track["title"].as_str().unwrap_or("Unknown");
-                let artists = track["artists"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|a| a["name"].as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
+                let is_playing = current_pl.map(|pl| (pl, i)) == playing;
+                let title = track.title.as_deref().unwrap_or("Unknown");
+                let artists = track.artist_names();
 
                 let indicator = if is_playing { "♫ " } else { "  " };
                 let num = format!("{:>num_w$}. ", i + 1);
@@ -1481,15 +1050,7 @@ impl App {
                     spans.push(Span::styled(artists, Style::default().fg(Color::Gray)));
                 }
 
-                let dur = track["duration"]
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| {
-                        track["duration_seconds"]
-                            .as_u64()
-                            .map(|s| format!("{}:{:02}", s / 60, s % 60))
-                    })
-                    .unwrap_or_default();
+                let dur = track_duration(track).unwrap_or_default();
 
                 Row::new([
                     Cell::from(Line::from(spans)),
@@ -1545,26 +1106,19 @@ impl App {
     // ── queue view ────────────────────────────────────────────────────────────
 
     fn render_queue(&mut self, frame: &mut Frame, area: Rect) {
-        let queue_pos = self.queue_pos;
+        let queue_pos = self.player.queue_position();
+        let queue = self.player.queue();
         let filtered = self.filtered_queue_positions();
 
         let items: Vec<ListItem> = filtered
             .iter()
             .map(|&q_pos| {
-                let (pl, song_idx) = self.queue[q_pos];
+                let (pl, song_idx) = queue[q_pos];
                 let is_current = Some(q_pos) == queue_pos;
-                let track = self.all_songs.get(pl).and_then(|songs| songs.get(song_idx));
+                let track = self.library.track(pl, song_idx);
 
-                let title = track.and_then(|t| t["title"].as_str()).unwrap_or("Unknown");
-                let artists = track
-                    .and_then(|t| t["artists"].as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|a| a["name"].as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
+                let title = track.and_then(|t| t.title.as_deref()).unwrap_or("Unknown");
+                let artists = track.map(Track::artist_names).unwrap_or_default();
 
                 let indicator = if is_current { "♫ " } else { "  " };
                 let num = format!("{:>3}. ", q_pos + 1);
@@ -1600,11 +1154,9 @@ impl App {
         };
 
         let base_title = {
-            let n = self.queue.len();
-            let pos_str = self
-                .queue_pos
-                .map_or_else(|| format!("0/{n}"), |p| format!("{}/{n}", p + 1));
-            match self.mode {
+            let n = queue.len();
+            let pos_str = queue_pos.map_or_else(|| format!("0/{n}"), |p| format!("{}/{n}", p + 1));
+            match self.player.mode() {
                 PlayMode::Shuffle => format!("Queue  [{pos_str}]  ⇌ Shuffle"),
                 PlayMode::Single => format!("Queue  [{pos_str}]  ⊙ Single"),
                 PlayMode::Cycle => format!("Queue  [{pos_str}]"),
@@ -1645,12 +1197,7 @@ impl App {
     // ── player bar ────────────────────────────────────────────────────────────
 
     fn render_player(&mut self, frame: &mut Frame, area: Rect) {
-        let ast = self
-            .audio
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let ast = self.player.audio_state();
 
         let title = if ast.error.is_some() {
             "Error"
@@ -1742,18 +1289,15 @@ impl App {
         );
 
         // ── row 3: volume bar (left) · mode (right) ─────────────────────────
-        let filled = ((self.volume as usize * 8 + 50) / 100).min(8);
-        let vol_bar = if self.muted {
+        let volume = self.player.volume();
+        let muted = self.player.is_muted();
+        let filled = ((volume as usize * 8 + 50) / 100).min(8);
+        let vol_bar = if muted {
             "MUTE".to_string()
         } else {
-            format!(
-                "{}{} {}%",
-                "█".repeat(filled),
-                "░".repeat(8 - filled),
-                self.volume
-            )
+            format!("{}{} {}%", "█".repeat(filled), "░".repeat(8 - filled), volume)
         };
-        let mode_str = self.mode.label().to_string();
+        let mode_str = self.player.mode().label().to_string();
         let w = extra_area.width as usize;
         let pad = w.saturating_sub(vol_bar.chars().count() + mode_str.chars().count());
 
@@ -1761,7 +1305,7 @@ impl App {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     vol_bar,
-                    if self.muted {
+                    if muted {
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD)
@@ -1776,11 +1320,8 @@ impl App {
         );
     }
 
-    fn player_track_info(
-        &self,
-        ast: &crate::audio::AudioState,
-    ) -> (String, Option<String>, String, String) {
-        let (Some(pl_idx), Some(song_idx)) = (self.playing_pl, self.playing_song) else {
+    fn player_track_info(&self, ast: &AudioState) -> (String, Option<String>, String, String) {
+        let Some((pl_idx, song_idx)) = self.player.playing() else {
             return (
                 "—  No track playing".into(),
                 None,
@@ -1788,7 +1329,7 @@ impl App {
                 "0:00".into(),
             );
         };
-        let Some(track) = self.all_songs.get(pl_idx).and_then(|s| s.get(song_idx)) else {
+        let Some(track) = self.library.track(pl_idx, song_idx) else {
             return (
                 "—  No track playing".into(),
                 None,
@@ -1796,15 +1337,11 @@ impl App {
                 "0:00".into(),
             );
         };
-        let title = track["title"].as_str().unwrap_or("Unknown").to_string();
-        let artist = track["artists"].as_array().and_then(|arr| {
-            let s = arr
-                .iter()
-                .filter_map(|a| a["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if s.is_empty() { None } else { Some(s) }
-        });
+        let title = track.title.clone().unwrap_or_else(|| "Unknown".to_string());
+        let artist = {
+            let s = track.artist_names();
+            (!s.is_empty()).then_some(s)
+        };
         (title, artist, fmt_secs(ast.elapsed), fmt_secs(ast.total))
     }
 }

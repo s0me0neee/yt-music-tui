@@ -1,6 +1,12 @@
+//! Audio playback: an mpv instance embedded in-process via `libmpv2`, driven
+//! from a dedicated thread through a command mailbox.
+//!
+//! Split into its own thread (rather than driven from the caller's event
+//! loop) so a blocking mpv/yt-dlp call never stalls anything else — worst
+//! case this thread hangs, not the whole process.
+
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,6 +14,8 @@ use std::time::Duration;
 
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Format, Mpv};
+
+use crate::shutdown::is_shutdown_requested;
 
 #[allow(dead_code)]
 pub enum Cmd {
@@ -32,7 +40,7 @@ pub struct AudioState {
 
 pub struct AudioEngine {
     cmd_tx: Option<std::sync::mpsc::Sender<Cmd>>,
-    pub state: Arc<Mutex<AudioState>>,
+    state: Arc<Mutex<AudioState>>,
     audio_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -57,6 +65,30 @@ impl AudioEngine {
             let _ = tx.send(cmd);
         }
     }
+
+    /// Snapshot of the current playback state.
+    pub fn state(&self) -> AudioState {
+        self.lock_state().clone()
+    }
+
+    /// Atomically reads and clears `song_ended`. `true` only once per natural
+    /// end-of-track.
+    pub fn take_song_ended(&self) -> bool {
+        let mut s = self.lock_state();
+        std::mem::take(&mut s.song_ended)
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, AudioState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Default for AudioEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for AudioEngine {
@@ -74,7 +106,7 @@ impl Drop for AudioEngine {
 #[hotpath::measure]
 fn resolve_url(video_id: &str) -> Option<String> {
     // Don't start new yt-dlp work if the app is shutting down.
-    if crate::QUIT.load(Ordering::Relaxed) {
+    if is_shutdown_requested() {
         return None;
     }
 
@@ -208,7 +240,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
 
     // ── main loop ─────────────────────────────────────────────────────────────
     loop {
-        if crate::QUIT.load(Ordering::Relaxed) {
+        if is_shutdown_requested() {
             log::info!("[audio] QUIT signal — dropping mpv");
             return;
         }

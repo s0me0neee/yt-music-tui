@@ -2,3 +2,6 @@
 tokencache.json
 .DS_Store
 .yt-tui-browser
+bg_snapshot.bin
+rustypipe_cache.json
+rustypipe_reports/
