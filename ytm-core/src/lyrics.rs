@@ -394,6 +394,15 @@ pub struct TrackLyrics {
     pub album_name: String,
     /// `None` when lrclib has no duration for the record.
     pub duration: Option<f64>,
+    /// Position in lrclib's own result ordering, lowest first.
+    ///
+    /// lrclib returns search hits ranked by relevance — exact title matches
+    /// ahead of decorated variants — and that ordering is stable across
+    /// requests. It is the final tiebreak, so two records our own signals
+    /// can't separate fall back to lrclib's judgement. Recorded explicitly
+    /// rather than relying on the sort being stable, since results are merged
+    /// from several queries.
+    pub relevance: usize,
     pub kind: LyricsKind,
 }
 
@@ -441,6 +450,8 @@ impl TrackLyrics {
 
         Some(Self {
             id: l.id,
+            // Overwritten by `with_relevance` once the position is known.
+            relevance: 0,
             track_name: l.track_name,
             artist_name: l.artist_name,
             album_name: l.album_name,
@@ -451,6 +462,18 @@ impl TrackLyrics {
 }
 
 // ── ranking ──────────────────────────────────────────────────────────────────
+
+/// Stamps lrclib's ordering onto a batch of records, continuing from `from`.
+fn with_relevance(records: Vec<TrackLyrics>, from: usize) -> Vec<TrackLyrics> {
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut c)| {
+            c.relevance = from + i;
+            c
+        })
+        .collect()
+}
 
 /// Orders candidates best-first: synced before plain, then closest duration,
 /// then artist/title agreement, then LRCLIB's own relevance order.
@@ -489,15 +512,18 @@ pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
                     .map_or(f64::INFINITY, |d| d.round()),
                 !c.artist_name.to_lowercase().contains(&artist),
                 !c.track_name.to_lowercase().eq(&title),
+                // Last word goes to lrclib's own relevance ranking.
+                c.relevance,
             )
         };
-        let (a_sync, a_delta, a_art, a_tit) = key(a);
-        let (b_sync, b_delta, b_art, b_tit) = key(b);
+        let (a_sync, a_delta, a_art, a_tit, a_rel) = key(a);
+        let (b_sync, b_delta, b_art, b_tit, b_rel) = key(b);
         a_sync
             .cmp(&b_sync)
             .then(a_delta.total_cmp(&b_delta))
             .then(a_art.cmp(&b_art))
             .then(a_tit.cmp(&b_tit))
+            .then(a_rel.cmp(&b_rel))
     });
 
     items
@@ -666,10 +692,12 @@ impl LyricsService {
                     // A response whose records all lack lyrics still counts as
                     // a miss — keep broadening rather than reporting "no lyrics
                     // found" as the old `raw.is_empty()` check did.
-                    let usable: Vec<TrackLyrics> = raw
-                        .into_iter()
-                        .filter_map(TrackLyrics::from_record)
-                        .collect();
+                    let usable = with_relevance(
+                        raw.into_iter()
+                            .filter_map(TrackLyrics::from_record)
+                            .collect(),
+                        0,
+                    );
                     let ranked = rank(usable, q);
 
                     // `rank` sorts synced first, so the head tells us whether
@@ -720,7 +748,16 @@ impl LyricsService {
             }
             match self.run(&attempt).await {
                 Ok(raw) => {
-                    for found in raw.into_iter().filter_map(TrackLyrics::from_record) {
+                    // `all.len()` continues the counter, so earlier (more
+                    // precise) rungs keep priority and lrclib's ordering is
+                    // preserved within each.
+                    let batch = with_relevance(
+                        raw.into_iter()
+                            .filter_map(TrackLyrics::from_record)
+                            .collect(),
+                        all.len(),
+                    );
+                    for found in batch {
                         if seen.insert(found.id) {
                             all.push(found);
                         }
@@ -809,6 +846,7 @@ mod tests {
     fn rec(id: u64, duration: f64, synced: bool) -> TrackLyrics {
         TrackLyrics {
             id,
+            relevance: id as usize,
             track_name: "Echo".into(),
             artist_name: "Crusher-P".into(),
             album_name: String::new(),
@@ -1408,6 +1446,43 @@ mod tests {
         );
     }
 
+    /// lrclib returns hits in its own relevance order — exact title matches
+    /// ahead of decorated variants — and we carry that through as the final
+    /// tiebreak. This checks the assumption still holds upstream.
+    #[tokio::test]
+    #[ignore = "hits the live lrclib.net API"]
+    async fn lrclib_results_are_relevance_ordered() {
+        let svc = LyricsService::new();
+        let raw = svc
+            .client
+            .search_by_meta("法螺話", "", "")
+            .await
+            .expect("search errored");
+        assert!(raw.len() > 3);
+
+        // Exact title matches must precede decorated ones.
+        let last_exact = raw.iter().rposition(|l| l.track_name == "法螺話");
+        let first_decorated = raw.iter().position(|l| l.track_name != "法螺話");
+        if let (Some(last), Some(first)) = (last_exact, first_decorated) {
+            assert!(
+                last < first,
+                "lrclib no longer returns relevance-ordered results: {:?}",
+                raw.iter().map(|l| &l.track_name).collect::<Vec<_>>()
+            );
+        }
+
+        // And the order is stable, so using it as a tiebreak is deterministic.
+        let again = svc
+            .client
+            .search_by_meta("法螺話", "", "")
+            .await
+            .expect("search errored");
+        assert_eq!(
+            raw.iter().map(|l| l.id).collect::<Vec<_>>(),
+            again.iter().map(|l| l.id).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     #[ignore = "hits the live lrclib.net API"]
     async fn candidates_returns_multiple_ranked_records() {
@@ -1521,16 +1596,37 @@ mod tests {
     }
 
     #[test]
-    fn ties_preserve_source_order() {
+    fn ties_fall_back_to_lrclib_relevance() {
+        // Same length, same everything else: lrclib ranked #7 first, so it wins
+        // — and it wins even when handed to us out of order, because the
+        // ranking is an explicit sort key rather than an artefact of the sort
+        // happening to be stable.
         let out = rank(
             vec![
+                rec(9, 245.0, true),
                 rec(7, 245.0, true),
                 rec(8, 245.0, true),
-                rec(9, 245.0, true),
             ],
             &q(Some(245.0)),
         );
         assert_eq!(ids(&out), [7, 8, 9]);
+    }
+
+    #[test]
+    fn relevance_only_breaks_ties_it_cannot_override_a_better_match() {
+        // lrclib ranked #1 first, but #2 is closer to the track's length.
+        let out = rank(
+            vec![rec(1, 249.0, true), rec(2, 245.0, true)],
+            &q(Some(245.0)),
+        );
+        assert_eq!(ids(&out), [2, 1]);
+
+        // ...and a synced record outranks a more "relevant" unsynced one.
+        let out = rank(
+            vec![rec(1, 245.0, false), rec(2, 245.0, true)],
+            &q(Some(245.0)),
+        );
+        assert_eq!(ids(&out), [2, 1]);
     }
 
     #[test]
