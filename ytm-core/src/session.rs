@@ -48,6 +48,12 @@ pub fn browser_file_path() -> PathBuf {
 pub fn queue_path() -> PathBuf {
     app_config_dir().join("queue.json")
 }
+pub fn settings_path() -> PathBuf {
+    app_config_dir().join("settings.json")
+}
+pub fn lyrics_path() -> PathBuf {
+    app_config_dir().join("lyrics.json")
+}
 pub fn config_toml_path() -> PathBuf {
     app_config_dir().join("config.toml")
 }
@@ -350,7 +356,11 @@ fn parse_netscape_cookies(content: &str) -> String {
             let _expiry = parts.next()?;
             let name = parts.next()?;
             let value = parts.next()?;
-            if domain.ends_with("youtube.com") {
+            // Skip per-tab session-token cookies (ST-*): browser profiles
+            // accumulate dozens of them and the resulting header blows past
+            // Google's request-size limit (HTTP 413). ytmusicapi does not
+            // need them.
+            if domain.ends_with("youtube.com") && !name.starts_with("ST-") {
                 Some(format!("{name}={value}"))
             } else {
                 None

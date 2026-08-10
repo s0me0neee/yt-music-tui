@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 ytm-core = { path = "../ytm-core" }
 ratatui = "0.30.0"
+# Already resolved in the graph via ratatui-core — used for cell-accurate
+# truncation so wide (CJK/emoji) titles don't over-run their column.
+unicode-width = "0.2"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 log = "0.4"

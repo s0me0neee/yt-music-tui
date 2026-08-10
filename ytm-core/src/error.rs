@@ -48,6 +48,9 @@ pub enum Error {
     #[error("libmpv init failed: {0}")]
     Mpv(String),
 
+    #[error("lyrics lookup failed: {0}")]
+    Lyrics(#[from] lrclib::LrcError),
+
     #[error("{0}")]
     Other(String),
 }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+lrclib = { path = "../lrclib" }
 ytmusicapi = "0.4.2"
 libmpv2 = "6.0.0"
 tokio = { version = "1", features = ["rt", "time"] }
@@ -15,6 +16,10 @@ rand = "0.8"
 dirs = "5"
 inquire = "0.9.4"
 hotpath = "0.19.0"
+
+[dev-dependencies]
+# `macros` for #[tokio::test] in the live lyrics tests.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [build-dependencies]
 pkg-config = "0.3.33"

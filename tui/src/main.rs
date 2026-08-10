@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
     let saved_queue = persistence::load_queue();
     let lib = library::Library::new(playlists);
 
-    let result = app::App::new(lib, saved_queue, songs_rx).run();
+    let result = app::App::new(lib, saved_queue, songs_rx, rt.handle().clone()).run();
 
     // Wait for cookie refresh before exiting so browser.json is never partial.
     let _ = cookie_refresh.join();

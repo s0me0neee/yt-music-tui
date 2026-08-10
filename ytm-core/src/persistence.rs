@@ -1,12 +1,13 @@
 //! Queue persistence: serialising the live queue to `queue.json` on exit and
 //! resolving it back to `(playlist_idx, song_idx)` pairs on the next launch.
+//! Also holds user settings persisted to `settings.json`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::library::Library;
 use crate::player::TrackRef;
-use crate::session::queue_path;
+use crate::session::{lyrics_path, queue_path, settings_path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueEntry {
@@ -31,6 +32,78 @@ pub fn save_queue(state: &QueueState) -> Result<()> {
 pub fn load_queue() -> Option<QueueState> {
     let json = std::fs::read_to_string(queue_path()).ok()?;
     serde_json::from_str(&json).ok()
+}
+
+// ── settings ─────────────────────────────────────────────────────────────────
+
+fn default_volume() -> u8 {
+    80
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// Playback volume (0-100), restored on the next launch.
+    #[serde(default = "default_volume")]
+    pub volume: u8,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            volume: default_volume(),
+        }
+    }
+}
+
+pub fn save_settings(settings: &Settings) -> Result<()> {
+    std::fs::write(settings_path(), serde_json::to_string_pretty(settings)?)?;
+    Ok(())
+}
+
+pub fn load_settings() -> Settings {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+// ── lyrics overrides ─────────────────────────────────────────────────────────
+
+/// Manual lyric choices: `video_id` → lrclib record id.
+///
+/// Wrapped in a struct rather than serialised as a bare map so later fields
+/// don't break the on-disk format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LyricsOverrides {
+    #[serde(default)]
+    pub choices: std::collections::HashMap<String, u64>,
+}
+
+impl LyricsOverrides {
+    pub fn get(&self, video_id: &str) -> Option<u64> {
+        self.choices.get(video_id).copied()
+    }
+
+    pub fn set(&mut self, video_id: &str, id: u64) {
+        self.choices.insert(video_id.to_string(), id);
+    }
+
+    /// Reverts a track to automatic matching.
+    pub fn clear(&mut self, video_id: &str) {
+        self.choices.remove(video_id);
+    }
+}
+
+pub fn save_lyrics_overrides(overrides: &LyricsOverrides) -> Result<()> {
+    std::fs::write(lyrics_path(), serde_json::to_string_pretty(overrides)?)?;
+    Ok(())
+}
+
+pub fn load_lyrics_overrides() -> LyricsOverrides {
+    std::fs::read_to_string(lyrics_path())
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
 
 /// Serialises a live queue into a [`QueueState`] ready for [`save_queue`].

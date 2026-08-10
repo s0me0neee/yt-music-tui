@@ -8,94 +8,140 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build          # compile
 cargo run            # run the TUI
 cargo check          # fast type-check without linking
-cargo test           # run tests
+cargo test           # run tests (offline — network tests are #[ignore]d)
 cargo test <name>    # run a single test by name
+
+cargo test -p lrclib -- --ignored   # the live lrclib.net API tests
 ```
 
 ## Credential Setup
 
 Auth uses cookie-based auth via `browser.json` (ytmusicapi style — no OAuth).
 
-On first run (`browser.json` absent), the app runs an interactive setup:
-- Open `music.youtube.com` in Chrome, open DevTools → Network
-- Click any request → right-click → "Copy as cURL (bash)"
-- Paste into the terminal and press Enter (no Ctrl+D needed — the app auto-detects the end of the curl command)
-- `browser.json` is written and the app continues
-
-`src/auth.rs` contains a scaffolded OAuth 2.0 / yup_oauth2 flow that is not currently wired up (ytmusicapi OAuth is broken upstream).
+On first run (`browser.json` absent), the app runs an interactive setup that shells out to
+`yt-dlp --cookies-from-browser` to extract YouTube cookies from a local browser profile.
+Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
+`lyrics.json`, `config.toml`, `app.log`).
 
 ## Architecture
 
-A full Rust TUI (ratatui + crossterm) that streams YouTube Music via mpv.
+A Cargo workspace with three members. `ytm-core` is UI-agnostic so the engine can be driven
+by something other than the ratatui frontend.
 
-### Source files
+```
+lrclib/     lyrics.net API client + LRC format parser (no app knowledge)
+ytm-core/   session/auth, library, playback, queue, lyrics policy, persistence
+tui/        the ratatui frontend — single `ytm` binary
+```
 
-**`src/main.rs`**
-- Initialises logging to `app.log`
-- Installs a `ctrlc` handler (`SIGINT/SIGTERM/SIGHUP`) that sets `QUIT: AtomicBool`
-- Checks for `browser.json`; if missing or expired, runs `setup::run_setup()`
-- Fetches all playlists + their tracks in parallel (scoped threads) then hands off to `App::run()`
+### `lrclib/`
 
-**`src/api.rs`**
-- `get_playlists(yt)` — returns `Err(ApiError::SessionExpired)` when the YTM API returns a non-array (expired cookie); callers in `main.rs` catch this and re-run setup
-- `get_songs(yt, playlist_id)` — returns all tracks for a playlist
+- **`api.rs`** — `LrcLib` client over `reqwest` (async). `get`, `get_by_id`, `search`,
+  `search_by_meta`. Timeouts are set on the client so a hung server can't stall the UI.
+- **`lrc.rs`** — `parse_lrc` turns raw `[mm:ss.xx]line` text into sorted `LyricLine`s;
+  `active_index` answers "which line is playing at time *t*" via binary search;
+  `next_boundary` drives the redraw schedule. Handles multi-timestamp lines, metadata tags,
+  and `[offset:]`.
 
-**`src/setup.rs`**
-- `run_setup(path)` — reads cURL input line-by-line, stops automatically when the trailing-backslash continuation chain ends (no Ctrl+D required), writes `browser.json`
+### `ytm-core/`
 
-**`src/audio.rs`**
-- `AudioEngine` — owns the audio thread and an `Arc<Mutex<AudioState>>`
-- `Drop` kills mpv and joins the audio thread
-- Audio thread spawns mpv with `--input-ipc-server=/tmp/yt-tui-{pid}.sock`
-- Background URL resolution: `Cmd::Prefetch(id)` pre-resolves CDN URLs via yt-dlp (capped at 2 concurrent threads); `Cmd::Play(id)` uses the cache if warm, otherwise sends the YouTube URL to mpv immediately and races a background resolve — if it arrives while mpv is still loading, it upgrades to the direct CDN URL (`pending_resolve`)
-- `pub static QUIT: AtomicBool` — checked in the audio loop; killed cleanly on signal
-- IPC socket file cleaned up on every exit path
+- **`session.rs`** — `Session`: cookie extraction via yt-dlp, `browser.json` I/O, config paths.
+- **`library.rs`** — `Library`, `Track`, `Playlist`. `spawn_library_fetch` streams each
+  playlist's tracks back over an `mpsc` channel as they arrive.
+- **`playback.rs`** — `AudioEngine` owns an in-process **libmpv** instance (`libmpv2`) on its
+  own thread, plus an `Arc<Mutex<AudioState>>` snapshot. `AudioState::elapsed` is the live
+  playback position, fed by an mpv `time-pos` property observer.
+- **`player.rs`** — `Player`: queue, play modes, volume/mute, song-end advance.
+- **`lyrics.rs`** — policy over `lrclib`. `LyricsService::best_for` layers `/get` (exact, has
+  duration, returns one) over `/search` (returns many, ignores duration), preferring synced
+  over plain; `rank` does duration-proximity scoring client-side. `spawn_best`/`spawn_choices`
+  do the fetching in background tokio tasks.
+- **`persistence.rs`** — `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
+  choices, keyed by video ID).
 
-**`src/app.rs`**
-- `App` — full TUI state: playlists, songs, queue, playback, filter
-- Event loop polls `QUIT` flag and `event::poll(200ms)`
-- **Filter**: `/` opens inline filter mode; typing narrows songs or queue by title/artist in real time; `Enter` confirms (keeps filter), `Esc` clears; filter is shown in the panel title as `/query█` while typing
-- **Queue**: `a` appends, `d` removes (switching audio to next if current entry removed), `o` toggles queue/songs view, `p`/`n` skip prev/next
-- **Prefetch**: j/k navigation in Songs fires `Cmd::Prefetch` for the selected + next song so the CDN URL is warm before Enter is pressed
+### `tui/`
 
-**`src/auth.rs`**
-- Unused scaffolding for yup_oauth2 OAuth flow (for when ytmusicapi upstream fixes OAuth)
+- **`main.rs`** — logging, ctrlc handler, session setup, builds the tokio runtime, kicks off
+  the background library fetch, then hands off to `App::run()`.
+- **`app.rs`** — all TUI state and rendering.
+  - **Chrome**: no bordered panels. Each panel is a `section()` — an uppercase
+    header, an optional right-aligned status, and a rule — separated by
+    whitespace. Only *overlays* (the `?` keymap, the lyrics picker) keep a
+    border, because they float above other content.
+  - **Colour**: every style is a named constant in the `theme` module, and every
+    value is an **ANSI named colour** (never `Rgb`/`Indexed`) so the user's own
+    terminal palette drives the look. One role per colour — Cyan is focus and
+    keys, Green is playing, Yellow warns, Red errors, Gray/DarkGray are content
+    metadata and chrome respectively.
+  - **Focus** is carried by the section header's colour and by the selection
+    style (`SELECTED` vs `SELECTED_BLUR`), since there is no border to tint.
+  - **Filter**: `/` opens inline filter mode; `Enter` confirms (keeps filter), `Esc` clears.
+  - **Queue**: `a` appends, `d` removes, `o` toggles queue/songs view, `p`/`n` skip.
+  - **Prefetch**: j/k in Songs warms the CDN URL for the selected + next song.
+  - **Lyrics**: `y` replaces the right column with a synced-lyrics panel that auto-centres the
+    active line; `c` opens a modal to pick a different lrclib record; `r` retries a failed
+    fetch. Results are cached per video ID and never re-fetched, so toggling is free.
 
-**`src/ytm.rs`**
-- Legacy pyo3 bridge (unused in current flow — ytmusicapi Rust crate is used instead)
+### Event loop cadence
+
+`event::poll` normally blocks 200 ms, but `App::poll_timeout` shortens it to wake just after
+the next lyric boundary while synced lyrics are following playback (clamped to 33–200 ms).
+Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 
 ### Keybindings
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate down / up |
+| `j` / `k` | Navigate down / up (scroll lyrics in lyrics mode) |
 | `h` / `l` | Switch panels (Playlists ↔ Songs) |
 | `Enter` | Open playlist / play song / play from queue |
 | `/` | Enter filter mode (songs or queue panel) |
-| `Esc` | Clear filter → back to playlists → quit |
+| `Esc` | Re-centre lyrics → close lyrics → clear filter → back to playlists → quit |
 | `Space` | Pause / resume |
 | `p` / `n` | Previous / next in queue |
 | `←` / `→` | Seek −5s / +5s |
 | `↑` / `↓` | Volume +5 / −5 |
-| `m` | Cycle play mode (Cycle → Single → Shuffle) |
+| `m` | Mute / unmute |
+| `t` | Cycle play mode (Cycle → Single → Shuffle) |
 | `a` | Append selected song to queue |
 | `d` | Remove selected queue entry |
 | `o` | Toggle queue / songs view |
-| `q` | Quit |
+| `y` | Toggle lyrics panel |
+| `c` | (in lyrics mode) Choose a different lrclib record |
+| `r` | (in lyrics mode) Retry a failed lyrics fetch |
+| `?` | Full keymap overlay (any key closes it) |
+| `q` / `Ctrl+C` | Quit |
+
+The one-row help bar shows only as many hints as fit, dropping whole hints from
+the end (`fit_hints`) — the full list needs ~143 columns, so `?` is where the
+complete keymap lives.
+
+Note: raw mode clears `ISIG`, so `Ctrl+C` never becomes a signal — `app.rs` matches it as a
+key event. The `ctrlc` handler in `main.rs` only covers SIGTERM/SIGHUP.
 
 ### Data flow
 
 ```
 main.rs
-  └─ YTMusic::authenticated("browser.json")
-  └─ api::get_playlists()  ──► App::new(playlists, all_songs)
-  └─ api::get_songs() ×N          └─ App::run()
-       (parallel threads)               └─ event_loop → AudioEngine::send(Cmd)
-                                                             └─ audio thread → mpv IPC
+  └─ Session::build_client()
+  └─ library::get_playlists()  ──► App::new(library, saved_queue, songs_rx, rt_handle)
+  └─ library::spawn_library_fetch()   └─ App::run()
+       (tokio tasks → mpsc)                └─ event_loop
+                                                ├─ drain_song_channel / drain_lyrics
+                                                ├─ render
+                                                └─ Player → AudioEngine → libmpv
 ```
 
 ## Dependency notes
 
-Cargo resolves versions more loosely than expected in edition 2024. When adding or updating dependencies, pin exact versions in `Cargo.toml` and run `cargo tree` to confirm the resolved version before writing code against a specific API.
+Cargo resolves versions more loosely than expected in edition 2024. When adding or updating
+dependencies, pin exact versions in `Cargo.toml` and run `cargo tree` to confirm the resolved
+version before writing code against a specific API.
 
-Key deps: `ratatui 0.30`, `ytmusicapi` (path dep `../ytmusicapi`), `thiserror 1`, `ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.8`, `throbber-widgets-tui 0.11`.
+**reqwest is pinned to 0.12** across the workspace to match what `ytmusicapi` already pulls in.
+Do not bump `lrclib` to 0.13 casually — it would add a second HTTP stack plus an `aws-lc-sys`
+C build (needs cc + cmake). Verify with `cargo tree -i aws-lc-sys` (should report *not found*).
+Note 0.12 has no `query` feature; `.query()` is unconditional there.
+
+Key deps: `ratatui 0.30`, `ytmusicapi 0.4.2`, `libmpv2 6`, `reqwest 0.12`, `thiserror 1`,
+`ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.8`, `throbber-widgets-tui 0.11`.

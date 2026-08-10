@@ -128,6 +128,12 @@ impl Player {
         self.muted
     }
 
+    /// The volume to persist across runs: while muted this is the pre-mute
+    /// level, so quitting muted doesn't save a level of 0.
+    pub fn effective_volume(&self) -> u8 {
+        if self.muted { self.pre_mute_vol } else { self.volume }
+    }
+
     // ── playback ─────────────────────────────────────────────────────────────
 
     /// Warm the CDN URL cache for `video_id` ahead of an expected `play`/`resume`.

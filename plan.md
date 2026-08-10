@@ -65,10 +65,13 @@ Legend: ✅ done  🔄 in progress  ❌ not started
 
 ## Tier 3 — Polish
 
-❌ **Lyrics panel** (`y` key)
-- Toggle a right-side panel that shows lyrics fetched via `get_lyrics(browse_id)`
-- Scrollable with `j`/`k`; `y` again closes it
-- `browse_id` is returned alongside song metadata — cache per video_id to avoid repeated fetches
+✅ **Lyrics panel** (`y` key)
+- Sourced from **lrclib.net**, not ytmusicapi: `get_lyrics(browse_id)` does not exist in
+  ytmusicapi 0.4.2. The `lrclib` crate was vendored into the workspace as a member.
+- `y` replaces the right column with synced lyrics that auto-centre the active line, driven by
+  `AudioState::elapsed`; falls back to unsynced when no synced record exists
+- `c` opens a modal to pick a different lrclib record; the choice persists in `lyrics.json`
+- Scrollable with `j`/`k`; cached per video_id so toggling never re-fetches
 
 ❌ **Config file** (`~/.config/yt-music-tui/config.toml`)
 - The file is created but not read yet
