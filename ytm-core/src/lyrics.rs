@@ -26,10 +26,15 @@ use crate::library::Track;
 /// deliberately no "show them anyway if nothing else matched" fallback.
 const MAX_DURATION_DELTA: f64 = 5.0;
 
-/// How close the exact-lookup hit must be before it's accepted without also
-/// consulting search. lrclib's `/get` tolerates a few seconds either way, and
-/// the record it picks is often not the best-timed one on offer.
-const EXACT_DURATION_DELTA: f64 = 2.0;
+/// A synced record this close to the track's length is a clear winner: the
+/// search stops there rather than broadening, and the exact-lookup hit is
+/// accepted without consulting search at all.
+///
+/// Sub-second deliberately. Both lrclib and YouTube report whole seconds for
+/// most tracks, so a genuine match lands on zero — and anything a second out
+/// must still compete, because an exactly-matching record often exists under
+/// slightly different metadata and would otherwise never be reached.
+const DECISIVE_DURATION_DELTA: f64 = 0.5;
 
 /// Words that mark a bracketed group as production decoration rather than part
 /// of the song's name. `(Remix)` and `(self cover)` are deliberately absent —
@@ -600,7 +605,7 @@ impl LyricsService {
                     if let Some(found) = TrackLyrics::from_record(l) {
                         let close = found
                             .duration_delta(q.duration)
-                            .is_some_and(|d| d <= EXACT_DURATION_DELTA);
+                            .is_some_and(|d| d <= DECISIVE_DURATION_DELTA);
                         if found.is_synced() && close {
                             return Ok(Some(found));
                         }
@@ -625,7 +630,7 @@ impl LyricsService {
         // network failure and "lrclib genuinely has nothing" are different
         // things, and the UI shows them differently. Only reach for the plain
         // fallback once we know the search itself succeeded.
-        let mut found = match self.search_first_match(q).await {
+        let mut found = match self.search_ladder(q, true).await {
             Ok(found) => found,
             Err(e) if plain_fallback.is_some() => {
                 log::warn!("lyrics search failed ({e}) — using the exact plain match");
@@ -667,21 +672,30 @@ impl LyricsService {
         }
     }
 
-    /// Walks the ladder for the automatic match, stopping as soon as a rung
-    /// offers *synced* lyrics.
+    /// Whether `found` settles the search outright: synced, and its length
+    /// matches the track closely enough that nothing better can exist.
+    fn is_decisive(found: &TrackLyrics, q: &LyricsQuery) -> bool {
+        found.is_synced()
+            && found
+                .duration_delta(q.duration)
+                .is_some_and(|d| d <= DECISIVE_DURATION_DELTA)
+    }
+
+    /// Walks the ladder, merging each rung's results into one ranked pool.
     ///
-    /// Stopping at the first rung with any usable record isn't enough: a
-    /// precise rung often returns a pile of unsynced uploads while the one
-    /// synced transcription sits under different metadata — a blank album, say
-    /// — and is only reachable from a broader rung. Unsynced hits are therefore
-    /// remembered and the search continues, so a timed transcription always
-    /// wins over an untimed one.
+    /// With `stop_early`, the walk ends as soon as the pool holds a decisive
+    /// match — so a well-tagged track still costs one request. Without it,
+    /// every rung runs and the caller sees everything reachable.
     ///
-    /// The cost lands on tracks that genuinely have no synced lyrics: those
-    /// walk the whole ladder. Results are cached per track, so it is paid once.
-    async fn search_first_match(&self, q: &LyricsQuery) -> Result<Vec<TrackLyrics>> {
+    /// Merging rather than returning the first rung that matched is what makes
+    /// the best record win: a precise query often returns a near-miss (a
+    /// transcription a second out, or an unsynced upload) while the exact one
+    /// sits under looser metadata — a plain `Sway` where the track is
+    /// `Sway (feat. Nevve)` — and is only reachable from a broader rung.
+    async fn search_ladder(&self, q: &LyricsQuery, stop_early: bool) -> Result<Vec<TrackLyrics>> {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut pool: Vec<TrackLyrics> = Vec::new();
         let mut last_err = None;
-        let mut plain: Vec<TrackLyrics> = Vec::new();
 
         for attempt in q.search_ladder() {
             if matches!(&attempt, Attempt::FreeText(s) if s.is_empty()) {
@@ -691,24 +705,29 @@ impl LyricsService {
                 Ok(raw) => {
                     // A response whose records all lack lyrics still counts as
                     // a miss — keep broadening rather than reporting "no lyrics
-                    // found" as the old `raw.is_empty()` check did.
-                    let usable = with_relevance(
+                    // found" as an early `raw.is_empty()` check would.
+                    //
+                    // The relevance counter continues from the pool length, so
+                    // earlier (more precise) rungs keep priority and lrclib's
+                    // own ordering is preserved within each.
+                    let batch = with_relevance(
                         raw.into_iter()
                             .filter_map(TrackLyrics::from_record)
                             .collect(),
-                        0,
+                        pool.len(),
                     );
-                    let ranked = rank(usable, q);
-
-                    // `rank` sorts synced first, so the head tells us whether
-                    // this rung has any.
-                    if ranked.first().is_some_and(TrackLyrics::is_synced) {
-                        log::debug!("lyrics: synced match on {attempt:?}");
-                        return Ok(ranked);
+                    for found in batch {
+                        if seen.insert(found.id) {
+                            pool.push(found);
+                        }
                     }
-                    if plain.is_empty() && !ranked.is_empty() {
-                        log::debug!("lyrics: unsynced match on {attempt:?}, still looking");
-                        plain = ranked;
+
+                    if stop_early
+                        && let Some(best) = rank(pool.clone(), q).into_iter().next()
+                        && Self::is_decisive(&best, q)
+                    {
+                        log::debug!("lyrics: decisive match #{} on {attempt:?}", best.id);
+                        return Ok(rank(pool, q));
                     }
                 }
                 // One failing rung shouldn't abort the ladder — a later,
@@ -722,61 +741,24 @@ impl LyricsService {
 
         match last_err {
             // Every rung failed and nothing was found: an error, not an absence.
-            Some(e) if plain.is_empty() => Err(e.into()),
-            _ => Ok(plain),
+            Some(e) if pool.is_empty() => Err(e.into()),
+            _ => {
+                log::debug!("lyrics: {} candidates across the ladder", pool.len());
+                Ok(rank(pool, q))
+            }
         }
     }
 
     /// Every candidate the ladder can reach, de-duplicated and ranked.
     ///
-    /// Unlike the automatic match this runs *all* rungs and merges them, so the
-    /// picker offers everything a manual lrclib search would turn up — stopping
-    /// at the first rung meant a precise query returning one record hid the
-    /// dozen a broader one would have found. It is only invoked when the user
-    /// presses `c`, so the extra requests are paid for deliberately.
+    /// Unlike the automatic match this never stops early, so the picker offers
+    /// everything a manual lrclib search would turn up. It is only invoked when
+    /// the user presses `c`, so the extra requests are paid for deliberately.
     ///
     /// Returns *full* records — LRCLIB's search response already includes
     /// `syncedLyrics`, so committing a choice needs no further request.
     pub async fn candidates(&self, q: &LyricsQuery) -> Result<Vec<TrackLyrics>> {
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut all: Vec<TrackLyrics> = Vec::new();
-        let mut last_err = None;
-
-        for attempt in q.search_ladder() {
-            if matches!(&attempt, Attempt::FreeText(s) if s.is_empty()) {
-                continue;
-            }
-            match self.run(&attempt).await {
-                Ok(raw) => {
-                    // `all.len()` continues the counter, so earlier (more
-                    // precise) rungs keep priority and lrclib's ordering is
-                    // preserved within each.
-                    let batch = with_relevance(
-                        raw.into_iter()
-                            .filter_map(TrackLyrics::from_record)
-                            .collect(),
-                        all.len(),
-                    );
-                    for found in batch {
-                        if seen.insert(found.id) {
-                            all.push(found);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("lyrics: {attempt:?} failed: {e}");
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        if all.is_empty()
-            && let Some(e) = last_err
-        {
-            return Err(e.into());
-        }
-        log::debug!("lyrics: {} candidates across the ladder", all.len());
-        Ok(rank(all, q))
+        self.search_ladder(q, false).await
     }
 }
 
@@ -1260,7 +1242,7 @@ mod tests {
             .expect("no lyrics");
         let delta = best.duration_delta(q.duration).expect("no duration");
         assert!(
-            delta <= EXACT_DURATION_DELTA,
+            delta <= DECISIVE_DURATION_DELTA,
             "picked #{} at {:?}s — {delta}s off a 244s track",
             best.id,
             best.duration
@@ -1304,7 +1286,7 @@ mod tests {
             duration: Some(244.0),
         };
 
-        let first = svc.search_first_match(&q).await.expect("search errored");
+        let first = svc.search_ladder(&q, true).await.expect("search errored");
         let all = svc.candidates(&q).await.expect("search errored");
         assert!(
             all.len() > first.len(),
@@ -1480,6 +1462,34 @@ mod tests {
         assert_eq!(
             raw.iter().map(|l| l.id).collect::<Vec<_>>(),
             again.iter().map(|l| l.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// `Sway (feat. Nevve)` at 3:21. lrclib's exact 201s record is titled just
+    /// `Sway`, while `/get` and the precise rungs both return a 202s one — so
+    /// accepting either without broadening picked the 3:22.
+    #[tokio::test]
+    #[ignore = "hits the live lrclib.net API"]
+    async fn picks_the_exact_duration_over_a_near_miss() {
+        let svc = LyricsService::new();
+        let q = LyricsQuery {
+            title: "Sway (feat. Nevve)".into(),
+            artist: "Syn Cole, Nevve".into(),
+            album: String::new(),
+            duration: Some(201.0),
+        };
+        let found = svc
+            .best_for(&q, None)
+            .await
+            .expect("lookup errored")
+            .expect("no lyrics found");
+        assert!(found.is_synced());
+        assert_eq!(
+            found.duration,
+            Some(201.0),
+            "picked #{} at {:?}s over the exact 201s record",
+            found.id,
+            found.duration
         );
     }
 
