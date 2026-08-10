@@ -75,9 +75,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let session = Session::new()?;
+    // Refresh first rather than in the background as the TUI does: cookies go
+    // stale within the hour, and YouTube answers an unauthenticated library
+    // request with an empty list rather than an error, so a stale session shows
+    // up here as "every track is missing" instead of anything diagnosable.
+    if let Err(e) = session.refresh_cookies() {
+        eprintln!("cookie refresh failed ({e}) — trying the cached session");
+    }
     let yt = session.build_client()?;
+
     let playlists = library::get_playlists(&yt).await?;
     eprintln!("fetching {} playlists...", playlists.len());
+    if playlists.is_empty() {
+        eprintln!("no playlists — the session is probably expired; run the app once");
+        return Ok(());
+    }
 
     let mut tracks: HashMap<String, ytm_core::Track> = HashMap::new();
     for pl in &playlists {
