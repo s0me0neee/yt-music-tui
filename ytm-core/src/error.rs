@@ -2,6 +2,14 @@
 
 use crate::session::Browser;
 
+/// How to install yt-dlp, phrased for the platform actually running.
+#[cfg(target_os = "windows")]
+const YTDLP_INSTALL: &str = "winget install yt-dlp  or  pip install yt-dlp";
+#[cfg(target_os = "macos")]
+const YTDLP_INSTALL: &str = "brew install yt-dlp  or  pip install yt-dlp";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const YTDLP_INSTALL: &str = "pip install yt-dlp";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The YouTube Music session has expired and re-authentication is required.
@@ -21,15 +29,19 @@ pub enum Error {
     Prompt(#[from] inquire::InquireError),
 
     /// `yt-dlp` isn't installed or failed to spawn.
-    #[error("yt-dlp not found — install it with: pip install yt-dlp  or  brew install yt-dlp")]
+    #[error("yt-dlp not found — install it with: {}", YTDLP_INSTALL)]
     YtDlpNotInstalled,
 
-    /// `yt-dlp` ran but wrote no cookie file — the user isn't signed in to YouTube
-    /// Music in the given browser.
+    /// `yt-dlp` ran but wrote no cookie file. Usually the user isn't signed in to
+    /// YouTube Music in the given browser — but it is also what a cookie store
+    /// that couldn't be read at all looks like from out here, so `diagnosis`
+    /// carries whatever yt-dlp's own stderr said about which it was (empty when
+    /// it said nothing recognisable). See `session::diagnose_ytdlp_stderr`.
     #[error(
-        "yt-dlp wrote no cookie file — make sure you're signed in to YouTube Music in {browser}"
+        "yt-dlp wrote no cookie file — make sure you're signed in to YouTube Music in \
+         {browser}{diagnosis}"
     )]
-    BrowserNotSignedIn { browser: Browser },
+    BrowserNotSignedIn { browser: Browser, diagnosis: String },
 
     /// A cookie file was written, but none of its cookies were for `*.youtube.com`.
     #[error("no youtube.com cookies found in {browser} — are you signed in to YouTube Music?")]

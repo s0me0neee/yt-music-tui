@@ -377,7 +377,10 @@ fn extract_cookies_via_ytdlp(browser: Browser) -> Result<String> {
         .into_owned();
     let _guard = FileGuard(tmp.clone());
 
-    let mut child = std::process::Command::new("yt-dlp")
+    // stderr is kept rather than discarded: when the cookie store can't be read
+    // at all, yt-dlp's own message is the only thing that says why, and every
+    // cause looks the same from here — a missing file.
+    let output = std::process::Command::new("yt-dlp")
         .args([
             "--cookies-from-browser",
             browser.as_ytdlp_arg(),
@@ -387,22 +390,68 @@ fn extract_cookies_via_ytdlp(browser: Browser) -> Result<String> {
             "https://music.youtube.com/",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::piped())
+        // output() waits, so no zombie is left behind. yt-dlp exits non-zero for
+        // this URL but still writes the cookie file, so the status is not worth
+        // checking — whether the file is there is the real answer.
+        .output()
         .map_err(|_| Error::YtDlpNotInstalled)?;
 
-    // Always wait() — never leave a zombie.
-    // yt-dlp exits non-zero for this URL but still writes the cookie file.
-    let _ = child.wait();
-
-    let content =
-        std::fs::read_to_string(&tmp).map_err(|_| Error::BrowserNotSignedIn { browser })?;
+    let content = std::fs::read_to_string(&tmp).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!(
+            "[session] yt-dlp wrote no cookie file for {browser}: {}",
+            stderr.trim()
+        );
+        Error::BrowserNotSignedIn {
+            browser,
+            diagnosis: diagnose_ytdlp_stderr(browser, &stderr),
+        }
+    })?;
 
     let header = parse_netscape_cookies(&content);
     if header.is_empty() {
         return Err(Error::NoCookiesFound { browser });
     }
     Ok(header)
+}
+
+/// Turns yt-dlp's stderr into something actionable, appended to
+/// [`Error::BrowserNotSignedIn`].
+///
+/// Both messages recognised here mean the cookie store could not be read *at
+/// all*, which has nothing to do with being signed in — so without the hint the
+/// error sends the user off to check the one thing that isn't wrong. Anything
+/// else yt-dlp said is passed through verbatim, since it is still the only
+/// evidence available; the tail is what carries the actual error, so a long
+/// traceback is cut from the front rather than the back.
+fn diagnose_ytdlp_stderr(browser: Browser, stderr: &str) -> String {
+    const MAX_LINES: usize = 8;
+
+    let hint = if stderr.contains("Failed to decrypt with DPAPI") {
+        "\n\nChrome 127+ encrypts its cookie store with App-Bound Encryption, which yt-dlp \
+         cannot decrypt. Try one of:\
+         \n  • yt-dlp -U  — newer releases handle more of these\
+         \n  • re-run setup and pick Firefox or Edge instead\
+         \n  • re-run setup and pick Manual (paste a cURL from DevTools)"
+            .to_string()
+    } else if stderr.contains("Could not copy") {
+        format!(
+            "\n\nClose every {browser} window first — {browser} locks its cookie database while \
+             it is running."
+        )
+    } else {
+        String::new()
+    };
+
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return hint;
+    }
+
+    let lines: Vec<&str> = stderr.lines().collect();
+    let tail = lines[lines.len().saturating_sub(MAX_LINES)..].join("\n");
+    format!("{hint}\n\nyt-dlp said:\n{tail}")
 }
 
 fn parse_netscape_cookies(content: &str) -> String {
@@ -496,4 +545,58 @@ fn extract_single_quoted(text: &str, flag: &str) -> Vec<String> {
         }
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What yt-dlp prints on Windows when Chrome's cookie store is App-Bound
+    /// encrypted, trimmed to the lines that matter.
+    const DPAPI: &str = "\
+WARNING: [Cookies] Failed to decrypt with DPAPI. See  https://github.com/yt-dlp/yt-dlp/issues/7271
+ERROR: Unable to extract cookies from browser";
+
+    #[test]
+    fn app_bound_encryption_says_what_to_do_instead() {
+        let out = diagnose_ytdlp_stderr(Browser::Chrome, DPAPI);
+        assert!(out.contains("App-Bound Encryption"));
+        assert!(out.contains("Firefox or Edge"));
+        // The evidence is kept alongside the hint, not replaced by it.
+        assert!(out.contains("Failed to decrypt with DPAPI"));
+    }
+
+    #[test]
+    fn a_locked_cookie_database_names_the_browser_to_close() {
+        let out = diagnose_ytdlp_stderr(
+            Browser::Brave,
+            "ERROR: Could not copy Brave cookie database",
+        );
+        assert!(out.contains("Close every Brave window"));
+    }
+
+    #[test]
+    fn an_unrecognised_failure_still_passes_the_evidence_through() {
+        let out = diagnose_ytdlp_stderr(Browser::Firefox, "ERROR: something else entirely");
+        assert!(out.contains("yt-dlp said:"));
+        assert!(out.contains("something else entirely"));
+    }
+
+    #[test]
+    fn silence_from_yt_dlp_adds_nothing() {
+        assert_eq!(diagnose_ytdlp_stderr(Browser::Chrome, "   \n\n"), "");
+    }
+
+    #[test]
+    fn a_long_traceback_is_cut_from_the_front() {
+        let stderr = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = diagnose_ytdlp_stderr(Browser::Chrome, &stderr);
+        // The tail carries the actual error, so that is the end kept.
+        assert!(out.contains("line 20"));
+        assert!(out.contains("line 13"));
+        assert!(!out.contains("line 12"));
+    }
 }
