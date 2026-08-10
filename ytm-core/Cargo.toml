@@ -18,8 +18,15 @@ inquire = "0.9.4"
 hotpath = "0.19.0"
 
 [dev-dependencies]
-# `macros` for #[tokio::test] in the live lyrics tests.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+# `macros` for #[tokio::test] in the live lyrics tests; `test-util` for the
+# paused clock that keeps the retry-backoff tests instant.
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "test-util",
+] }
 
 [build-dependencies]
 pkg-config = "0.3.33"

@@ -28,6 +28,25 @@ pub enum LrcError {
     Http(#[from] reqwest::Error),
 }
 
+impl LrcError {
+    /// Whether repeating the identical request could plausibly succeed.
+    ///
+    /// Classification lives here because it is transport knowledge; *how many*
+    /// times to repeat, and how long to wait, is the caller's policy.
+    ///
+    /// Timeouts, refused connections and 5xx/429 responses are all "try again
+    /// in a moment". A 404 means lrclib genuinely holds no such record, and
+    /// every other 4xx means the request itself was wrong — repeating those
+    /// only costs the user time and lrclib bandwidth. Decode failures are
+    /// likewise not repeated: a response we can't parse won't parse next time.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            LrcError::Api { status_code, .. } => *status_code == 429 || *status_code >= 500,
+            LrcError::Http(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
+        }
+    }
+}
+
 // ── Response types ────────────────────────────────────────────────────────────
 
 /// A lyrics record returned by GET /api/get or GET /api/get/:id.
@@ -74,6 +93,33 @@ impl From<ApiErrorBody> for LrcError {
             name: b.name,
             status_code: b.status_code,
         }
+    }
+}
+
+/// Turns a non-2xx response into an error, keeping the status code even when
+/// the body isn't the JSON object lrclib documents.
+///
+/// Anything between us and lrclib can answer instead of lrclib: a proxy 502 or
+/// a captive portal arrives as HTML, which used to fail `ApiErrorBody` parsing
+/// and surface as an opaque [`LrcError::Http`] — burying the very status that
+/// says whether the request is worth repeating.
+async fn api_error(resp: reqwest::Response) -> LrcError {
+    let status = resp.status();
+    let status_code = status.as_u16();
+    let opaque = || LrcError::Api {
+        message: status
+            .canonical_reason()
+            .unwrap_or("unexpected response")
+            .to_string(),
+        name: "HttpError".to_string(),
+        status_code,
+    };
+
+    match resp.text().await {
+        Ok(body) => serde_json::from_str::<ApiErrorBody>(&body)
+            .map(Into::into)
+            .unwrap_or_else(|_| opaque()),
+        Err(_) => opaque(),
     }
 }
 
@@ -155,7 +201,7 @@ impl LrcLib {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(resp.json::<ApiErrorBody>().await?.into());
+            return Err(api_error(resp).await);
         }
         Ok(resp.json::<Lyrics>().await?)
     }
@@ -171,7 +217,7 @@ impl LrcLib {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(resp.json::<ApiErrorBody>().await?.into());
+            return Err(api_error(resp).await);
         }
         Ok(resp.json::<Lyrics>().await?)
     }
@@ -188,7 +234,7 @@ impl LrcLib {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(resp.json::<ApiErrorBody>().await?.into());
+            return Err(api_error(resp).await);
         }
         Ok(parse_results(resp.json::<Vec<serde_json::Value>>().await?))
     }
@@ -212,7 +258,7 @@ impl LrcLib {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(resp.json::<ApiErrorBody>().await?.into());
+            return Err(api_error(resp).await);
         }
         Ok(parse_results(resp.json::<Vec<serde_json::Value>>().await?))
     }
@@ -224,6 +270,24 @@ impl LrcLib {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_repeatable_failures_are_transient() {
+        let api = |status_code| LrcError::Api {
+            message: String::new(),
+            name: String::new(),
+            status_code,
+        };
+        // Worth repeating: the server is overloaded or briefly broken.
+        assert!(api(429).is_transient());
+        assert!(api(500).is_transient());
+        assert!(api(502).is_transient());
+        assert!(api(503).is_transient());
+        // Not worth repeating: lrclib has answered definitively.
+        assert!(!api(404).is_transient());
+        assert!(!api(400).is_transient());
+        assert!(!api(403).is_transient());
+    }
 
     #[tokio::test]
     #[ignore = "hits the live lrclib.net API"]

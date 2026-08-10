@@ -6,8 +6,10 @@
 //! layers the two and [`rank`] does duration-proximity scoring client-side.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use lrclib::{LrcError, LrcLib, Lyrics, parse_lrc};
 
@@ -207,6 +209,18 @@ pub fn strip_title_noise(title: &str) -> String {
     strip_bracketed(title, NOISE_WORDS)
 }
 
+/// Field separators YouTube uses to append an alias, an artist or a credit.
+const FIELD_SEPARATORS: &[&str] = &[" - ", " – ", " — ", " / ", "／", " ・ "];
+
+/// Splits `s` at the first field separator, into what precedes and follows it.
+fn split_field(s: &str) -> Option<(&str, &str)> {
+    FIELD_SEPARATORS
+        .iter()
+        .filter_map(|sep| s.find(sep).map(|at| (at, sep)))
+        .min_by_key(|&(at, _)| at)
+        .map(|(at, sep)| (&s[..at], &s[at + sep.len()..]))
+}
+
 /// Reduces a title to just the song's name, discarding cover credits.
 ///
 /// Cover uploads are titled like `【歌ってみた】人マニア / covered by ヰ世界情緒`.
@@ -214,9 +228,12 @@ pub fn strip_title_noise(title: &str) -> String {
 /// searching the full title returns nothing, and so does constraining by the
 /// coverer.
 ///
+/// `artist` disambiguates the `A - B` layout, which YouTube uses for both
+/// `song - alias` and `artist - song`; pass `""` when it is unknown.
+///
 /// Deliberately more aggressive than [`strip_title_noise`], so it is only used
 /// by the late, broadening steps of the search ladder.
-pub fn song_title_only(title: &str) -> String {
+pub fn song_title_only(title: &str, artist: &str) -> String {
     // A bare `by <name>` is only a credit when the title already says it's a
     // cover — `【歌ってみた】ドゥーマー by 花譜` versus `Stand By Me`.
     let mut credits: Vec<&str> = [RENDITION_CREDITS, GUEST_CREDITS].concat();
@@ -243,21 +260,39 @@ pub fn song_title_only(title: &str) -> String {
             .to_string();
     }
 
+    // `Artist - Song`, the standard layout for uploads outside YouTube's Topic
+    // channels. The rule below keeps the *leading* field, which here is the
+    // artist — so `Lorde - Ribs` would search lrclib for "Lorde". When the
+    // leading field is the credited artist, the song is what follows it.
+    if let Some((lead, rest)) = split_field(&out)
+        && !rest.trim().is_empty()
+        && credits_the_artist(lead, artist)
+    {
+        out = rest.trim().to_string();
+    }
+
     // Drop a trailing alias or credit field. YouTube Music appends an English
     // or romanised alias to non-English titles — `法螺話 - Tall Story`,
     // `キャラクターT - Character T` — and lrclib usually stores just the
     // original, so the combined form matches nothing. Japanese uploads also use
     // `Song / Artist`.
-    const FIELD_SEPARATORS: &[&str] = &[" - ", " – ", " — ", " / ", "／", " ・ "];
-    if let Some(cut) = FIELD_SEPARATORS
-        .iter()
-        .filter_map(|sep| out.find(sep))
-        .min()
-    {
-        out.truncate(cut);
+    if let Some((lead, _)) = split_field(&out) {
+        out = lead.to_string();
     }
 
     out.trim().to_string()
+}
+
+/// Whether `field` is the track's credited artist rather than part of its name.
+///
+/// Both the full credit and its primary form count, since a title carries
+/// whichever the uploader felt like using.
+fn credits_the_artist(field: &str, artist: &str) -> bool {
+    let field = field.trim().to_lowercase();
+    if field.is_empty() || artist.trim().is_empty() {
+        return false;
+    }
+    field == artist.trim().to_lowercase() || field == primary_artist(artist).to_lowercase()
 }
 
 /// Normalises an artist for searching: drops YouTube's auto-channel `- Topic`
@@ -270,8 +305,10 @@ pub fn primary_artist(artist: &str) -> String {
         .strip_suffix(" - Topic")
         .or_else(|| artist.strip_suffix(" - topic"))
         .unwrap_or(artist);
+    // `、` is the ideographic comma, which Japanese credits join with.
+    // `&` deliberately isn't a separator — it is part of plenty of band names.
     artist
-        .split(&[',', ';'][..])
+        .split(&[',', ';', '、'][..])
         .next()
         .unwrap_or(artist)
         .trim()
@@ -279,7 +316,7 @@ pub fn primary_artist(artist: &str) -> String {
 }
 
 /// One LRCLIB query in the broadening ladder.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Attempt {
     Meta {
         track: String,
@@ -330,7 +367,7 @@ impl LyricsQuery {
     fn search_ladder(&self) -> Vec<Attempt> {
         let clean = strip_title_noise(&self.title);
         let primary = primary_artist(&self.artist);
-        let song = song_title_only(&self.title);
+        let song = song_title_only(&self.title, &self.artist);
 
         let mut ladder = vec![
             // Everything we know.
@@ -379,7 +416,7 @@ impl LyricsQuery {
         // removes *consecutive* duplicates, and the rungs interleave, so an
         // identical query could reappear later and cost a second request.
         let mut seen = HashSet::new();
-        ladder.retain(|a| seen.insert(format!("{a:?}")));
+        ladder.retain(|a| seen.insert(a.clone()));
         ladder
     }
 }
@@ -418,6 +455,10 @@ pub struct TrackLyrics {
     /// can't separate fall back to lrclib's judgement. Recorded explicitly
     /// rather than relying on the sort being stable, since results are merged
     /// from several queries.
+    ///
+    /// The sequence spans the whole ladder, so an earlier (more precise) rung
+    /// always ranks ahead of a later one. Zero is reserved for the `/get` hit:
+    /// no search result is a more precise match than an exact lookup.
     pub relevance: usize,
     pub kind: LyricsKind,
 }
@@ -479,7 +520,8 @@ impl TrackLyrics {
         Some(Self {
             id: l.id,
             timing_mismatch: false,
-            // Overwritten by `with_relevance` once the position is known.
+            // Search results are re-stamped by `with_relevance` once their
+            // position is known; a `/get` hit keeps zero, which outranks them.
             relevance: 0,
             track_name: l.track_name,
             artist_name: l.artist_name,
@@ -504,12 +546,41 @@ fn with_relevance(records: Vec<TrackLyrics>, from: usize) -> Vec<TrackLyrics> {
         .collect()
 }
 
+/// Merges one rung's response into `pool`, skipping records already held, and
+/// returns the next free relevance slot.
+///
+/// Every record parsed consumes a slot, whether or not it survives
+/// de-duplication. Counting only the *kept* ones let the following rung reuse
+/// numbers this one had already handed out, so a broad rung's record could be
+/// stamped more relevant than a precise rung's — the exact inversion the
+/// counter exists to prevent.
+fn merge_rung(
+    pool: &mut Vec<TrackLyrics>,
+    seen: &mut HashSet<u64>,
+    raw: Vec<Lyrics>,
+    next_relevance: usize,
+) -> usize {
+    let batch = with_relevance(
+        raw.into_iter()
+            .filter_map(TrackLyrics::from_record)
+            .collect(),
+        next_relevance,
+    );
+    let next = next_relevance + batch.len();
+    for found in batch {
+        if seen.insert(found.id) {
+            pool.push(found);
+        }
+    }
+    next
+}
+
 /// Orders candidates best-first: synced before plain, then closest duration,
 /// then artist/title agreement, then LRCLIB's own relevance order.
 ///
-/// Records more than [`MAX_DURATION_DELTA`] from a known duration are dropped —
-/// unless that would empty the list, in which case they are kept, so this never
-/// turns "a poor match" into "no lyrics".
+/// Records more than [`MAX_DURATION_DELTA`] from a known duration are dropped
+/// outright — at that distance they are a different song, and offering the
+/// wrong lyrics is worse than offering none.
 pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
     if q.duration.is_some() {
         // Far enough out and it's a different song, not a different edit.
@@ -570,6 +641,42 @@ pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
 
 // ── service ──────────────────────────────────────────────────────────────────
 
+/// How many times a transient lrclib failure is repeated before giving up.
+///
+/// One, not several. A dropped connection or a rate-limit tick clears on the
+/// second try, while a server that is genuinely down would otherwise multiply
+/// its timeout across every rung of the ladder — nine rungs at ten seconds is
+/// already the worst case, and doubling that is felt. Beyond one retry the
+/// lyrics panel says so and `r` runs the lookup again on demand.
+const MAX_RETRIES: u32 = 1;
+
+/// How long to wait before repeating a request. Long enough to outlast a blip,
+/// short enough to go unnoticed in a background fetch.
+const RETRY_BACKOFF: Duration = Duration::from_millis(400);
+
+/// Repeats `attempt` while it fails for a reason that might not recur.
+///
+/// Which failures those are is [`LrcError::is_transient`]'s call — this is the
+/// policy over it. A settled answer, including a 404, returns immediately.
+async fn with_retry<F, Fut, T>(what: &str, mut attempt: F) -> std::result::Result<T, LrcError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, LrcError>>,
+{
+    let mut backoff = RETRY_BACKOFF;
+    for _ in 0..MAX_RETRIES {
+        match attempt().await {
+            Err(e) if e.is_transient() => {
+                log::debug!("lyrics: {what} failed ({e}) — retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            settled => return settled,
+        }
+    }
+    attempt().await
+}
+
 pub struct LyricsService {
     client: LrcLib,
 }
@@ -592,7 +699,7 @@ impl LyricsService {
     /// Re-fetches a specific record. `Ok(None)` when it no longer exists or
     /// carries no usable content.
     pub async fn by_id(&self, id: u64) -> Result<Option<TrackLyrics>> {
-        match self.client.get_by_id(id).await {
+        match with_retry("lookup by id", || self.client.get_by_id(id)).await {
             Ok(l) => Ok(TrackLyrics::from_record(l)),
             Err(LrcError::Api {
                 status_code: 404, ..
@@ -630,10 +737,10 @@ impl LyricsService {
         let mut exact: Option<TrackLyrics> = None;
         let mut plain_fallback: Option<TrackLyrics> = None;
         if let Some(duration) = q.duration {
-            match self
-                .client
-                .get(&q.title, &q.artist, &q.album, duration)
-                .await
+            match with_retry("exact lookup", || {
+                self.client.get(&q.title, &q.artist, &q.album, duration)
+            })
+            .await
             {
                 Ok(l) => {
                     if let Some(found) = TrackLyrics::from_record(l) {
@@ -662,15 +769,21 @@ impl LyricsService {
         //
         // Errors propagate rather than being swallowed into an empty list: a
         // network failure and "lrclib genuinely has nothing" are different
-        // things, and the UI shows them differently. Only reach for the plain
-        // fallback once we know the search itself succeeded.
+        // things, and the UI shows them differently.
         let mut found = match self.search_ladder(q, true).await {
             Ok(found) => found,
-            Err(e) if plain_fallback.is_some() => {
-                log::warn!("lyrics search failed ({e}) — using the exact plain match");
-                return Ok(plain_fallback);
-            }
-            Err(e) => return Err(e),
+            // The ladder failed for real, retries included. Anything the exact
+            // lookup is still holding beats reporting nothing: it is the same
+            // record the search would have had to beat, and a synced hit a
+            // second or two out is exactly what the user wants on screen. The
+            // search that would have improved on it is a keypress away.
+            Err(e) => match exact.or(plain_fallback) {
+                Some(held) => {
+                    log::warn!("lyrics search failed ({e}) — using the exact-lookup match");
+                    return Ok(Some(held));
+                }
+                None => return Err(e),
+            },
         };
 
         // Fold the exact-lookup hit into the pool and re-rank, so whichever
@@ -701,8 +814,15 @@ impl LyricsService {
                 track,
                 artist,
                 album,
-            } => self.client.search_by_meta(track, artist, album).await,
-            Attempt::FreeText(query) => self.client.search(query).await,
+            } => {
+                with_retry("metadata search", || {
+                    self.client.search_by_meta(track, artist, album)
+                })
+                .await
+            }
+            Attempt::FreeText(query) => {
+                with_retry("free-text search", || self.client.search(query)).await
+            }
         }
     }
 
@@ -730,6 +850,10 @@ impl LyricsService {
         let mut seen: HashSet<u64> = HashSet::new();
         let mut pool: Vec<TrackLyrics> = Vec::new();
         let mut last_err = None;
+        // Spans the whole ladder rather than restarting per rung, so a later
+        // rung can never be stamped more relevant than an earlier one. Starts
+        // at 1: zero belongs to the `/get` hit `best_for` may fold in.
+        let mut next_relevance = 1;
 
         for attempt in q.search_ladder() {
             if matches!(&attempt, Attempt::FreeText(s) if s.is_empty()) {
@@ -740,27 +864,19 @@ impl LyricsService {
                     // A response whose records all lack lyrics still counts as
                     // a miss — keep broadening rather than reporting "no lyrics
                     // found" as an early `raw.is_empty()` check would.
-                    //
-                    // The relevance counter continues from the pool length, so
-                    // earlier (more precise) rungs keep priority and lrclib's
-                    // own ordering is preserved within each.
-                    let batch = with_relevance(
-                        raw.into_iter()
-                            .filter_map(TrackLyrics::from_record)
-                            .collect(),
-                        pool.len(),
-                    );
-                    for found in batch {
-                        if seen.insert(found.id) {
-                            pool.push(found);
-                        }
-                    }
+                    next_relevance = merge_rung(&mut pool, &mut seen, raw, next_relevance);
 
+                    // A decisive record is synced and within half a second, so
+                    // `rank` can neither drop nor demote it — and anything rank
+                    // would place above it is synced and inside half a second
+                    // too, hence decisive itself. Scanning the pool therefore
+                    // answers exactly what ranking it would, without cloning
+                    // every candidate's lyrics on every rung.
                     if stop_early
-                        && let Some(best) = rank(pool.clone(), q).into_iter().next()
-                        && Self::is_decisive(&best, q)
+                        && let Some(id) =
+                            pool.iter().find(|c| Self::is_decisive(c, q)).map(|c| c.id)
                     {
-                        log::debug!("lyrics: decisive match #{} on {attempt:?}", best.id);
+                        log::debug!("lyrics: decisive match #{id} on {attempt:?}");
                         return Ok(rank(pool, q));
                     }
                 }
@@ -883,6 +999,21 @@ mod tests {
         v.iter().map(|c| c.id).collect()
     }
 
+    /// A raw lrclib record, as a rung's response would carry it.
+    fn raw(id: u64) -> Lyrics {
+        Lyrics {
+            id,
+            name: "Echo".into(),
+            track_name: "Echo".into(),
+            artist_name: "Crusher-P".into(),
+            album_name: String::new(),
+            duration: Some(245.0),
+            instrumental: false,
+            plain_lyrics: Some("x".into()),
+            synced_lyrics: None,
+        }
+    }
+
     // ── query normalisation ───────────────────────────────────────────────
 
     #[test]
@@ -926,63 +1057,66 @@ mod tests {
     #[test]
     fn reduces_cover_uploads_to_the_original_song_name() {
         assert_eq!(
-            song_title_only("【歌ってみた】人マニア / covered by ヰ世界情緒"),
+            song_title_only("【歌ってみた】人マニア / covered by ヰ世界情緒", ""),
             "人マニア"
         );
         assert_eq!(
-            song_title_only("人マニア / covered by ヰ世界情緒"),
+            song_title_only("人マニア / covered by ヰ世界情緒", ""),
             "人マニア"
         );
-        assert_eq!(song_title_only("Song (Cover)"), "Song");
-        assert_eq!(song_title_only("Song 【cover】"), "Song");
-        assert_eq!(song_title_only("Song - covered by Someone"), "Song");
-        assert_eq!(song_title_only("「歌ってみた」Song"), "Song");
+        assert_eq!(song_title_only("Song (Cover)", ""), "Song");
+        assert_eq!(song_title_only("Song 【cover】", ""), "Song");
+        assert_eq!(song_title_only("Song - covered by Someone", ""), "Song");
+        assert_eq!(song_title_only("「歌ってみた」Song", ""), "Song");
         // `Song / Artist` is a common Japanese upload convention.
-        assert_eq!(song_title_only("人マニア / ヰ世界情緒"), "人マニア");
+        assert_eq!(song_title_only("人マニア / ヰ世界情緒", ""), "人マニア");
     }
 
     #[test]
     fn strips_japanese_version_credits() {
-        assert_eq!(song_title_only("ダーリン ver.わかばやし"), "ダーリン");
-        assert_eq!(song_title_only("ダーリンver.わかばやし"), "ダーリン");
-        assert_eq!(song_title_only("Song ver.Someone"), "Song");
-        assert_eq!(song_title_only("Song ver: Someone"), "Song");
+        assert_eq!(song_title_only("ダーリン ver.わかばやし", ""), "ダーリン");
+        assert_eq!(song_title_only("ダーリンver.わかばやし", ""), "ダーリン");
+        assert_eq!(song_title_only("Song ver.Someone", ""), "Song");
+        assert_eq!(song_title_only("Song ver: Someone", ""), "Song");
     }
 
     #[test]
     fn version_marker_does_not_fire_mid_word() {
         // "Cover." contains "ver." — cutting there would leave "Co".
-        assert_eq!(song_title_only("Cover.jp Anthem"), "Cover.jp Anthem");
-        assert_eq!(song_title_only("Discover.me"), "Discover.me");
+        assert_eq!(song_title_only("Cover.jp Anthem", ""), "Cover.jp Anthem");
+        assert_eq!(song_title_only("Discover.me", ""), "Discover.me");
     }
 
     #[test]
     fn strips_the_english_alias_youtube_music_appends() {
         // Real titles from the app log — lrclib stores only the original.
-        assert_eq!(song_title_only("法螺話 - Tall Story"), "法螺話");
+        assert_eq!(song_title_only("法螺話 - Tall Story", ""), "法螺話");
         assert_eq!(
-            song_title_only("キャラクターT - Character T (feat. Kasane Teto)"),
+            song_title_only("キャラクターT - Character T (feat. Kasane Teto)", ""),
             "キャラクターT"
         );
-        assert_eq!(song_title_only("泡沫 - Utakata"), "泡沫");
-        assert_eq!(song_title_only("千鳥 - Plover"), "千鳥");
-        assert_eq!(song_title_only("食虫植物 - Carnivorous Plant"), "食虫植物");
+        assert_eq!(song_title_only("泡沫 - Utakata", ""), "泡沫");
+        assert_eq!(song_title_only("千鳥 - Plover", ""), "千鳥");
         assert_eq!(
-            song_title_only("ハナタバ - Hanataba (feat. KAFU)"),
+            song_title_only("食虫植物 - Carnivorous Plant", ""),
+            "食虫植物"
+        );
+        assert_eq!(
+            song_title_only("ハナタバ - Hanataba (feat. KAFU)", ""),
             "ハナタバ"
         );
         assert_eq!(
-            song_title_only("マインドブランド - Mind brand"),
+            song_title_only("マインドブランド - Mind brand", ""),
             "マインドブランド"
         );
         // Punctuation inside the original title is part of it.
         assert_eq!(
-            song_title_only("フィクションです。 - It’s Fiction."),
+            song_title_only("フィクションです。 - It’s Fiction.", ""),
             "フィクションです。"
         );
         // A parenthesised alias is kept — only the trailing credit is cut.
         assert_eq!(
-            song_title_only("逆さ月 (Reverse Moon) feat. asmi"),
+            song_title_only("逆さ月 (Reverse Moon) feat. asmi", ""),
             "逆さ月 (Reverse Moon)"
         );
     }
@@ -990,23 +1124,23 @@ mod tests {
     #[test]
     fn hyphen_split_needs_surrounding_spaces() {
         // A hyphenated word is not a field separator.
-        assert_eq!(song_title_only("Twenty-One"), "Twenty-One");
-        assert_eq!(song_title_only("Re-Education"), "Re-Education");
+        assert_eq!(song_title_only("Twenty-One", ""), "Twenty-One");
+        assert_eq!(song_title_only("Re-Education", ""), "Re-Education");
     }
 
     #[test]
     fn strips_a_bare_by_credit_only_on_covers() {
         // Real title from the app log.
         assert_eq!(
-            song_title_only("【歌ってみた】ドゥーマー by 花譜"),
+            song_title_only("【歌ってみた】ドゥーマー by 花譜", ""),
             "ドゥーマー"
         );
-        assert_eq!(song_title_only("Song (cover) by Someone"), "Song");
+        assert_eq!(song_title_only("Song (cover) by Someone", ""), "Song");
 
         // Without a cover marker, `by` is part of the name.
-        assert_eq!(song_title_only("Stand By Me"), "Stand By Me");
-        assert_eq!(song_title_only("Get By"), "Get By");
-        assert_eq!(song_title_only("Drive By"), "Drive By");
+        assert_eq!(song_title_only("Stand By Me", ""), "Stand By Me");
+        assert_eq!(song_title_only("Get By", ""), "Get By");
+        assert_eq!(song_title_only("Drive By", ""), "Drive By");
     }
 
     #[test]
@@ -1020,30 +1154,33 @@ mod tests {
         assert!(has_cover_marker("Song ver.X"));
         // A guest credit is not a cover, so it must not license the `by` cut.
         assert!(!has_cover_marker("Stand By Me feat. Someone"));
-        assert_eq!(song_title_only("Stand By Me feat. Someone"), "Stand By Me");
         assert_eq!(
-            song_title_only("Discovery by Daft Punk"),
+            song_title_only("Stand By Me feat. Someone", ""),
+            "Stand By Me"
+        );
+        assert_eq!(
+            song_title_only("Discovery by Daft Punk", ""),
             "Discovery by Daft Punk"
         );
     }
 
     #[test]
     fn song_title_only_leaves_ordinary_titles_alone() {
-        assert_eq!(song_title_only("Ribs"), "Ribs");
-        assert_eq!(song_title_only("法螺話"), "法螺話");
-        assert_eq!(song_title_only(""), "");
+        assert_eq!(song_title_only("Ribs", ""), "Ribs");
+        assert_eq!(song_title_only("法螺話", ""), "法螺話");
+        assert_eq!(song_title_only("", ""), "");
         // A kept multi-byte bracket group must not slice mid-character:
         // `】` is three bytes, so an inclusive range ends inside it.
         assert_eq!(
             strip_title_noise("【あいうえお】Song"),
             "【あいうえお】Song"
         );
-        assert_eq!(song_title_only("「そら」Song"), "「そら」Song");
+        assert_eq!(song_title_only("「そら」Song", ""), "「そら」Song");
         // No panic on unbalanced or odd input.
-        assert_eq!(song_title_only("Song (cover"), "Song (cover");
-        song_title_only("【】");
-        song_title_only("///");
-        song_title_only("【】【】(((");
+        assert_eq!(song_title_only("Song (cover", ""), "Song (cover");
+        song_title_only("【】", "");
+        song_title_only("///", "");
+        song_title_only("【】【】(((", "");
     }
 
     #[test]
@@ -1053,7 +1190,7 @@ mod tests {
         // broad fallback and may discard it.
         let t = "法螺話(self cover)";
         assert_eq!(strip_title_noise(t), t);
-        assert_eq!(song_title_only(t), "法螺話");
+        assert_eq!(song_title_only(t, ""), "法螺話");
     }
 
     #[test]
@@ -1062,8 +1199,36 @@ mod tests {
         assert_eq!(primary_artist("理芽 - Topic"), "理芽");
         // lrclib stores one artist per record, so a joined list matches nothing.
         assert_eq!(primary_artist("理芽, Guiano"), "理芽");
+        // Japanese credits join with the ideographic comma.
+        assert_eq!(primary_artist("重音テト、音街ウナ"), "重音テト");
         assert_eq!(primary_artist("Lorde"), "Lorde");
         assert_eq!(primary_artist(""), "");
+        // `&` is part of plenty of band names, so it is not a separator.
+        assert_eq!(primary_artist("Simon & Garfunkel"), "Simon & Garfunkel");
+    }
+
+    #[test]
+    fn artist_leading_titles_keep_the_song_not_the_artist() {
+        // Uploads outside YouTube's Topic channels are titled `Artist - Song`,
+        // where keeping the leading field would search lrclib for the artist.
+        assert_eq!(song_title_only("Lorde - Ribs", "Lorde"), "Ribs");
+        assert_eq!(song_title_only("理芽 - 法螺話", "理芽 - Topic"), "法螺話");
+        assert_eq!(
+            song_title_only("Syn Cole - Sway", "Syn Cole, Nevve"),
+            "Sway"
+        );
+        // Decoration on such a title is still dropped.
+        assert_eq!(
+            song_title_only("Lorde - Ribs (Official Video)", "Lorde"),
+            "Ribs"
+        );
+
+        // The leading field only yields when it really is the artist — the
+        // alias layout must keep behaving as it did.
+        assert_eq!(song_title_only("法螺話 - Tall Story", "理芽"), "法螺話");
+        assert_eq!(song_title_only("Ribs - Live", "Lorde"), "Ribs");
+        // And with no artist to compare against, nothing changes.
+        assert_eq!(song_title_only("Lorde - Ribs", ""), "Lorde");
     }
 
     #[test]
@@ -1116,6 +1281,110 @@ mod tests {
             ladder
                 .iter()
                 .any(|a| matches!(a, Attempt::FreeText(q) if q == "法螺話 理芽"))
+        );
+    }
+
+    #[test]
+    fn relevance_never_restarts_across_rungs() {
+        let mut pool = Vec::new();
+        let mut seen = HashSet::new();
+        // 0 is reserved for the `/get` hit `best_for` folds in, so no search
+        // result may claim it.
+        let mut next = 1;
+
+        next = merge_rung(&mut pool, &mut seen, vec![raw(1), raw(2), raw(3)], next);
+        assert_eq!(next, 4);
+
+        // A broader rung repeats what the first found and adds one record. The
+        // repeats are dropped, but they still consumed their slots.
+        next = merge_rung(
+            &mut pool,
+            &mut seen,
+            vec![raw(1), raw(2), raw(3), raw(4)],
+            next,
+        );
+        assert_eq!(next, 8);
+
+        // Counting only the records *kept* would restart this rung at 4 and
+        // stamp #5 ahead of #4 — a broader query outranking a narrower one.
+        next = merge_rung(&mut pool, &mut seen, vec![raw(5)], next);
+        assert_eq!(next, 9);
+
+        assert_eq!(
+            pool.iter().map(|c| (c.id, c.relevance)).collect::<Vec<_>>(),
+            [(1, 1), (2, 2), (3, 3), (4, 7), (5, 8)]
+        );
+        assert!(
+            pool.windows(2).all(|w| w[0].relevance < w[1].relevance),
+            "a later rung was stamped ahead of an earlier one"
+        );
+        assert!(pool.iter().all(|c| c.relevance > 0), "0 is the /get hit's");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_is_retried() {
+        let calls = std::cell::Cell::new(0);
+        let out = with_retry("test", || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                match n {
+                    1 => Err(LrcError::Api {
+                        message: String::new(),
+                        name: String::new(),
+                        status_code: 503,
+                    }),
+                    _ => Ok(n),
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(out.expect("the retry should have succeeded"), 2);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_answer_is_not_retried() {
+        // A 404 is lrclib saying it holds no such record. Asking again wastes
+        // the user's time and lrclib's bandwidth.
+        let calls = std::cell::Cell::new(0);
+        let out: std::result::Result<(), LrcError> = with_retry("test", || {
+            calls.set(calls.get() + 1);
+            async {
+                Err(LrcError::Api {
+                    message: String::new(),
+                    name: String::new(),
+                    status_code: 404,
+                })
+            }
+        })
+        .await;
+
+        assert!(out.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_are_bounded() {
+        let calls = std::cell::Cell::new(0);
+        let out: std::result::Result<(), LrcError> = with_retry("test", || {
+            calls.set(calls.get() + 1);
+            async {
+                Err(LrcError::Api {
+                    message: String::new(),
+                    name: String::new(),
+                    status_code: 500,
+                })
+            }
+        })
+        .await;
+
+        assert!(out.is_err());
+        assert_eq!(
+            calls.get(),
+            MAX_RETRIES as i32 + 1,
+            "a server that stays down must not be hammered"
         );
     }
 
