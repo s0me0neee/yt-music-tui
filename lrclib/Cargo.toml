@@ -7,7 +7,13 @@ edition = "2024"
 # 0.12 (not 0.13) to match the version ytmusicapi already pulls in — 0.13 would
 # add a second HTTP stack plus an aws-lc-sys C build. Note there is no "query"
 # feature on 0.12; `.query()` is unconditional there.
-reqwest = { version = "0.12", features = ["json"] }
+#
+# "gzip" because /search returns the *complete* lyrics of every hit — a single
+# rung for a popular track is a quarter of a megabyte, and one lookup walks
+# several. lrclib serves gzip, and reqwest only asks for it when this feature is
+# on: measured 260 KB -> 23 KB on one rung. It decodes transparently, so no
+# calling code changes.
+reqwest = { version = "0.12", features = ["json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 # Per-record deserialisation, so one malformed row can't fail a whole response.
 serde_json = "1"
