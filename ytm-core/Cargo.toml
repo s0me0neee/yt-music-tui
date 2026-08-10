@@ -10,6 +10,8 @@ libmpv2 = "6.0.0"
 tokio = { version = "1", features = ["rt", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# config.toml parsing. Read-only, so no "display" feature.
+toml = { version = "0.8.23", default-features = false, features = ["parse"] }
 thiserror = "1"
 log = "0.4"
 rand = "0.8"

@@ -58,11 +58,23 @@ pub fn config_toml_path() -> PathBuf {
     app_config_dir().join("config.toml")
 }
 
-/// Creates `config.toml` with a comment header if it doesn't exist yet.
+/// Creates `config.toml` from the documented template if it doesn't exist.
+///
+/// Also replaces the bare one-line header older versions wrote, so the settings
+/// that file was always meant to hold are actually discoverable. That is the
+/// only content ever overwritten — a file the user has typed anything into is
+/// left exactly as it is, settings we don't recognise included.
 pub fn ensure_config_toml() -> Result<()> {
     let path = config_toml_path();
-    if !path.exists() {
-        std::fs::write(&path, "# yt-music-tui configuration\n")?;
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&path, crate::config::TEMPLATE)?;
+        }
+        Ok(existing) if existing == crate::config::LEGACY_STUB => {
+            log::info!("config: filling in the empty config.toml template");
+            std::fs::write(&path, crate::config::TEMPLATE)?;
+        }
+        _ => {}
     }
     Ok(())
 }

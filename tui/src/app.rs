@@ -558,6 +558,8 @@ pub struct App {
     lyrics_picker: Option<LyricsPicker>,
     lyrics_overrides: LyricsOverrides,
     lyrics_dirty: bool,
+    /// User settings from `config.toml`, read once at startup.
+    config: ytm_core::Config,
 }
 
 impl App {
@@ -566,6 +568,7 @@ impl App {
         saved_queue: Option<QueueState>,
         songs_rx: std::sync::mpsc::Receiver<SongBatch>,
         rt: tokio::runtime::Handle,
+        config: ytm_core::Config,
     ) -> Self {
         let n = library.len();
         let selected = (n > 0).then_some(0);
@@ -609,6 +612,7 @@ impl App {
             lyrics_following: true,
             lyrics_picker: None,
             lyrics_overrides: persistence::load_lyrics_overrides(),
+            config,
             lyrics_dirty: false,
         }
     }
@@ -732,7 +736,9 @@ impl App {
         let Some(lines) = self.current_lyrics().and_then(TrackLyrics::synced_lines) else {
             return IDLE;
         };
-        match lyrics::next_boundary(lines, state.elapsed) {
+        // Against the shifted clock, so the wake-up lands on the boundary the
+        // highlight will actually flip at rather than the record's raw one.
+        match lyrics::next_boundary(lines, self.config.lyrics.lyric_time(state.elapsed)) {
             // The +20 ms absorbs `elapsed` staleness (mpv's time-pos observer),
             // so we don't wake early and busy-spin; the 33 ms floor bounds a
             // densely-timed record to ~30 redraws/sec worst case.
@@ -1776,7 +1782,7 @@ impl App {
             }
             Some(LyricsEntry::Ready(found)) => match &found.kind {
                 ytm_core::LyricsKind::Instrumental => {
-                    let status = Self::lyrics_status(found, None);
+                    let status = Self::lyrics_status(found, None, None);
                     let body = section(frame, area, "Lyrics", Some(status), focused);
                     centered_message(
                         frame,
@@ -1796,10 +1802,20 @@ impl App {
 
     /// Right-hand status for the lyrics header: which lrclib record is in use
     /// and what it matched — the cue to press `c` when the match is wrong.
-    fn lyrics_status(found: &TrackLyrics, badge: Option<Span<'static>>) -> Line<'static> {
+    /// `offset` is shown only when it is non-zero, so a shift that is silently
+    /// in effect can't be mistaken for a badly-timed record.
+    fn lyrics_status(
+        found: &TrackLyrics,
+        badge: Option<Span<'static>>,
+        offset: Option<String>,
+    ) -> Line<'static> {
         let mut spans = Vec::new();
         if let Some(badge) = badge {
             spans.push(badge);
+            spans.push(Span::styled(SEP, theme::DIM));
+        }
+        if let Some(offset) = offset {
+            spans.push(Span::styled(format!("offset {offset}"), theme::WARN));
             spans.push(Span::styled(SEP, theme::DIM));
         }
         spans.push(Span::styled(
@@ -1863,7 +1879,11 @@ impl App {
             let Some(LyricsEntry::Ready(found)) = self.lyrics_cache.get(video_id) else {
                 return;
             };
-            Self::lyrics_status(found, Some(Span::styled("♪ synced", theme::ACCENT)))
+            Self::lyrics_status(
+                found,
+                Some(Span::styled("♪ synced", theme::ACCENT)),
+                self.config.lyrics.offset_label(),
+            )
         };
 
         let focused = self.active_panel == Panel::Songs;
@@ -1879,7 +1899,10 @@ impl App {
             return;
         }
 
-        let elapsed = self.player.audio_state().elapsed;
+        let elapsed = self
+            .config
+            .lyrics
+            .lyric_time(self.player.audio_state().elapsed);
         // Two columns short of the full width: the active line is padded by one
         // space either side for its highlight, and wrapping to the same width
         // for every row keeps that padding from clipping the longest lines.
@@ -1912,7 +1935,7 @@ impl App {
         } else {
             Span::styled("¶ unsynced", theme::WARN)
         };
-        let status = Self::lyrics_status(found, Some(badge));
+        let status = Self::lyrics_status(found, Some(badge), None);
 
         let focused = self.active_panel == Panel::Songs;
         let body = section(frame, area, "Lyrics", Some(status), focused);
@@ -2402,6 +2425,60 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// Lyric lines at the given timestamps.
+    fn timed_lines(at: &[f64]) -> Vec<ytm_core::lyrics::LyricLine> {
+        at.iter()
+            .map(|at| ytm_core::lyrics::LyricLine {
+                at: *at,
+                text: "line".into(),
+            })
+            .collect()
+    }
+
+    // ── lyrics offset ─────────────────────────────────────────────────────
+
+    #[test]
+    fn the_offset_moves_which_line_is_active() {
+        let lines = timed_lines(&[10.0, 20.0, 30.0]);
+        let at = |offset: f64, elapsed: f64| {
+            let cfg = ytm_core::config::Lyrics { offset };
+            lyrics::active_index(&lines, cfg.lyric_time(elapsed))
+        };
+
+        // Unshifted: line b starts exactly at 20s.
+        assert_eq!(at(0.0, 19.5), Some(0));
+        assert_eq!(at(0.0, 20.0), Some(1));
+
+        // Early (negative): b already shows half a second before it is sung,
+        // and a full second before it with -1.0.
+        assert_eq!(at(-0.5, 19.5), Some(1));
+        assert_eq!(at(-1.0, 19.0), Some(1));
+        assert_eq!(at(-1.0, 18.9), Some(0), "but not before its shifted time");
+
+        // Late (positive): b is held back past 20s.
+        assert_eq!(at(0.5, 20.0), Some(0));
+        assert_eq!(at(0.5, 20.5), Some(1));
+
+        // Shifted into the intro, nothing is active — as before the first line.
+        assert_eq!(at(5.0, 12.0), None);
+    }
+
+    #[test]
+    fn the_offset_moves_the_redraw_boundary_with_it() {
+        // The wake-up has to land on the boundary the highlight flips at, not
+        // the record's raw one, or every line changes late by the offset.
+        let lines = timed_lines(&[10.0, 20.0]);
+        let wait = |offset: f64, elapsed: f64| {
+            let cfg = ytm_core::config::Lyrics { offset };
+            lyrics::next_boundary(&lines, cfg.lyric_time(elapsed))
+        };
+
+        assert_eq!(wait(0.0, 15.0), Some(5.0));
+        // Showing lines a second early means waking a second sooner.
+        assert_eq!(wait(-1.0, 15.0), Some(4.0));
+        assert_eq!(wait(1.0, 15.0), Some(6.0));
     }
 
     // ── lyrics picker ─────────────────────────────────────────────────────

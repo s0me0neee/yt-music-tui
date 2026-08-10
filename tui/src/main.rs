@@ -71,8 +71,10 @@ fn main() -> anyhow::Result<()> {
 
     let saved_queue = persistence::load_queue();
     let lib = library::Library::new(playlists);
+    // Read after `Session::new` has ensured the file exists.
+    let config = ytm_core::Config::load();
 
-    let result = app::App::new(lib, saved_queue, songs_rx, rt.handle().clone()).run();
+    let result = app::App::new(lib, saved_queue, songs_rx, rt.handle().clone(), config).run();
 
     // Wait for cookie refresh before exiting so browser.json is never partial.
     let _ = cookie_refresh.join();

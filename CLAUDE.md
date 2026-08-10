@@ -21,7 +21,8 @@ Auth uses cookie-based auth via `browser.json` (ytmusicapi style — no OAuth).
 On first run (`browser.json` absent), the app runs an interactive setup that shells out to
 `yt-dlp --cookies-from-browser` to extract YouTube cookies from a local browser profile.
 Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
-`lyrics.json`, `config.toml`, `app.log`).
+`lyrics.json`, `config.toml`, `app.log`). Everything but `config.toml` is written by the
+app; `config.toml` is the hand-edited one, read once at startup by `config.rs`.
 
 ## Architecture
 
@@ -58,6 +59,11 @@ tui/        the ratatui frontend — single `ytm` binary
   do the fetching in background tokio tasks.
 - **`persistence.rs`** — `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID).
+- **`config.rs`** — `config.toml`, the hand-edited settings, read once at startup. Every
+  value has a working default and a missing or malformed file falls back to those with a
+  log warning, so a typo can never stop playback. `lyrics.offset` shifts every lyric line
+  against the record's timings (negative = early, positive = late); it is applied by
+  shifting the clock handed to `active_index`/`next_boundary`, never the cached records.
 
 ### `tui/`
 
