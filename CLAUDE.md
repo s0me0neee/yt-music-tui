@@ -20,6 +20,10 @@ Auth uses cookie-based auth via `browser.json` (ytmusicapi style — no OAuth).
 
 On first run (`browser.json` absent), the app runs an interactive setup that shells out to
 `yt-dlp --cookies-from-browser` to extract YouTube cookies from a local browser profile.
+The browser that worked is written to `config.toml` as `auth.cookie-browser`, so a later
+expiry renews itself by re-running yt-dlp rather than prompting — set `auth.auto-reauth =
+false` to always be asked. `Session::reauth` reports which happened via `Reauth`, and an
+automatic renewal lets `main.rs` carry on instead of asking for a restart.
 Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
 `lyrics.json`, `config.toml`, `app.log`). Everything but `config.toml` is written by the
 app; `config.toml` is the hand-edited one, read once at startup by `config.rs`.
@@ -64,6 +68,9 @@ tui/        the ratatui frontend — single `ytm` binary
   log warning, so a typo can never stop playback. `lyrics.offset` shifts every lyric line
   against the record's timings (negative = early, positive = late); it is applied by
   shifting the clock handed to `active_index`/`next_boundary`, never the cached records.
+  `auth.auto-reauth` / `auth.cookie-browser` drive silent re-authentication.
+  `remember_cookie_browser` writes back through `toml_edit`, so the user's comments and
+  formatting survive — this is the one file the app both reads and writes.
 
 ### `tui/`
 

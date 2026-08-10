@@ -137,7 +137,7 @@ impl Browser {
     }
 
     /// Parses the lowercase form written by [`Browser::as_ytdlp_arg`] (case-insensitive).
-    fn parse(s: &str) -> Option<Browser> {
+    pub fn parse(s: &str) -> Option<Browser> {
         Self::ALL
             .into_iter()
             .find(|b| b.as_ytdlp_arg().eq_ignore_ascii_case(s))
@@ -148,6 +148,36 @@ impl std::fmt::Display for Browser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
     }
+}
+
+/// The browser yt-dlp should read cookies from, if one is on record.
+///
+/// `config.toml` wins: it is the setting the user can see and change. The
+/// `.yt-tui-browser` marker file is the fallback, which is what sessions set up
+/// before the setting existed have.
+pub fn configured_browser() -> Option<Browser> {
+    let configured = crate::config::Config::load().auth.cookie_browser;
+    if !configured.trim().is_empty() {
+        return match Browser::parse(configured.trim()) {
+            Some(b) => Some(b),
+            None => {
+                log::warn!("config: cookie-browser {configured:?} is not one we know — ignoring");
+                None
+            }
+        };
+    }
+    std::fs::read_to_string(browser_file_path())
+        .ok()
+        .and_then(|raw| Browser::parse(raw.trim()))
+}
+
+/// What [`Session::reauth`] did, so a caller can tell "carry on" from "restart".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reauth {
+    /// Renewed with yt-dlp and no questions. The session is usable now.
+    Automatic,
+    /// The user was taken through setup and the app should restart.
+    Interactive,
 }
 
 // ── session ──────────────────────────────────────────────────────────────────
@@ -217,6 +247,9 @@ impl Session {
         let headers = build_default_headers(cookie_header);
         std::fs::write(&self.browser_json, serde_json::to_string_pretty(&headers)?)?;
         std::fs::write(browser_file_path(), browser.as_ytdlp_arg())?;
+        // Only once the extraction has actually worked — a browser that can't
+        // produce cookies is not worth re-running silently forever.
+        crate::config::remember_cookie_browser(browser.as_ytdlp_arg());
         Ok(())
     }
 
@@ -241,15 +274,8 @@ impl Session {
     /// No-op when setup was done with the manual cURL method, and skipped
     /// while cookies are still fresh (checked via `browser.json`'s mtime).
     pub fn refresh_cookies(&self) -> Result<()> {
-        let raw = match std::fs::read_to_string(browser_file_path()) {
-            Ok(b) => b,
-            Err(_) => {
-                log::info!("[session] no browser file — skipping cookie refresh (manual setup)");
-                return Ok(());
-            }
-        };
-        let Some(browser) = Browser::parse(raw.trim()) else {
-            log::warn!("[session] unrecognized browser {raw:?} in marker file — skipping refresh");
+        let Some(browser) = configured_browser() else {
+            log::info!("[session] no browser on record — skipping cookie refresh (manual setup)");
             return Ok(());
         };
 
@@ -279,11 +305,34 @@ impl Session {
 
     /// Drops the current session (`browser.json` + the browser marker file)
     /// and re-runs the interactive setup flow.
-    pub fn reauth(&self) -> Result<()> {
+    pub fn reauth(&self) -> Result<Reauth> {
+        // A session almost always expires for the dull reason — the cookies
+        // rotated — and the fix is the same yt-dlp run that set it up. Asking
+        // which method to use, then which browser, to arrive back where we
+        // started is a conversation with no content.
+        if let Some(browser) = configured_browser()
+            && crate::config::Config::load().auth.auto_reauth
+        {
+            eprintln!("\nSession expired — renewing from {browser} via yt-dlp…");
+            match self.setup_with_browser(browser) {
+                Ok(()) => {
+                    log::info!("[session] renewed automatically from {browser}");
+                    eprintln!("Renewed.\n");
+                    return Ok(Reauth::Automatic);
+                }
+                Err(e) => {
+                    // The browser may be closed, locked, or signed out. Fall
+                    // through and ask rather than leaving the user stuck.
+                    log::warn!("[session] automatic re-auth from {browser} failed: {e}");
+                    eprintln!("Automatic renewal failed ({e}).\n");
+                }
+            }
+        }
+
         self.clear()?;
         self.run_setup()?;
         eprintln!("\nSetup complete. Restart the app to continue.\n");
-        Ok(())
+        Ok(Reauth::Interactive)
     }
 
     // ── interactive setup methods ───────────────────────────────────────────
@@ -293,6 +342,7 @@ impl Session {
             "Browser you are signed in to YouTube Music with:",
             Browser::ALL.to_vec(),
         )
+        .with_help_message("remembered as auth.cookie-browser, so renewals need no prompt")
         .prompt()?;
         self.setup_with_browser(browser)
     }

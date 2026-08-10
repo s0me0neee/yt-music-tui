@@ -18,7 +18,7 @@ pub use library::{Album, Artist, Library, Playlist, PlaylistEntry, Track};
 pub use lyrics::{LyricsKind, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 pub use playback::AudioState;
 pub use player::{AppendOutcome, PlayMode, Player, RemoveOutcome, TrackRef};
-pub use session::{Browser, Session};
+pub use session::{Browser, Reauth, Session};
 
 /// Re-exported so consumers don't need `ytmusicapi` as a direct dependency.
 pub use ytmusicapi::YTMusicClient;

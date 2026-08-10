@@ -4,7 +4,7 @@ use simplelog::{Config, LevelFilter, WriteLogger};
 use std::fs::File;
 use std::sync::Arc;
 
-use ytm_core::{Session, library, persistence, session, shutdown};
+use ytm_core::{Reauth, Session, library, persistence, session, shutdown};
 
 #[hotpath::main]
 fn main() -> anyhow::Result<()> {
@@ -30,13 +30,17 @@ fn main() -> anyhow::Result<()> {
 
     // Build the API client immediately with cached cookies, then kick off a
     // background refresh so yt-dlp's 2-5 s run doesn't block startup.
-    let yt = match session.build_client() {
+    let mut yt = match session.build_client() {
         Ok(c) => c,
         Err(e) => {
             log::error!("build_client failed: {e:#}");
             eprintln!("\nFailed to load session: {e}");
-            session.reauth()?;
-            return Ok(());
+            // A silent renewal leaves us able to carry straight on; being
+            // walked through setup does not, since the app has to restart.
+            if session.reauth()? == Reauth::Interactive {
+                return Ok(());
+            }
+            session.build_client()?
         }
     };
 
@@ -56,9 +60,11 @@ fn main() -> anyhow::Result<()> {
     let playlists = match rt.block_on(library::get_playlists(&yt)) {
         Ok(p) => p,
         Err(ytm_core::Error::SessionExpired) => {
-            eprintln!("\nSession expired — re-authenticating.");
-            session.reauth()?;
-            return Ok(());
+            if session.reauth()? == Reauth::Interactive {
+                return Ok(());
+            }
+            yt = session.build_client()?;
+            rt.block_on(library::get_playlists(&yt))?
         }
         Err(e) => return Err(e.into()),
     };

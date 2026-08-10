@@ -27,6 +27,14 @@ pub const TEMPLATE: &str = "\
 # Applies to every song. Fractions are the useful range — try -0.3 if lines
 # consistently arrive a moment after they are sung.
 #offset = 0.0
+
+[auth]
+# Renew an expired session by re-running yt-dlp against the browser below,
+# instead of asking which method to use. Set false to always be asked.
+#auto-reauth = true
+# The browser yt-dlp reads cookies from. Filled in for you the first time you
+# set up with one; edit it if you switch browsers.
+#cookie-browser = \"firefox\"
 ";
 
 /// The one-line file older versions wrote. Recognised so it can be replaced
@@ -50,10 +58,34 @@ fn seconds<'de, D: Deserializer<'de>>(de: D) -> std::result::Result<f64, D::Erro
     })
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub lyrics: Lyrics,
+    pub auth: Auth,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Auth {
+    /// Renew an expired session with yt-dlp instead of asking. Only ever does
+    /// anything once [`Auth::cookie_browser`] is known, which is why it can
+    /// default on: until a browser has been chosen there is nothing to run.
+    pub auto_reauth: bool,
+    /// The browser yt-dlp reads cookies from, lowercase — `"firefox"`. Written
+    /// here the first time setup completes with one, so the next expiry needs
+    /// no conversation. Empty when setup was done by pasting a cURL command,
+    /// which yt-dlp can't repeat.
+    pub cookie_browser: String,
+}
+
+impl Default for Auth {
+    fn default() -> Self {
+        Self {
+            auto_reauth: true,
+            cookie_browser: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -108,6 +140,59 @@ impl Config {
             log::info!("config: lyrics.offset {}s", self.lyrics.offset);
         }
         self
+    }
+}
+
+/// Records the browser yt-dlp just extracted cookies from, so the next expiry
+/// can be handled without asking.
+///
+/// Rewrites `config.toml` in place, preserving its comments, key order and
+/// formatting — it is a file the user edits, and setup succeeding is no reason
+/// to reformat it. A no-op when the value is already right, and a logged
+/// warning rather than an error when the file can't be parsed: failing to
+/// record a preference must not fail the authentication that just worked.
+pub fn remember_cookie_browser(browser: &str) {
+    let path = config_toml_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_string(),
+        Err(e) => {
+            log::warn!(
+                "config: can't read {} to record the browser ({e})",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(e) => {
+            log::warn!(
+                "config: {} is not valid TOML ({e}) — leaving it alone",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    if doc
+        .get("auth")
+        .and_then(|a| a.get("cookie-browser"))
+        .and_then(|b| b.as_str())
+        == Some(browser)
+    {
+        return;
+    }
+
+    if !doc.get("auth").is_some_and(|a| a.is_table()) {
+        doc["auth"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["auth"]["cookie-browser"] = toml_edit::value(browser);
+
+    match std::fs::write(&path, doc.to_string()) {
+        Ok(()) => log::info!("config: remembered cookie-browser = {browser:?}"),
+        Err(e) => log::warn!("config: can't write {} ({e})", path.display()),
     }
 }
 
@@ -190,6 +275,94 @@ mod tests {
         // key, must not cost the user the settings that are valid.
         let c = parse("[lyrics]\noffset = -0.4\nsomething_else = true\n");
         assert_eq!(c.lyrics.offset, -0.4);
+    }
+
+    // ── auth ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn auth_defaults_to_asking_nothing_it_cannot_answer() {
+        let c = Config::default();
+        // On by default, but inert until a browser is on record — there is
+        // nothing to run yt-dlp against until then.
+        assert!(c.auth.auto_reauth);
+        assert!(c.auth.cookie_browser.is_empty());
+        assert_eq!(parse("").auth.cookie_browser, "");
+        assert!(parse("").auth.auto_reauth);
+    }
+
+    #[test]
+    fn auth_settings_are_read_in_kebab_case() {
+        // The names as they appear in the file, which is what the user types.
+        let c = parse("[auth]\nauto-reauth = false\ncookie-browser = \"firefox\"\n");
+        assert!(!c.auth.auto_reauth);
+        assert_eq!(c.auth.cookie_browser, "firefox");
+    }
+
+    #[test]
+    fn a_broken_auth_section_does_not_cost_the_lyrics_settings() {
+        // Whole-file fallback would silently undo an offset the user tuned.
+        let c = parse("[lyrics]\noffset = -0.4\n\n[auth]\nsomething-new = 1\n");
+        assert_eq!(c.lyrics.offset, -0.4);
+        assert!(c.auth.auto_reauth);
+    }
+
+    /// `remember_cookie_browser` against an arbitrary document, so the
+    /// format-preserving behaviour can be checked without touching the real
+    /// config file.
+    fn record_browser(src: &str, browser: &str) -> String {
+        let mut doc = src.parse::<toml_edit::DocumentMut>().expect("valid toml");
+        if !doc.get("auth").is_some_and(|a| a.is_table()) {
+            doc["auth"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["auth"]["cookie-browser"] = toml_edit::value(browser);
+        doc.to_string()
+    }
+
+    #[test]
+    fn recording_the_browser_keeps_the_file_as_the_user_left_it() {
+        let src = "\
+# my notes
+[lyrics]
+# tuned by ear
+offset = -0.35
+
+[auth]
+auto-reauth = true
+";
+        let out = record_browser(src, "firefox");
+        assert!(out.contains("# my notes"), "comments survive: {out}");
+        assert!(out.contains("# tuned by ear"));
+        assert!(out.contains("offset = -0.35"), "values survive: {out}");
+        assert!(out.contains("auto-reauth = true"));
+        assert!(out.contains("cookie-browser = \"firefox\""));
+        // And it still reads back as the same settings.
+        let c = parse(&out);
+        assert_eq!(c.lyrics.offset, -0.35);
+        assert_eq!(c.auth.cookie_browser, "firefox");
+    }
+
+    #[test]
+    fn recording_the_browser_creates_the_section_when_absent() {
+        let out = record_browser("[lyrics]\noffset = 0.5\n", "chrome");
+        let c = parse(&out);
+        assert_eq!(c.auth.cookie_browser, "chrome");
+        assert_eq!(c.lyrics.offset, 0.5);
+
+        // Including into the shipped template, which has it commented out.
+        let c = parse(&record_browser(TEMPLATE, "brave"));
+        assert_eq!(c.auth.cookie_browser, "brave");
+        assert!(c.auth.auto_reauth);
+    }
+
+    #[test]
+    fn recording_the_browser_replaces_an_earlier_one() {
+        let out = record_browser("[auth]\ncookie-browser = \"chrome\"\n", "firefox");
+        assert_eq!(parse(&out).auth.cookie_browser, "firefox");
+        assert_eq!(
+            out.matches("cookie-browser").count(),
+            1,
+            "not duplicated: {out}"
+        );
     }
 
     #[test]
