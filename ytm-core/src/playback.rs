@@ -162,6 +162,45 @@ fn load_url(mpv: &Mpv, url: &str) {
     set_prop(mpv, "pause", false);
 }
 
+/// mpv errors that mean "that URL did not play", as opposed to something being
+/// wrong with the player itself.
+///
+/// `LOADING_FAILED` is the everyday one — a CDN URL that has gone stale. The
+/// other two are how a *fallback* fails once mpv has opened something that
+/// isn't media at all: an expiry page parses as an unknown format, or as a
+/// container with no playable stream. Matching only `LOADING_FAILED` meant the
+/// fallback's own failure fell through to the catch-all warn arm, so the retry
+/// could neither escalate nor give up and the player sat "loading" forever.
+///
+/// `UNSUPPORTED` (-18) is deliberately absent: it means the system can't play
+/// this kind of stream, which a different URL for the same song won't change.
+const LOAD_FAILED: &[libmpv2::MpvError] = &[
+    -13, // MPV_ERROR_LOADING_FAILED
+    -16, // MPV_ERROR_NOTHING_TO_PLAY
+    -17, // MPV_ERROR_UNKNOWN_FORMAT
+];
+
+/// Starts a yt-dlp resolve for `id` on its own thread, unless one is already
+/// running. `what` only names the thread, for debuggers and panic messages.
+fn spawn_resolve(
+    id: &str,
+    what: &str,
+    fetching: &mut HashSet<String>,
+    tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
+) {
+    if !fetching.insert(id.to_string()) {
+        return; // already in flight; its result will be delivered to us anyway
+    }
+    let tx = tx.clone();
+    let id = id.to_string();
+    thread::Builder::new()
+        .name(format!("{what}-{id}"))
+        .spawn(move || {
+            let _ = tx.send((id.clone(), resolve_url(&id)));
+        })
+        .ok();
+}
+
 fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
     #[cfg(windows)]
     let which_cmd = "where";
@@ -306,17 +345,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                             // competing yt-dlp via its ytdl_hook.
                             log::info!("[audio] Play {id}: cache miss — resolving (single yt-dlp)");
                             pending_resolve = Some(id.clone());
-                            if !fetching.contains(&id) {
-                                fetching.insert(id.clone());
-                                let tx = fetch_tx.clone();
-                                let id2 = id.clone();
-                                thread::Builder::new()
-                                    .name(format!("resolve-{id2}"))
-                                    .spawn(move || {
-                                        let _ = tx.send((id2.clone(), resolve_url(&id2)));
-                                    })
-                                    .ok();
-                            }
+                            spawn_resolve(&id, "resolve", &mut fetching, &fetch_tx);
                         }
                     }
 
@@ -327,15 +356,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         if fetching.len() >= MAX_PREFETCH {
                             continue;
                         }
-                        fetching.insert(id.clone());
-                        let tx = fetch_tx.clone();
-                        let id2 = id.clone();
-                        thread::Builder::new()
-                            .name(format!("prefetch-{id2}"))
-                            .spawn(move || {
-                                let _ = tx.send((id2.clone(), resolve_url(&id2)));
-                            })
-                            .ok();
+                        spawn_resolve(&id, "prefetch", &mut fetching, &fetch_tx);
                     }
 
                     Cmd::Pause => {
@@ -405,23 +426,33 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                 }
                 Ok(Event::FileLoaded) => log::info!("[audio] file-loaded"),
                 Ok(_) => {}
-                // -13 = LOADING_FAILED: the cached URL is bad. Drop it and retry
-                // once via mpv's ytdl_hook so the song still plays.
-                Err(libmpv2::Error::Raw(-13)) => match current_id.clone() {
-                    Some(id) if !load_retried => {
-                        log::warn!("[audio] load failed for {id} — retrying via ytdl_hook");
-                        load_retried = true;
-                        url_cache.remove(&id);
-                        load_url(&mpv, &format!("https://music.youtube.com/watch?v={id}"));
+                // The URL didn't play. Drop it and resolve the song again, once.
+                Err(libmpv2::Error::Raw(code)) if LOAD_FAILED.contains(&code) => {
+                    match current_id.clone() {
+                        Some(id) if !load_retried => {
+                            log::warn!("[audio] load failed for {id} (mpv {code}) — re-resolving");
+                            load_retried = true;
+                            url_cache.remove(&id);
+                            // Resolve it ourselves rather than handing mpv the
+                            // watch URL. Its ytdl_hook is the path that failed
+                            // in the field, on a video a fresh single yt-dlp
+                            // resolve then played without complaint. If this
+                            // resolve comes back empty we still fall back to
+                            // ytdl_hook, where the results are drained.
+                            pending_resolve = Some(id.clone());
+                            spawn_resolve(&id, "re-resolve", &mut fetching, &fetch_tx);
+                        }
+                        Some(id) => {
+                            log::error!(
+                                "[audio] load failed for {id} (mpv {code}) after retry — giving up"
+                            );
+                            let mut s = lock_state(&state);
+                            s.loading = false;
+                            s.error = Some("playback failed".into());
+                        }
+                        None => log::warn!("[audio] load failed (mpv {code}), no current track"),
                     }
-                    Some(id) => {
-                        log::error!("[audio] load failed for {id} after retry — giving up");
-                        let mut s = lock_state(&state);
-                        s.loading = false;
-                        s.error = Some("playback failed".into());
-                    }
-                    None => log::warn!("[audio] load failed with no current track"),
-                },
+                }
                 Err(e) => log::warn!("[audio] mpv event error: {e}"),
             }
         }
