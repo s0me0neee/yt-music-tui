@@ -17,14 +17,20 @@ pub use lrclib::{LyricLine, active_index, next_boundary};
 use crate::error::Result;
 use crate::library::Track;
 
-/// Records whose length differs from the track's by more than this are hidden:
-/// they are a different edit at best, and synced lyrics drift visibly out of
-/// time well before this much. A few seconds of slack covers the usual
-/// difference between a YouTube upload and a release master.
+/// How far a record's length may differ from the track's before its *timing*
+/// stops being trustworthy. A few seconds of slack covers the usual difference
+/// between a YouTube upload and a release master; past that, synced lyrics
+/// drift visibly out of time.
 ///
-/// This is a hard limit whenever the track's own duration is known — there is
-/// deliberately no "show them anyway if nothing else matched" fallback.
-const MAX_DURATION_DELTA: f64 = 5.0;
+/// Records outside this are not discarded — they are demoted to plain text
+/// (see [`TrackLyrics::demote_to_plain`]), because the words are still right
+/// even when the timings aren't.
+const SYNC_DURATION_DELTA: f64 = 5.0;
+
+/// Past this, the record is a different song rather than a different edit, and
+/// is dropped outright. Generous enough for a cover or live take, which can
+/// legitimately run a good deal longer or shorter than the original.
+const MAX_DURATION_DELTA: f64 = 30.0;
 
 /// A synced record this close to the track's length is a clear winner: the
 /// search stops there rather than broadening, and the exact-lookup hit is
@@ -399,6 +405,11 @@ pub struct TrackLyrics {
     pub album_name: String,
     /// `None` when lrclib has no duration for the record.
     pub duration: Option<f64>,
+    /// Set when the record's length is too far from the track's for its
+    /// timings to be trusted, or when lrclib has no duration to check. The
+    /// lyrics are still offered — as plain text — since the words are the
+    /// song's even if the timings belong to a different recording.
+    pub timing_mismatch: bool,
     /// Position in lrclib's own result ordering, lowest first.
     ///
     /// lrclib returns search hits ranked by relevance — exact title matches
@@ -420,6 +431,18 @@ impl TrackLyrics {
 
     pub fn is_synced(&self) -> bool {
         matches!(self.kind, LyricsKind::Synced(_))
+    }
+
+    /// Drops the timings, keeping the words.
+    ///
+    /// Used when the record's length says its timings belong to a different
+    /// recording: scrolling those against this track would simply be wrong,
+    /// but the lyrics themselves are still the ones being sung.
+    fn demote_to_plain(&mut self) {
+        self.timing_mismatch = true;
+        if let LyricsKind::Synced(lines) = &self.kind {
+            self.kind = LyricsKind::Plain(lines.iter().map(|l| l.text.clone()).collect());
+        }
     }
 
     pub fn synced_lines(&self) -> Option<&[LyricLine]> {
@@ -455,6 +478,7 @@ impl TrackLyrics {
 
         Some(Self {
             id: l.id,
+            timing_mismatch: false,
             // Overwritten by `with_relevance` once the position is known.
             relevance: 0,
             track_name: l.track_name,
@@ -487,13 +511,23 @@ fn with_relevance(records: Vec<TrackLyrics>, from: usize) -> Vec<TrackLyrics> {
 /// unless that would empty the list, in which case they are kept, so this never
 /// turns "a poor match" into "no lyrics".
 pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
-    // Drop anything whose length doesn't match the track. Records with no
-    // duration at all go too: we can't tell whether they fit.
     if q.duration.is_some() {
+        // Far enough out and it's a different song, not a different edit.
         items.retain(|c| {
             c.duration_delta(q.duration)
-                .is_some_and(|d| d <= MAX_DURATION_DELTA)
+                .is_none_or(|d| d <= MAX_DURATION_DELTA)
         });
+        // Close enough to be the same song but too far for the timings to line
+        // up — keep the words, drop the clock. A cover running 13s longer than
+        // the original is the usual case.
+        for c in &mut items {
+            if !c
+                .duration_delta(q.duration)
+                .is_some_and(|d| d <= SYNC_DURATION_DELTA)
+            {
+                c.demote_to_plain();
+            }
+        }
     }
 
     // Compare against the normalised forms: when the match came from a
@@ -828,6 +862,7 @@ mod tests {
     fn rec(id: u64, duration: f64, synced: bool) -> TrackLyrics {
         TrackLyrics {
             id,
+            timing_mismatch: false,
             relevance: id as usize,
             track_name: "Echo".into(),
             artist_name: "Crusher-P".into(),
@@ -1315,16 +1350,25 @@ mod tests {
             album: "Some Album".into(),
             duration: Some(174.0),
         };
-        // lrclib has three records: two at 174s and one at 181s. The 181s one
-        // is outside the duration window, so two are offered.
+        // lrclib has three records: two at 174s and one at 181s. All three are
+        // offered — 7s is the same song — but the 181s one loses its timings.
         let all = svc.candidates(&q).await.expect("search errored");
-        assert_eq!(all.len(), 2, "got {all:?}");
-        assert!(
-            all.iter().all(|c| c
-                .duration_delta(q.duration)
-                .is_some_and(|d| d <= MAX_DURATION_DELTA)),
-            "an out-of-window record was offered"
-        );
+        let summary: Vec<_> = all
+            .iter()
+            .map(|c| (c.id, c.duration, c.is_synced(), c.timing_mismatch))
+            .collect();
+        assert_eq!(all.len(), 3, "got {summary:?}");
+        for c in &all {
+            let delta = c.duration_delta(q.duration).expect("no duration");
+            assert_eq!(
+                c.timing_mismatch,
+                delta > SYNC_DURATION_DELTA,
+                "#{} at {delta}s off: {summary:?}",
+                c.id
+            );
+            // A demoted record must never still claim to be synced.
+            assert!(!(c.timing_mismatch && c.is_synced()));
+        }
 
         let best = svc
             .best_for(&q, None)
@@ -1493,6 +1537,50 @@ mod tests {
         );
     }
 
+    /// `【歌ってみた】ヴァンパイア/ covered by ヰ世界情緒` runs 3:13 while every
+    /// lrclib record of the original is 3:00–3:02. Thirteen seconds is far too
+    /// much drift to scroll, but the words are the same song, so the lyrics are
+    /// offered as plain text instead of the panel reporting nothing.
+    #[tokio::test]
+    #[ignore = "hits the live lrclib.net API"]
+    async fn offers_plain_lyrics_when_only_the_timing_is_wrong() {
+        let svc = LyricsService::new();
+        let q = LyricsQuery {
+            title: "【歌ってみた】ヴァンパイア/ covered by ヰ世界情緒".into(),
+            artist: "ヰ世界情緒".into(),
+            album: String::new(),
+            duration: Some(193.0),
+        };
+
+        let found = svc
+            .best_for(&q, None)
+            .await
+            .expect("lookup errored")
+            .expect("no lyrics offered for a 13s difference");
+        assert!(
+            matches!(found.kind, LyricsKind::Plain(_)),
+            "expected plain, got {:?}",
+            found.kind
+        );
+        assert!(found.timing_mismatch);
+
+        // The picker offers alternatives, and none of them claims timings.
+        let all = svc.candidates(&q).await.expect("search errored");
+        assert!(all.len() > 1, "only {} candidate(s)", all.len());
+        assert!(
+            all.iter().all(|c| !c.is_synced()),
+            "a record 13s out was offered as synced"
+        );
+        // The wildly-off records (1:38, 4:22) are a different song, not a
+        // different edit, and must not be offered at all.
+        assert!(
+            all.iter().all(|c| c
+                .duration_delta(q.duration)
+                .is_none_or(|d| d <= MAX_DURATION_DELTA)),
+            "a different song leaked into the results"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "hits the live lrclib.net API"]
     async fn candidates_returns_multiple_ranked_records() {
@@ -1547,7 +1635,12 @@ mod tests {
         let mut unknown = rec(9, 0.0, true);
         unknown.duration = None;
         let out = rank(vec![unknown, rec(1, 246.0, true)], &q(Some(244.0)));
-        assert_eq!(ids(&out), [1]);
+        assert_eq!(ids(&out), [1, 9], "the timed record must lead");
+        assert!(out[0].is_synced());
+        assert!(
+            !out[1].is_synced(),
+            "an unverifiable record can't claim timings"
+        );
 
         // With no known duration to compare against, it is kept and ordered
         // behind nothing in particular.
@@ -1557,11 +1650,17 @@ mod tests {
     }
 
     #[test]
-    fn a_record_without_duration_is_hidden_when_the_track_length_is_known() {
+    fn a_record_without_duration_cannot_be_trusted_for_timing() {
         // We can't tell whether it fits, so it can't be vouched for.
         let mut unknown = rec(9, 0.0, true);
         unknown.duration = None;
-        assert!(rank(vec![unknown], &q(Some(244.0))).is_empty());
+        let out = rank(vec![unknown], &q(Some(244.0)));
+        assert_eq!(out.len(), 1, "it is still offered");
+        assert!(
+            out[0].timing_mismatch,
+            "but its timings can't be vouched for"
+        );
+        assert!(!out[0].is_synced());
 
         // With no track duration to compare against, it is kept.
         let mut unknown = rec(9, 0.0, true);
@@ -1579,9 +1678,50 @@ mod tests {
     }
 
     #[test]
-    fn far_off_records_are_hidden_even_when_nothing_else_matches() {
-        // These used to be kept as a last resort. A lyric sheet for a different
-        // edit is worse than none: it scrolls visibly out of time.
+    fn a_mistimed_record_is_offered_as_plain_rather_than_dropped() {
+        // The reported cover: 3:13 against a 3:00 original. Thirteen seconds is
+        // far too much for synced playback, but the words are the same song.
+        let out = rank(vec![rec(1, 180.0, true)], &q(Some(193.0)));
+        assert_eq!(out.len(), 1, "the words were thrown away with the timings");
+        assert!(
+            !out[0].is_synced(),
+            "13s of drift must not scroll as synced"
+        );
+        assert!(out[0].timing_mismatch);
+        assert!(matches!(out[0].kind, LyricsKind::Plain(_)));
+    }
+
+    #[test]
+    fn a_well_timed_record_keeps_its_timings() {
+        let out = rank(vec![rec(1, 194.0, true)], &q(Some(193.0)));
+        assert!(out[0].is_synced());
+        assert!(!out[0].timing_mismatch);
+    }
+
+    #[test]
+    fn synced_in_window_outranks_a_demoted_one() {
+        // Even though the demoted record is listed first by lrclib.
+        let out = rank(
+            vec![rec(1, 180.0, true), rec(2, 194.0, true)],
+            &q(Some(193.0)),
+        );
+        assert_eq!(ids(&out), [2, 1]);
+        assert!(out[0].is_synced());
+        assert!(!out[1].is_synced());
+    }
+
+    #[test]
+    fn demotion_does_not_apply_without_a_track_duration() {
+        // Nothing to compare against, so nothing is claimed about the timings.
+        let out = rank(vec![rec(1, 180.0, true)], &q(None));
+        assert!(out[0].is_synced());
+        assert!(!out[0].timing_mismatch);
+    }
+
+    #[test]
+    fn a_different_song_is_dropped_outright() {
+        // Beyond the outer bound these aren't a different edit, they're a
+        // different track — not worth offering even as plain text.
         let out = rank(
             vec![rec(1, 400.0, true), rec(2, 500.0, true)],
             &q(Some(245.0)),
@@ -1590,13 +1730,16 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_a_few_seconds_not_a_dozen() {
-        // A ~15s difference used to pass; that is what prompted tightening it.
+    fn the_sync_window_is_a_few_seconds_not_a_dozen() {
+        // A ~15s difference used to be offered as synced; it is now demoted,
+        // and the well-timed record wins.
         let out = rank(
             vec![rec(1, 259.0, true), rec(2, 248.0, true)],
             &q(Some(244.0)),
         );
-        assert_eq!(ids(&out), [2], "a 15s difference must not be offered");
+        assert_eq!(ids(&out), [2, 1]);
+        assert!(out[0].is_synced(), "a 4s difference is still synced");
+        assert!(!out[1].is_synced(), "a 15s difference must not scroll");
     }
 
     #[test]

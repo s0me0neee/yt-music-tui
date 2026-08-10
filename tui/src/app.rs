@@ -1797,7 +1797,15 @@ impl App {
         };
         // "no timing available" belongs in the header, not consuming a content
         // row and scrolling away with the text as it used to.
-        let status = Self::lyrics_status(found, Some(Span::styled("¶ unsynced", theme::WARN)));
+        // Distinguish "lrclib has no timed version" from "the timed version is
+        // for a different-length recording" — the second is worth a nudge to
+        // press `c`, the first isn't.
+        let badge = if found.timing_mismatch {
+            Span::styled("¶ timing differs", theme::WARN)
+        } else {
+            Span::styled("¶ unsynced", theme::WARN)
+        };
+        let status = Self::lyrics_status(found, Some(badge));
 
         let focused = self.active_panel == Panel::Songs;
         let body = section(frame, area, "Lyrics", Some(status), focused);
@@ -1929,9 +1937,16 @@ impl App {
             }
 
             // Green when the length matches the track — a one-glance cue that
-            // this is the right edit.
+            // this is the right edit. Yellow when the gap is why the record
+            // lost its timings, so the trade-off is visible before choosing.
             let close = c.duration_delta(track_secs).is_some_and(|d| d <= 2.0);
-            let dur_style = if close { theme::PLAYING } else { theme::DIM };
+            let dur_style = if close {
+                theme::PLAYING
+            } else if c.timing_mismatch {
+                theme::WARN
+            } else {
+                theme::DIM
+            };
 
             Row::new(vec![
                 Cell::from(Line::from(spans)),
