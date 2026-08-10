@@ -6,7 +6,9 @@
 //! layers the two and [`rank`] does duration-proximity scoring client-side.
 
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -493,6 +495,41 @@ impl TrackLyrics {
         }
     }
 
+    /// A fingerprint of what this record actually puts on screen.
+    ///
+    /// lrclib is full of the same lyrics re-uploaded under a different album,
+    /// and the picker shows every copy — for some tracks *every* result is the
+    /// same words and the same timings under six different album names.
+    ///
+    /// The timings are part of the identity, deliberately. Two records whose
+    /// words agree but whose timings differ are a real choice, and which of
+    /// them scrolls correctly is the whole reason the picker exists; only when
+    /// both agree is there nothing left to choose between.
+    fn content_fingerprint(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        match &self.kind {
+            LyricsKind::Synced(lines) => {
+                0u8.hash(&mut h);
+                for l in lines {
+                    // Centiseconds — LRC's own precision, so two copies of one
+                    // file agree exactly without depending on float equality.
+                    ((l.at * 100.0).round() as i64).hash(&mut h);
+                    l.text.hash(&mut h);
+                }
+            }
+            LyricsKind::Plain(lines) => {
+                1u8.hash(&mut h);
+                for l in lines {
+                    l.trim().hash(&mut h);
+                }
+            }
+            // No content to tell apart: one "instrumental" row says everything
+            // a dozen of them would.
+            LyricsKind::Instrumental => 2u8.hash(&mut h),
+        }
+        h.finish()
+    }
+
     /// Converts a raw record, or `None` if it carries no usable content.
     ///
     /// Synced text that is present but unparseable falls through to plain —
@@ -637,6 +674,29 @@ pub fn rank(mut items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
     });
 
     items
+}
+
+/// Drops every record whose lyrics duplicate one already in the list.
+///
+/// Applied to a ranked list, so the copy that survives each group is the
+/// best-ranked one and the order of what remains is untouched.
+///
+/// This is not a cosmetic tidy-up. Two thirds of what the ladder reaches for a
+/// popular track is the same file under a different album name, which buries
+/// the records that genuinely differ and turns choosing into a scroll through
+/// twenty identical rows.
+pub fn dedupe_by_content(items: Vec<TrackLyrics>) -> Vec<TrackLyrics> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|c| seen.insert(c.content_fingerprint()))
+        .collect()
+}
+
+/// Orders candidates and then drops duplicated lyrics — what every caller
+/// wanting a final, user-facing list needs.
+fn rank_and_dedupe(items: Vec<TrackLyrics>, q: &LyricsQuery) -> Vec<TrackLyrics> {
+    dedupe_by_content(rank(items, q))
 }
 
 // ── service ──────────────────────────────────────────────────────────────────
@@ -793,7 +853,7 @@ impl LyricsService {
             if !found.iter().any(|c| c.id == exact.id) {
                 found.push(exact);
             }
-            found = rank(found, q);
+            found = rank_and_dedupe(found, q);
         }
 
         if !found.is_empty() {
@@ -877,7 +937,7 @@ impl LyricsService {
                             pool.iter().find(|c| Self::is_decisive(c, q)).map(|c| c.id)
                     {
                         log::debug!("lyrics: decisive match #{id} on {attempt:?}");
-                        return Ok(rank(pool, q));
+                        return Ok(rank_and_dedupe(pool, q));
                     }
                 }
                 // One failing rung shouldn't abort the ladder — a later,
@@ -894,7 +954,7 @@ impl LyricsService {
             Some(e) if pool.is_empty() => Err(e.into()),
             _ => {
                 log::debug!("lyrics: {} candidates across the ladder", pool.len());
-                Ok(rank(pool, q))
+                Ok(rank_and_dedupe(pool, q))
             }
         }
     }
@@ -1282,6 +1342,80 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Attempt::FreeText(q) if q == "法螺話 理芽"))
         );
+    }
+
+    /// A record carrying the given timed lines.
+    fn timed(id: u64, duration: f64, lines: &[(f64, &str)]) -> TrackLyrics {
+        TrackLyrics {
+            kind: LyricsKind::Synced(
+                lines
+                    .iter()
+                    .map(|(at, text)| LyricLine {
+                        at: *at,
+                        text: (*text).into(),
+                    })
+                    .collect(),
+            ),
+            ..rec(id, duration, true)
+        }
+    }
+
+    #[test]
+    fn duplicate_lyrics_collapse_to_the_best_ranked_copy() {
+        // The common lrclib shape: one file re-uploaded under three albums.
+        let lines = &[(0.0, "a"), (1.5, "b")][..];
+        let mut first = timed(1, 245.0, lines);
+        first.album_name = "Single".into();
+        let mut second = timed(2, 245.0, lines);
+        second.album_name = "Deluxe".into();
+        let mut third = timed(3, 245.0, lines);
+        third.album_name = "Greatest Hits".into();
+
+        let out = dedupe_by_content(rank(vec![first, second, third], &q(Some(245.0))));
+        assert_eq!(ids(&out), [1], "the best-ranked copy is the one kept");
+    }
+
+    #[test]
+    fn same_words_with_different_timings_are_both_kept() {
+        // The whole point of the picker: these are a real choice, and which one
+        // scrolls correctly is exactly what the user is choosing between.
+        let a = timed(1, 245.0, &[(0.0, "a"), (1.5, "b")]);
+        let b = timed(2, 245.0, &[(0.0, "a"), (2.5, "b")]);
+        let out = dedupe_by_content(rank(vec![a, b], &q(Some(245.0))));
+        assert_eq!(ids(&out), [1, 2]);
+    }
+
+    #[test]
+    fn dedupe_distinguishes_kinds_and_collapses_instrumentals() {
+        // Same words, but one has timings and one doesn't — different records.
+        let synced = timed(1, 245.0, &[(0.0, "a")]);
+        let plain = TrackLyrics {
+            kind: LyricsKind::Plain(vec!["a".into()]),
+            ..rec(2, 245.0, false)
+        };
+        let out = dedupe_by_content(vec![synced, plain]);
+        assert_eq!(ids(&out), [1, 2]);
+
+        // Instrumentals carry nothing to tell apart, so one row is enough.
+        let inst = |id| TrackLyrics {
+            kind: LyricsKind::Instrumental,
+            ..rec(id, 245.0, false)
+        };
+        assert_eq!(ids(&dedupe_by_content(vec![inst(1), inst(2)])), [1]);
+    }
+
+    #[test]
+    fn dedupe_ignores_metadata_and_leaves_order_alone() {
+        // Album, artist spelling and lrclib id differ; the lyrics don't.
+        let mut a = timed(1, 245.0, &[(0.0, "x")]);
+        a.artist_name = "Crusher-P".into();
+        let mut b = timed(2, 246.0, &[(0.0, "x")]);
+        b.artist_name = "crusher p".into();
+        b.album_name = "Other".into();
+        let distinct = timed(3, 245.0, &[(0.0, "y")]);
+
+        let out = dedupe_by_content(vec![a, distinct, b]);
+        assert_eq!(ids(&out), [1, 3], "order of survivors is untouched");
     }
 
     #[test]
