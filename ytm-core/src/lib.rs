@@ -11,6 +11,7 @@ pub mod playback;
 pub mod player;
 pub mod session;
 pub mod shutdown;
+pub mod translate;
 
 pub use config::Config;
 pub use error::{Error, Result};
@@ -19,6 +20,7 @@ pub use lyrics::{LyricsKind, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics}
 pub use playback::AudioState;
 pub use player::{AppendOutcome, PlayMode, Player, RemoveOutcome, TrackRef};
 pub use session::{Browser, Reauth, Session};
+pub use translate::TranslateMsg;
 
 /// Re-exported so consumers don't need `ytmusicapi` as a direct dependency.
 pub use ytmusicapi::YTMusicClient;

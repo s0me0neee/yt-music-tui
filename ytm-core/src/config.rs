@@ -27,6 +27,10 @@ pub const TEMPLATE: &str = "\
 # Applies to every song. Fractions are the useful range — try -0.3 if lines
 # consistently arrive a moment after they are sung.
 #offset = 0.0
+# Show a translation under each lyric, in this language: \"zh\", \"fr\", \"en\".
+# Press `i` in the lyrics panel to turn it on and off. Empty means the key
+# does nothing, which is the default — translation is never fetched unasked.
+#translate-to = \"\"
 
 [auth]
 # Renew an expired session by re-running yt-dlp against the browser below,
@@ -88,12 +92,19 @@ impl Default for Auth {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct Lyrics {
     /// Seconds to shift every lyric line by. Negative is early, positive late.
     #[serde(deserialize_with = "seconds")]
     pub offset: f64,
+    /// Language code to translate lyrics into — `"zh"`, `"fr"`, `"en"`. Empty
+    /// disables translation entirely, which is the default: nothing is ever
+    /// sent to a translation service unless a language is named here.
+    ///
+    /// Normalised by [`Config::validated`] to the spelling the endpoint uses,
+    /// and cleared if it isn't a language the endpoint knows.
+    pub translate_to: String,
 }
 
 impl Config {
@@ -139,6 +150,28 @@ impl Config {
         if self.lyrics.offset != 0.0 {
             log::info!("config: lyrics.offset {}s", self.lyrics.offset);
         }
+
+        // Checked here rather than at the point of use, because an unknown
+        // code is not an error the endpoint reports: it answers `tl=zzz` with
+        // the text unchanged, which looks like a translation that silently
+        // never works. Better to say so once, at startup, and stay off.
+        let want = self.lyrics.translate_to.trim().to_string();
+        self.lyrics.translate_to = match crate::translate::normalise_language(&want) {
+            Some(code) => {
+                log::info!("config: lyrics.translate-to {code:?}");
+                code.to_string()
+            }
+            None => {
+                if !want.is_empty() {
+                    log::warn!(
+                        "config: lyrics.translate-to {want:?} is not a language code — \
+                         translation is off"
+                    );
+                }
+                String::new()
+            }
+        };
+
         self
     }
 }
@@ -251,7 +284,13 @@ mod tests {
 
     #[test]
     fn negative_is_early_and_positive_is_late() {
-        let at = |offset| Lyrics { offset }.lyric_time(10.0);
+        let at = |offset| {
+            Lyrics {
+                offset,
+                ..Default::default()
+            }
+            .lyric_time(10.0)
+        };
         // Early: the lookup runs ahead of the clock, so the line due at 10.5s
         // is already active at 10s.
         assert_eq!(at(-0.5), 10.5);
@@ -267,6 +306,69 @@ mod tests {
         assert_eq!(parse("[lyrics]\noffset = 1000.0\n").lyrics.offset, 30.0);
         assert_eq!(parse("[lyrics]\noffset = nan\n").lyrics.offset, 0.0);
         assert_eq!(parse("[lyrics]\noffset = inf\n").lyrics.offset, 0.0);
+    }
+
+    // ── translation ───────────────────────────────────────────────────────
+
+    #[test]
+    fn translation_is_off_until_a_language_is_named() {
+        assert_eq!(parse("").lyrics.translate_to, "");
+        assert_eq!(parse("[lyrics]\noffset = 0.0\n").lyrics.translate_to, "");
+        assert_eq!(Config::default().lyrics.translate_to, "");
+        // The template names none, so a fresh install fetches nothing.
+        assert_eq!(parse(TEMPLATE).lyrics.translate_to, "");
+    }
+
+    #[test]
+    fn a_language_is_read_in_kebab_case_and_normalised() {
+        assert_eq!(
+            parse("[lyrics]\ntranslate-to = \"zh\"\n")
+                .lyrics
+                .translate_to,
+            "zh"
+        );
+        assert_eq!(
+            parse("[lyrics]\ntranslate-to = \" FR \"\n")
+                .lyrics
+                .translate_to,
+            "fr"
+        );
+        // The one code with capitals in it.
+        assert_eq!(
+            parse("[lyrics]\ntranslate-to = \"zh-tw\"\n")
+                .lyrics
+                .translate_to,
+            "zh-TW"
+        );
+    }
+
+    #[test]
+    fn a_language_nobody_translates_into_turns_the_feature_off() {
+        // Left set, this would look like a translation that never arrives:
+        // the endpoint answers an unknown code with the input unchanged.
+        assert_eq!(
+            parse("[lyrics]\ntranslate-to = \"chinese\"\n")
+                .lyrics
+                .translate_to,
+            ""
+        );
+        assert_eq!(
+            parse("[lyrics]\ntranslate-to = \"\"\n").lyrics.translate_to,
+            ""
+        );
+        assert_eq!(
+            parse("[lyrics]\ntranslate-to = \"  \"\n")
+                .lyrics
+                .translate_to,
+            ""
+        );
+    }
+
+    #[test]
+    fn a_bad_language_does_not_cost_the_offset() {
+        let c = parse("[lyrics]\noffset = -0.4\ntranslate-to = \"nope\"\n");
+        assert_eq!(c.lyrics.offset, -0.4);
+        assert_eq!(c.lyrics.translate_to, "");
     }
 
     #[test]
@@ -367,13 +469,30 @@ auto-reauth = true
 
     #[test]
     fn the_label_only_appears_when_there_is_a_shift() {
-        assert_eq!(Lyrics { offset: 0.0 }.offset_label(), None);
         assert_eq!(
-            Lyrics { offset: -0.3 }.offset_label().as_deref(),
+            Lyrics {
+                offset: 0.0,
+                ..Default::default()
+            }
+            .offset_label(),
+            None
+        );
+        assert_eq!(
+            Lyrics {
+                offset: -0.3,
+                ..Default::default()
+            }
+            .offset_label()
+            .as_deref(),
             Some("-0.3s")
         );
         assert_eq!(
-            Lyrics { offset: 1.25 }.offset_label().as_deref(),
+            Lyrics {
+                offset: 1.25,
+                ..Default::default()
+            }
+            .offset_label()
+            .as_deref(),
             Some("+1.2s")
         );
     }

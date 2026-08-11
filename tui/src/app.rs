@@ -19,7 +19,7 @@ use throbber_widgets_tui::{Throbber, ThrobberState};
 use ytm_core::library::SongBatch;
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
-use ytm_core::{AppendOutcome, AudioState, Library, Player, RemoveOutcome, Track};
+use ytm_core::{AppendOutcome, AudioState, Library, Player, RemoveOutcome, Track, TranslateMsg};
 
 // ── theme ────────────────────────────────────────────────────────────────────
 
@@ -64,6 +64,24 @@ mod theme {
     pub const KEY: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     /// Progress fill and other "live" accents.
     pub const ACCENT: Style = Style::new().fg(Color::Cyan);
+
+    /// Translated text. Magenta plays no other role in the palette, so a line
+    /// the app wrote can never be read as a line the song did — which is the
+    /// whole point of showing the two together.
+    pub const TRANSLATION: Style = Style::new().fg(Color::Magenta);
+    /// A translation that isn't the line playing: italic and faint, so it sits
+    /// under its original rather than competing with it. The italic is a second
+    /// cue for terminals whose magenta is loud, and the colour is a second cue
+    /// for those that don't render italics at all.
+    pub const TRANSLATION_DIM: Style = Style::new()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::ITALIC)
+        .add_modifier(Modifier::DIM);
+    /// The translation of the line currently playing.
+    pub const TRANSLATION_ACTIVE: Style = Style::new()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::ITALIC);
 
     /// Something needs attention but still works (mute, filter, no synced lyrics).
     pub const WARN: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -378,10 +396,21 @@ fn synced_view(
             let row = &rows[idx as usize];
             let Some(active) = active else {
                 // Intro: nothing is playing yet, so nothing is emphasised.
-                return Line::styled(row.text.clone(), theme::DIM).centered();
+                let style = if row.translated {
+                    theme::TRANSLATION_DIM
+                } else {
+                    theme::DIM
+                };
+                return Line::styled(row.text.clone(), style).centered();
             };
 
             if row.lyric == active {
+                // The translation of the active line is *not* given the
+                // highlight: two adjacent rows in the same marker pen would
+                // read as one four-line lyric.
+                if row.translated {
+                    return Line::styled(row.text.clone(), theme::TRANSLATION_ACTIVE).centered();
+                }
                 let text = if row.text.is_empty() {
                     "♪ ♪ ♪".to_string()
                 } else {
@@ -392,7 +421,9 @@ fn synced_view(
                 return Line::styled(format!(" {text} "), ACTIVE_LYRIC).centered();
             }
 
-            let style = if row.lyric.abs_diff(active) == 1 {
+            let style = if row.translated {
+                theme::TRANSLATION_DIM
+            } else if row.lyric.abs_diff(active) == 1 {
                 theme::META
             } else {
                 theme::DIM
@@ -419,6 +450,23 @@ enum LyricsEntry {
 struct LyricRow {
     lyric: usize,
     text: String,
+    /// This row is the translation of `lyric` rather than the words themselves.
+    /// It follows its original's rows, so the highlight still lands on the
+    /// first row of the line being sung.
+    translated: bool,
+}
+
+/// Per-record translation state, keyed by lrclib id in [`App::translations`].
+/// Terminal like [`LyricsEntry`]: toggling `i` off and on again re-reads the
+/// cache rather than the network.
+enum TranslationEntry {
+    Loading,
+    /// One entry per lyric line, empty where there was nothing to translate.
+    Ready(Vec<String>),
+    /// The reason is reported as a toast when it happens and written to the
+    /// log; what has to survive here is only that this record was tried, so a
+    /// dead network isn't re-dialled once a tick. Pressing `i` twice retries.
+    Failed,
 }
 
 /// The `c` variant picker.
@@ -519,6 +567,53 @@ fn picker_rows(
     rows
 }
 
+/// Wraps a record's lines to `width`, weaving each line's translation in under
+/// it.
+///
+/// Both halves of a line carry the same `lyric` index, so a translated pair
+/// highlights, scrolls and centres as the single line it is. `translation` may
+/// be shorter than `texts`, or empty when nothing is being translated.
+fn lyric_rows(texts: &[String], translation: &[String], width: u16) -> Vec<LyricRow> {
+    let mut rows = Vec::new();
+    for (i, text) in texts.iter().enumerate() {
+        if text.trim().is_empty() {
+            // Keep interludes as a row of their own so synced playback has
+            // something to sit on during instrumental gaps.
+            rows.push(LyricRow {
+                lyric: i,
+                text: String::new(),
+                translated: false,
+            });
+            continue;
+        }
+        for piece in wrap_n_lines(text, width as usize, usize::MAX) {
+            rows.push(LyricRow {
+                lyric: i,
+                text: piece,
+                translated: false,
+            });
+        }
+        // Nothing at all when the line couldn't be translated, rather than a
+        // blank row that would read as a lyric the record is missing. Nothing
+        // either when the translation came back identical — a kanji-only line
+        // often does, and printing it twice is noise, not information.
+        let Some(line) = translation
+            .get(i)
+            .filter(|t| !t.trim().is_empty() && t.trim() != text.trim())
+        else {
+            continue;
+        };
+        for piece in wrap_n_lines(line, width as usize, usize::MAX) {
+            rows.push(LyricRow {
+                lyric: i,
+                text: piece,
+                translated: true,
+            });
+        }
+    }
+    rows
+}
+
 /// Row to start the picker on: whatever is already in use, so re-picking it
 /// takes a deliberate keypress. Row 0 is the pinned "Automatic" entry, so the
 /// candidates are offset by one.
@@ -576,6 +671,16 @@ pub struct App {
     /// When we started waiting for mpv to report the playing track's real
     /// duration, so the wait can't become a permanent block if it never does.
     lyrics_duration_wait: Option<(String, Instant)>,
+    // translation
+    /// Toggled by `i`. A mode rather than a per-song setting, like lyrics
+    /// themselves: turn it on once and it follows you through the queue.
+    translate_on: bool,
+    translate_tx: std::sync::mpsc::Sender<TranslateMsg>,
+    translate_rx: std::sync::mpsc::Receiver<TranslateMsg>,
+    /// Keyed by lrclib record id, not by video: a translation belongs to the
+    /// words. Two tracks resolving to the same record share one, and picking a
+    /// different record with `c` correctly gets a translation of its own.
+    translations: std::collections::HashMap<u64, TranslationEntry>,
     /// User settings from `config.toml`, read once at startup.
     config: ytm_core::Config,
 }
@@ -596,6 +701,7 @@ impl App {
         player.set_volume(persistence::load_settings().volume);
 
         let (lyrics_tx, lyrics_rx) = std::sync::mpsc::channel();
+        let (translate_tx, translate_rx) = std::sync::mpsc::channel();
 
         Self {
             library,
@@ -631,6 +737,10 @@ impl App {
             lyrics_picker: None,
             lyrics_overrides: persistence::load_lyrics_overrides(),
             lyrics_duration_wait: None,
+            translate_on: false,
+            translate_tx,
+            translate_rx,
+            translations: std::collections::HashMap::new(),
             config,
             lyrics_dirty: false,
         }
@@ -830,9 +940,146 @@ impl App {
     fn retry_lyrics(&mut self) {
         if let Some(id) = self.current_video_id() {
             self.lyrics_cache.remove(&id);
+            // The words may come back from a different record, and last
+            // record's translation is not this one's.
             self.reset_lyrics_view();
             self.notify("Retrying lyrics…");
         }
+    }
+
+    // ── translation ───────────────────────────────────────────────────────────
+
+    /// `i`. Off when `config.toml` names no language, since there is nothing to
+    /// translate into and silently doing nothing would look like a broken key.
+    fn toggle_translation(&mut self) {
+        if self.config.lyrics.translate_to.is_empty() {
+            self.notify("Set lyrics.translate-to in config.toml (e.g. \"zh\")");
+            return;
+        }
+        self.translate_on = !self.translate_on;
+        // Only the wrapped rows change: keep the scroll position and whether
+        // the panel is following, so the view doesn't jump under the user.
+        self.lyrics_rows = None;
+        if !self.translate_on {
+            self.notify("Translation off");
+            return;
+        }
+        // Turning it back on is also the retry: a failure is otherwise sticky
+        // for the rest of the session, and the usual cause is a network that
+        // has since come back.
+        if let Some(id) = self.current_lyrics().map(|l| l.id)
+            && matches!(self.translations.get(&id), Some(TranslationEntry::Failed))
+        {
+            self.translations.remove(&id);
+        }
+        self.notify(format!(
+            "Translating to {}",
+            self.config.lyrics.translate_to
+        ));
+        self.ensure_translation();
+    }
+
+    /// Starts a translation for whatever record is on screen, unless one is
+    /// cached or already in flight — the same one-shot shape as
+    /// [`Self::ensure_lyrics`], and what makes `i` free to press twice.
+    fn ensure_translation(&mut self) {
+        if !self.translate_on || self.config.lyrics.translate_to.is_empty() {
+            return;
+        }
+        let Some(found) = self.current_lyrics() else {
+            return;
+        };
+        let record_id = found.id;
+        if self.translations.contains_key(&record_id) {
+            return;
+        }
+        let lines: Vec<String> = match &found.kind {
+            ytm_core::LyricsKind::Synced(lines) => lines.iter().map(|l| l.text.clone()).collect(),
+            ytm_core::LyricsKind::Plain(lines) => lines.clone(),
+            // Nothing to translate, and no entry cached either — an
+            // instrumental that later resolves to a real record should still
+            // get one.
+            ytm_core::LyricsKind::Instrumental => return,
+        };
+        if lines.iter().all(|l| l.trim().is_empty()) {
+            return;
+        }
+
+        let to = self.config.lyrics.translate_to.clone();
+        log::info!(
+            "translate: {} lines of lrclib #{record_id} into {to}",
+            lines.len()
+        );
+        self.translations
+            .insert(record_id, TranslationEntry::Loading);
+        ytm_core::translate::spawn_translate(
+            &self.lyrics_handle,
+            record_id,
+            lines,
+            to,
+            self.translate_tx.clone(),
+        );
+    }
+
+    /// Drain completed translations. Keyed by record, so a result that arrives
+    /// after the user has skipped on is still worth keeping.
+    fn drain_translations(&mut self) {
+        while let Ok(TranslateMsg::Done { record_id, result }) = self.translate_rx.try_recv() {
+            let on_screen = self.current_lyrics().map(|l| l.id) == Some(record_id);
+            let entry = match result {
+                Ok(lines) => {
+                    log::info!("translate: lrclib #{record_id} done");
+                    TranslationEntry::Ready(lines)
+                }
+                Err(e) => {
+                    log::warn!("translate: lrclib #{record_id} failed: {e}");
+                    // Said once, here, since the header has room for the fact
+                    // but not the reason. Only for the record on screen — a
+                    // result for a track the user has skipped past is noise.
+                    if on_screen {
+                        self.notify(format!("Translation failed: {e}"));
+                    }
+                    TranslationEntry::Failed
+                }
+            };
+            self.translations.insert(record_id, entry);
+            // Rebuild the wrapped rows with the translation woven in — but
+            // leave the scroll alone, since the user may have moved it while
+            // waiting.
+            if on_screen {
+                self.lyrics_rows = None;
+            }
+        }
+    }
+
+    /// The translation to show under the on-screen record's lines, if it has
+    /// arrived and `i` is on.
+    fn shown_translation(&self, record_id: u64) -> Option<&[String]> {
+        if !self.translate_on {
+            return None;
+        }
+        match self.translations.get(&record_id) {
+            Some(TranslationEntry::Ready(lines)) => Some(lines),
+            _ => None,
+        }
+    }
+
+    /// The lyrics header's translation badge: which language `i` turned on, and
+    /// how the fetch is getting on. Absent when translation is off.
+    fn translation_badge(&self, record_id: u64) -> Option<Span<'static>> {
+        if !self.translate_on {
+            return None;
+        }
+        let lang = self.config.lyrics.translate_to.clone();
+        Some(match self.translations.get(&record_id) {
+            Some(TranslationEntry::Ready(_)) => {
+                Span::styled(format!("⇄ {lang}"), theme::TRANSLATION)
+            }
+            Some(TranslationEntry::Failed) => {
+                Span::styled(format!("⇄ {lang} failed"), theme::ERROR)
+            }
+            _ => Span::styled(format!("⇄ {lang}…"), theme::DIM),
+        })
     }
 
     /// Attempt to restore a saved queue. Called after every song-batch arrival;
@@ -913,12 +1160,16 @@ impl App {
 
             self.drain_song_channel();
             self.drain_lyrics();
+            self.drain_translations();
             // Kicked off from here rather than on each key: this one lookup
             // covers entering lyrics mode, p/n, auto-advance and Enter alike.
             if self.lyrics_mode
                 && let Some(id) = self.current_video_id()
             {
                 self.ensure_lyrics(&id);
+                // Only once the record has arrived — which is why this can't
+                // hang off the `i` keypress alone.
+                self.ensure_translation();
             }
             self.throbber_state.calc_next();
             // Expire the toast here rather than inside the render pass, which
@@ -1103,6 +1354,7 @@ impl App {
                             KeyCode::Char('y') => self.toggle_lyrics_mode(),
                             KeyCode::Char('c') if self.lyrics_mode => self.open_lyrics_picker(),
                             KeyCode::Char('r') if self.lyrics_mode => self.retry_lyrics(),
+                            KeyCode::Char('i') if self.lyrics_mode => self.toggle_translation(),
                             KeyCode::PageDown if self.lyrics_mode => self.scroll_lyrics(5),
                             KeyCode::PageUp if self.lyrics_mode => self.scroll_lyrics(-5),
                             // ── quit ──────────────────────────────────────────────────
@@ -1441,6 +1693,7 @@ impl App {
             &[
                 ("y", "close"),
                 ("c", "source"),
+                ("i", "translate"),
                 ("spc", "pause"),
                 ("p/n", "skip"),
                 ("j/k", "scroll"),
@@ -1524,6 +1777,7 @@ impl App {
             ("", ""),
             ("y", "Toggle lyrics"),
             ("c", "Choose lyrics source (in lyrics)"),
+            ("i", "Toggle translation (in lyrics)"),
             ("r", "Retry lyrics (in lyrics)"),
             ("", ""),
             ("?", "Close this help"),
@@ -1834,7 +2088,9 @@ impl App {
             }
             Some(LyricsEntry::Ready(found)) => match &found.kind {
                 ytm_core::LyricsKind::Instrumental => {
-                    let status = Self::lyrics_status(found, None, None);
+                    // No badge: there are no words, so nothing is being
+                    // translated however the mode is set.
+                    let status = Self::lyrics_status(found, None, None, None);
                     let body = section(frame, area, "Lyrics", Some(status), focused);
                     centered_message(
                         frame,
@@ -1859,11 +2115,16 @@ impl App {
     fn lyrics_status(
         found: &TrackLyrics,
         badge: Option<Span<'static>>,
+        translation: Option<Span<'static>>,
         offset: Option<String>,
     ) -> Line<'static> {
         let mut spans = Vec::new();
         if let Some(badge) = badge {
             spans.push(badge);
+            spans.push(Span::styled(SEP, theme::DIM));
+        }
+        if let Some(translation) = translation {
+            spans.push(translation);
             spans.push(Span::styled(SEP, theme::DIM));
         }
         if let Some(offset) = offset {
@@ -1889,35 +2150,25 @@ impl App {
             None => true,
         };
         if stale {
-            let texts: Vec<String> = match self.lyrics_cache.get(video_id) {
-                Some(LyricsEntry::Ready(found)) => match &found.kind {
-                    ytm_core::LyricsKind::Synced(lines) => {
-                        lines.iter().map(|l| l.text.clone()).collect()
+            // Both cloned up front so the borrows of `self` end before the
+            // rows are stored back into it.
+            let (texts, translation): (Vec<String>, Vec<String>) =
+                match self.lyrics_cache.get(video_id) {
+                    Some(LyricsEntry::Ready(found)) => {
+                        let texts = match &found.kind {
+                            ytm_core::LyricsKind::Synced(lines) => {
+                                lines.iter().map(|l| l.text.clone()).collect()
+                            }
+                            ytm_core::LyricsKind::Plain(lines) => lines.clone(),
+                            ytm_core::LyricsKind::Instrumental => Vec::new(),
+                        };
+                        let translation = self.shown_translation(found.id).unwrap_or(&[]).to_vec();
+                        (texts, translation)
                     }
-                    ytm_core::LyricsKind::Plain(lines) => lines.clone(),
-                    ytm_core::LyricsKind::Instrumental => Vec::new(),
-                },
-                _ => Vec::new(),
-            };
+                    _ => (Vec::new(), Vec::new()),
+                };
 
-            let mut rows = Vec::new();
-            for (i, text) in texts.iter().enumerate() {
-                if text.trim().is_empty() {
-                    // Keep interludes as a row of their own so synced playback
-                    // has something to sit on during instrumental gaps.
-                    rows.push(LyricRow {
-                        lyric: i,
-                        text: String::new(),
-                    });
-                    continue;
-                }
-                for piece in wrap_n_lines(text, width as usize, usize::MAX) {
-                    rows.push(LyricRow {
-                        lyric: i,
-                        text: piece,
-                    });
-                }
-            }
+            let rows = lyric_rows(&texts, &translation, width);
             self.lyrics_rows = Some((video_id.to_string(), width, rows));
         }
         self.lyrics_rows.as_ref().map_or(0, |(_, _, r)| r.len())
@@ -1934,6 +2185,7 @@ impl App {
             Self::lyrics_status(
                 found,
                 Some(Span::styled("♪ synced", theme::ACCENT)),
+                self.translation_badge(found.id),
                 self.config.lyrics.offset_label(),
             )
         };
@@ -1987,7 +2239,8 @@ impl App {
         } else {
             Span::styled("¶ unsynced", theme::WARN)
         };
-        let status = Self::lyrics_status(found, Some(badge), None);
+        let status =
+            Self::lyrics_status(found, Some(badge), self.translation_badge(found.id), None);
 
         let focused = self.active_panel == Panel::Songs;
         let body = section(frame, area, "Lyrics", Some(status), focused);
@@ -2015,7 +2268,14 @@ impl App {
             .take(height)
             // Left-aligned: unsynced lyrics are prose-shaped, and centred prose
             // reads badly.
-            .map(|r| Line::styled(r.text.clone(), theme::META))
+            .map(|r| {
+                let style = if r.translated {
+                    theme::TRANSLATION_DIM
+                } else {
+                    theme::META
+                };
+                Line::styled(r.text.clone(), style)
+            })
             .collect();
         frame.render_widget(Paragraph::new(out), inner);
 
@@ -2434,6 +2694,7 @@ mod tests {
             .map(|i| LyricRow {
                 lyric: i,
                 text: format!("line{i}"),
+                translated: false,
             })
             .collect()
     }
@@ -2495,7 +2756,10 @@ mod tests {
     fn the_offset_moves_which_line_is_active() {
         let lines = timed_lines(&[10.0, 20.0, 30.0]);
         let at = |offset: f64, elapsed: f64| {
-            let cfg = ytm_core::config::Lyrics { offset };
+            let cfg = ytm_core::config::Lyrics {
+                offset,
+                ..Default::default()
+            };
             lyrics::active_index(&lines, cfg.lyric_time(elapsed))
         };
 
@@ -2523,7 +2787,10 @@ mod tests {
         // the record's raw one, or every line changes late by the offset.
         let lines = timed_lines(&[10.0, 20.0]);
         let wait = |offset: f64, elapsed: f64| {
-            let cfg = ytm_core::config::Lyrics { offset };
+            let cfg = ytm_core::config::Lyrics {
+                offset,
+                ..Default::default()
+            };
             lyrics::next_boundary(&lines, cfg.lyric_time(elapsed))
         };
 
@@ -3002,18 +3269,22 @@ mod tests {
             LyricRow {
                 lyric: 0,
                 text: "a".into(),
+                translated: false,
             },
             LyricRow {
                 lyric: 1,
                 text: "long part one".into(),
+                translated: false,
             },
             LyricRow {
                 lyric: 1,
                 text: "long part two".into(),
+                translated: false,
             },
             LyricRow {
                 lyric: 2,
                 text: "b".into(),
+                translated: false,
             },
         ];
         let out = synced_view(&wrapped, Some(1), 4, 0);
@@ -3027,14 +3298,17 @@ mod tests {
             LyricRow {
                 lyric: 0,
                 text: "a".into(),
+                translated: false,
             },
             LyricRow {
                 lyric: 1,
                 text: String::new(),
+                translated: false,
             },
             LyricRow {
                 lyric: 2,
                 text: "b".into(),
+                translated: false,
             },
         ];
         let out = synced_view(&gap, Some(1), 3, 0);
@@ -3046,6 +3320,12 @@ mod tests {
     fn intro_dims_everything() {
         let out = synced_view(&rows(20), None, 5, 0);
         assert!(styles(&out).iter().all(|s| s.bg.is_none()));
+    }
+
+    // ── translation ───────────────────────────────────────────────────────
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -3079,6 +3359,192 @@ mod tests {
     fn a_character_wider_than_the_column_still_makes_progress() {
         let out = wrap_n_lines("君の名", 1, usize::MAX);
         assert_eq!(out, ["君", "の", "名"]);
+    }
+
+    #[test]
+    fn without_a_translation_the_rows_are_the_lyrics_alone() {
+        let out = lyric_rows(&strings(&["one", "two"]), &[], 40);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|r| !r.translated));
+    }
+
+    #[test]
+    fn each_translation_follows_the_line_it_translates() {
+        let out = lyric_rows(&strings(&["one", "two"]), &strings(&["一", "二"]), 40);
+        let seen: Vec<(usize, bool, &str)> = out
+            .iter()
+            .map(|r| (r.lyric, r.translated, r.text.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (0, false, "one"),
+                (0, true, "一"),
+                (1, false, "two"),
+                (1, true, "二"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_untranslated_line_gets_no_row_of_its_own() {
+        // A blank would read as a lyric the record is missing, and would push
+        // the pairing out of step for everything below it.
+        let out = lyric_rows(
+            &strings(&["one", "two", "three"]),
+            &strings(&["一", "", "三"]),
+            40,
+        );
+        let seen: Vec<(usize, bool)> = out.iter().map(|r| (r.lyric, r.translated)).collect();
+        assert_eq!(
+            seen,
+            [(0, false), (0, true), (1, false), (2, false), (2, true)]
+        );
+
+        // Same when the translation simply ran short.
+        let short = lyric_rows(&strings(&["one", "two"]), &strings(&["一"]), 40);
+        assert_eq!(short.len(), 3);
+        assert!(!short[2].translated);
+    }
+
+    #[test]
+    fn a_translation_identical_to_the_line_is_not_shown_twice() {
+        // Kanji-only lines routinely come back unchanged, and a source already
+        // in the target language comes back unchanged throughout.
+        let out = lyric_rows(
+            &strings(&["永遠", "走った"]),
+            &strings(&["永遠", "跑了"]),
+            40,
+        );
+        let seen: Vec<(usize, bool)> = out.iter().map(|r| (r.lyric, r.translated)).collect();
+        assert_eq!(seen, [(0, false), (1, false), (1, true)]);
+    }
+
+    #[test]
+    fn an_interlude_is_never_given_a_translation() {
+        let out = lyric_rows(
+            &strings(&["a", "  ", "b"]),
+            &strings(&["甲", "x", "乙"]),
+            40,
+        );
+        let gap: Vec<_> = out.iter().filter(|r| r.lyric == 1).collect();
+        assert_eq!(gap.len(), 1, "the gap row stands alone");
+        assert!(!gap[0].translated);
+    }
+
+    #[test]
+    fn a_wrapped_translation_stays_bound_to_its_line() {
+        // Both halves of the pair carry the same lyric index, so the highlight
+        // covers the line and its translation together.
+        let out = lyric_rows(&strings(&["aaaaaa"]), &strings(&["bbbbbb"]), 3);
+        assert!(out.len() > 2, "nothing wrapped: {}", out.len());
+        assert!(out.iter().all(|r| r.lyric == 0));
+        assert_eq!(out.iter().filter(|r| r.translated).count(), 2);
+        // Originals first, so the centring lands on the words being sung.
+        assert!(!out[0].translated && !out[1].translated);
+    }
+
+    /// A lyric and its translation, ready for `synced_view`.
+    fn paired(n: usize) -> Vec<LyricRow> {
+        let texts: Vec<String> = (0..n).map(|i| format!("line{i}")).collect();
+        let trans: Vec<String> = (0..n).map(|i| format!("译{i}")).collect();
+        lyric_rows(&texts, &trans, 40)
+    }
+
+    #[test]
+    fn a_translation_never_looks_like_the_words_themselves() {
+        // The requirement in one assertion: no row is styled both ways, and
+        // the translated rows own a colour nothing else in the panel uses.
+        let out = synced_view(&paired(20), Some(10), 9, 0);
+        let (styles, texts) = (styles(&out), texts(&out));
+
+        for (style, text) in styles.iter().zip(&texts) {
+            if text.is_empty() {
+                continue;
+            }
+            if text.starts_with('译') {
+                assert_eq!(style.fg, Some(Color::Magenta), "{text}: not marked");
+            } else {
+                assert_ne!(style.fg, Some(Color::Magenta), "{text}: wrongly marked");
+            }
+        }
+    }
+
+    #[test]
+    fn the_highlight_stays_on_the_words_and_off_the_translation() {
+        let out = synced_view(&paired(20), Some(10), 9, 0);
+        let styles = styles(&out);
+        // Still exactly one background on screen — two adjacent highlighted
+        // rows would read as a single four-line lyric.
+        assert_eq!(styles.iter().filter(|s| s.bg.is_some()).count(), 1);
+
+        let active = styles.iter().position(|s| s.bg.is_some()).unwrap();
+        assert_eq!(texts(&out)[active], "line10");
+        assert_eq!(texts(&out)[active + 1], "译10", "translation sits under it");
+        assert_eq!(styles[active + 1].fg, Some(Color::Magenta));
+        assert!(styles[active + 1].bg.is_none());
+    }
+
+    #[test]
+    fn the_active_line_is_still_centred_with_translations_on() {
+        // Twice as many rows, so a centring bug shows up as an off-by-several.
+        let height = 9;
+        let out = synced_view(&paired(20), Some(10), height, 0);
+        let active = styles(&out).iter().position(|s| s.bg.is_some()).unwrap();
+        assert_eq!(active, (height as usize - 1) / 2);
+    }
+
+    #[test]
+    fn translations_are_dimmed_during_the_intro() {
+        // Nothing is playing yet, so nothing is emphasised — including the
+        // translations, which still have to be tellable apart.
+        let out = synced_view(&paired(20), None, 6, 0);
+        assert!(styles(&out).iter().all(|s| s.bg.is_none()));
+        for (style, text) in styles(&out).iter().zip(texts(&out)) {
+            if text.starts_with('译') {
+                assert_eq!(style.fg, Some(Color::Magenta));
+            }
+        }
+    }
+
+    /// Prints the translated panel so the pairing can be eyeballed:
+    /// `cargo test -p yt-music-tui -- --ignored --nocapture render_translated`
+    #[test]
+    #[ignore = "visual smoke check — prints the panel, asserts nothing"]
+    fn render_translated() {
+        let words = strings(&[
+            "夜が明けるまで踊ろう",
+            "君の声が聞こえる",
+            "",
+            "誰も知らない場所へ",
+            "もう戻れないんだ",
+        ]);
+        let trans = strings(&[
+            "让我们跳舞到黎明",
+            "我听到你的声音",
+            "",
+            "去一个无人知晓的地方",
+            "我们再也回不去了",
+        ]);
+        let rows = lyric_rows(&words, &trans, 40);
+        let out = draw(46, 11, |frame| {
+            let body = section(
+                frame,
+                frame.area(),
+                "Lyrics",
+                Some(Line::from(vec![
+                    Span::styled("♪ synced", theme::ACCENT),
+                    Span::styled(SEP, theme::DIM),
+                    Span::styled("⇄ zh", theme::TRANSLATION),
+                ])),
+                true,
+            );
+            frame.render_widget(
+                Paragraph::new(synced_view(&rows, Some(3), body.height, 0)),
+                body,
+            );
+        });
+        println!("{}", out.join("\n"));
     }
 
     #[test]

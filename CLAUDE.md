@@ -12,6 +12,7 @@ cargo test           # run tests (offline — network tests are #[ignore]d)
 cargo test <name>    # run a single test by name
 
 cargo test -p lrclib -- --ignored   # the live lrclib.net API tests
+cargo test -p ytm-core translate -- --ignored   # the live translation tests
 ```
 
 ### Linking libmpv
@@ -77,6 +78,17 @@ tui/        the ratatui frontend — single `ytm` binary
   duration, returns one) over `/search` (returns many, ignores duration), preferring synced
   over plain; `rank` does duration-proximity scoring client-side. `spawn_best`/`spawn_choices`
   do the fetching in background tokio tasks.
+- **`translate.rs`** — policy over the `rust-translate` crate, which wraps Google's public
+  `translate_a/single` endpoint. Two of the crate's flaws are handled here, and both are
+  silent if they aren't: it interpolates the text straight into the URL (a lyric with `&`,
+  `#` or `%` in it comes back mangled — hence `percent_encode`), and it returns only the
+  *first segment* of the reply, dropping everything past the first full stop. So a reply is
+  only used when it can be proved complete — one line back per line sent. `translate_lines`
+  probes with the first batch: whole ⇒ the rest of the song goes the same way (Japanese
+  sources come back in one piece, so a song is a couple of requests); short ⇒ re-fetched a
+  sentence at a time via `sentence_pieces`, which the endpoint cannot segment further.
+  Blank and repeated lines are never sent, so a chorus costs one request. Returns one entry
+  per input line, empty where nothing could be translated.
 - **`persistence.rs`** — `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID).
 - **`config.rs`** — `config.toml`, the hand-edited settings, read once at startup. Every
@@ -84,6 +96,10 @@ tui/        the ratatui frontend — single `ytm` binary
   log warning, so a typo can never stop playback. `lyrics.offset` shifts every lyric line
   against the record's timings (negative = early, positive = late); it is applied by
   shifting the clock handed to `active_index`/`next_boundary`, never the cached records.
+  `lyrics.translate-to` is the language `i` translates into (`"zh"`, `"fr"`, …); it is
+  checked against the endpoint's own list at startup and cleared if unknown, because an
+  unknown code is answered with the input unchanged rather than an error. Empty (the
+  default) means nothing is ever sent to a translation service.
   `auth.auto-reauth` / `auth.cookie-browser` drive silent re-authentication.
   `remember_cookie_browser` writes back through `toml_edit`, so the user's comments and
   formatting survive — this is the one file the app both reads and writes.
@@ -100,8 +116,8 @@ tui/        the ratatui frontend — single `ytm` binary
   - **Colour**: every style is a named constant in the `theme` module, and every
     value is an **ANSI named colour** (never `Rgb`/`Indexed`) so the user's own
     terminal palette drives the look. One role per colour — Cyan is focus and
-    keys, Green is playing, Yellow warns, Red errors, Gray/DarkGray are content
-    metadata and chrome respectively.
+    keys, Green is playing, Yellow warns, Red errors, Magenta is translated
+    text, Gray/DarkGray are content metadata and chrome respectively.
   - **Focus** is carried by the section header's colour and by the selection
     style (`SELECTED` vs `SELECTED_BLUR`), since there is no border to tint.
   - **Filter**: `/` opens inline filter mode; `Enter` confirms (keeps filter), `Esc` clears.
@@ -114,6 +130,16 @@ tui/        the ratatui frontend — single `ytm` binary
     returns for a popular track — and its left column marks `IN USE` (what the panel is
     showing) and `AUTO` (the record automatic matching resolved to). The record on screen
     is guaranteed a row, since it is often the `/get` hit the search ladder never sees.
+  - **Translation**: `i` weaves a translation in under each lyric, in the language
+    `lyrics.translate-to` names. Translated rows are Magenta and italic and carry the same
+    `lyric` index as their original (`lyric_rows`), so a pair highlights, wraps and centres
+    as the one line it is; the active line's own highlight deliberately stays on the words
+    alone. A line whose translation is blank, or identical to the original, gets no row at
+    all. Cached per **lrclib record id**, not per video — a translation belongs to the
+    words, so `c` gets one of its own and two tracks on the same record share one. `i`
+    twice is the retry after a failure.
+  - **Wrapping** (`wrap_n_lines`) measures display *cells*, not `char`s: a CJK lyric is two
+    cells per character and would otherwise run to twice the panel width and be clipped.
 
 ### Event loop cadence
 
@@ -141,6 +167,7 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `o` | Toggle queue / songs view |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |
+| `i` | (in lyrics mode) Toggle the translation under each line |
 | `r` | (in lyrics mode) Retry a failed lyrics fetch |
 | `?` | Full keymap overlay (any key closes it) |
 | `q` / `Ctrl+C` | Quit |
@@ -161,6 +188,7 @@ main.rs
   └─ library::spawn_library_fetch()   └─ App::run()
        (tokio tasks → mpsc)                └─ event_loop
                                                 ├─ drain_song_channel / drain_lyrics
+                                                │  / drain_translations
                                                 ├─ render
                                                 └─ Player → AudioEngine → libmpv
 ```
@@ -176,5 +204,11 @@ Do not bump `lrclib` to 0.13 casually — it would add a second HTTP stack plus 
 C build (needs cc + cmake). Verify with `cargo tree -i aws-lc-sys` (should report *not found*).
 Note 0.12 has no `query` feature; `.query()` is unconditional there.
 
+`rust-translate 0.1.3` brings no HTTP stack of its own — its `reqwest 0.12.4` resolves to the
+0.12 already in the graph. It does ask for tokio's `full` feature set, which unifies across
+the workspace; that costs build time, nothing at runtime. Its API is three free async
+functions and a language list; see `ytm-core/src/translate.rs` for what it gets wrong.
+
 Key deps: `ratatui 0.30`, `ytmusicapi 0.4.2`, `libmpv2 6`, `reqwest 0.12`, `thiserror 1`,
-`ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.8`, `throbber-widgets-tui 0.11`.
+`rust-translate 0.1.3`, `ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.8`,
+`throbber-widgets-tui 0.11`.
