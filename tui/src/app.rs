@@ -230,33 +230,48 @@ fn fit_hints(items: &[(&str, &str)], width: usize) -> Vec<Span<'static>> {
     spans
 }
 
+/// Hard-wraps `text` to `width` **display cells**.
+///
+/// Cells rather than `char`s, for the same reason [`truncate_line`] measures
+/// them: a CJK line is two cells per character, so counting characters lets it
+/// run to twice the panel's width and be clipped. Lyrics are where this shows
+/// — and where the missing half is the point of the panel.
 fn wrap_n_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     if width == 0 || max_lines == 0 {
         return vec![text.to_string()];
     }
     let mut result: Vec<String> = Vec::new();
     'outer: for raw in text.lines() {
-        let chars: Vec<char> = raw.chars().collect();
-        if chars.is_empty() {
+        if raw.is_empty() {
             result.push(String::new());
             if result.len() >= max_lines {
                 break;
             }
             continue;
         }
-        let mut start = 0;
-        while start < chars.len() {
-            let end = (start + width).min(chars.len());
-            if result.len() + 1 >= max_lines && end < chars.len() {
-                let mut s: String = chars[start..start + width.saturating_sub(1)]
-                    .iter()
-                    .collect();
-                s.push('…');
-                result.push(s);
+        let mut chars = raw.chars().peekable();
+        while chars.peek().is_some() {
+            let mut piece = String::new();
+            let mut used = 0;
+            while let Some(&c) = chars.peek() {
+                let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                // `piece.is_empty()` keeps a character wider than the whole
+                // column from stalling the loop; it overflows by a cell
+                // instead, which is the lesser of the two failures.
+                if used + w > width && !piece.is_empty() {
+                    break;
+                }
+                piece.push(c);
+                used += w;
+                chars.next();
+            }
+            if result.len() + 1 >= max_lines && chars.peek().is_some() {
+                while width_of(&piece) + 1 > width && piece.pop().is_some() {}
+                piece.push('…');
+                result.push(piece);
                 break 'outer;
             }
-            result.push(chars[start..end].iter().collect());
-            start = end;
+            result.push(piece);
             if result.len() >= max_lines {
                 break 'outer;
             }
@@ -3031,6 +3046,39 @@ mod tests {
     fn intro_dims_everything() {
         let out = synced_view(&rows(20), None, 5, 0);
         assert!(styles(&out).iter().all(|s| s.bg.is_none()));
+    }
+
+    #[test]
+    fn wrapping_counts_cells_so_cjk_stays_in_its_column() {
+        // Counting characters let a 26-character Japanese line occupy 52 cells
+        // of a 26-cell panel, and the second half was simply clipped away.
+        let long = "君の名前を呼ぶよ夜が明けるまでずっと歌っていたいんだ";
+        let out = wrap_n_lines(long, 26, usize::MAX);
+        assert!(out.len() > 1, "did not wrap at all: {out:?}");
+        assert!(out.iter().all(|p| width_of(p) <= 26), "{out:?}");
+        assert_eq!(out.concat(), long, "characters were lost");
+
+        // ASCII is unchanged: one cell a character either way.
+        assert_eq!(wrap_n_lines("abcdef", 3, usize::MAX), ["abc", "def"]);
+    }
+
+    #[test]
+    fn a_truncating_wrap_leaves_room_for_the_ellipsis() {
+        let out = wrap_n_lines("君の名前を呼ぶよ", 6, 1);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with('…'));
+        assert!(
+            width_of(&out[0]) <= 6,
+            "{:?} is {} cells",
+            out[0],
+            width_of(&out[0])
+        );
+    }
+
+    #[test]
+    fn a_character_wider_than_the_column_still_makes_progress() {
+        let out = wrap_n_lines("君の名", 1, usize::MAX);
+        assert_eq!(out, ["君", "の", "名"]);
     }
 
     #[test]
