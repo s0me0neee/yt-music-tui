@@ -13,6 +13,7 @@ cargo test <name>    # run a single test by name
 
 cargo test -p lrclib -- --ignored   # the live lrclib.net API tests
 cargo test -p ytm-core translate -- --ignored   # the live translation tests
+# the AI one takes ANTHROPIC_API_KEY or DEEPSEEK_API_KEY, whichever is set
 cargo test -p ytm-core mpris -- --ignored       # needs a session D-Bus
 ```
 
@@ -46,8 +47,9 @@ expiry renews itself by re-running yt-dlp rather than prompting — set `auth.au
 false` to always be asked. `Session::reauth` reports which happened via `Reauth`, and an
 automatic renewal lets `main.rs` carry on instead of asking for a restart.
 Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
-`lyrics.json`, `config.toml`, `app.log`). Everything but `config.toml` is written by the
-app; `config.toml` is the hand-edited one, read once at startup by `config.rs`.
+`lyrics.json`, `translations.json`, `config.toml`, `app.log`). Everything but `config.toml`
+is written by the app; `config.toml` is the hand-edited one, read once at startup by
+`config.rs`.
 
 ## Architecture
 
@@ -84,9 +86,10 @@ tui/        the ratatui frontend — single `ytm` binary
   duration, returns one) over `/search` (returns many, ignores duration), preferring synced
   over plain; `rank` does duration-proximity scoring client-side. `spawn_best`/`spawn_choices`
   do the fetching in background tokio tasks.
-- **`translate.rs`** — two backends behind one `translate_lines`, chosen by `Backend`.
-  `lyrics.ai-translation = false` (the default) is the **free path**, described below and
-  unchanged from before the AI backend existed. `true` routes to **`translate/llm.rs`**,
+- **`translate.rs`** — two backends behind one `translate_lines`, chosen by `Backend` and,
+  through it, by which key was pressed. `i` is always the **free path**, described below and
+  unchanged from before the AI backend existed; `I` — offered only where
+  `lyrics.ai-translation` set it up — routes to **`translate/llm.rs`**,
   which sends the whole song to the Messages API in one request with no pre-processing: a
   model that sees every line reads a sentence spanning several of them by itself. Alignment
   is enforced rather than hoped for, and `place` checks it twice: the reply is constrained
@@ -95,7 +98,14 @@ tui/        the ratatui frontend — single `ytm` binary
   copy of the line it is translating — is compared against what actually went out, which
   catches the case the index set can't, a reply of the right length and numbering whose text
   has slipped a line. Writing the line out before translating it also keeps the model on
-  *that* line, so the drift the echo detects happens less to begin with. The prompt names
+  *that* line, so the drift the echo detects happens less to begin with. What neither check
+  can see is *meaning* moving between correctly-numbered lines, which is what a model does
+  when it reads two stanzas as one passage — so `numbered` keeps the song's blank lines as
+  bare separators, and the prompt says a sentence never crosses one. The prompt also asks
+  for each line's own words on its own line even where the target language would order them
+  differently: told instead to make the lines read as natural prose, the model collapses an
+  enjambed sentence onto one line and leaves its neighbour empty or padded with invention
+  (3 runs in 6, measured; 0 in 8 after). The prompt names
   the target language rather than coding it: asked for `zh`, Haiku answers in *English*
   three times out of three, hence `language_name`. Blank and repeated lines are never sent,
   so a chorus is translated once and its repeats agree by construction. Measured over three
@@ -130,20 +140,43 @@ tui/        the ratatui frontend — single `ytm` binary
   returns `None` with a log line and nothing else changes. Linux-only; other targets get a
   same-shaped stub so `app.rs` needs no `cfg`.
 - **`persistence.rs`** — `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
-  choices, keyed by video ID).
+  choices, keyed by video ID), `translations.json` (**AI** translations, keyed by lrclib
+  record id, so one is paid for once). Only the AI ones: the free endpoint costs nothing but
+  a wait, so `i` asks again each session and its translation can improve, while `I` reuses
+  what it bought. The entry records the language — a changed `translate-to` is a miss — and
+  which model answered, and nothing is written when that model is *empty*: an `I` request
+  the free endpoint ended up answering is not what `I` bought, so it is dropped and `I` gets
+  another go at the model. Capped at `MAX_SAVED_TRANSLATIONS`, oldest written evicted first.
 - **`config.rs`** — `config.toml`, the hand-edited settings, read once at startup. Every
   value has a working default and a missing or malformed file falls back to those with a
-  log warning, so a typo can never stop playback. `lyrics.offset` shifts every lyric line
+  log warning, so a typo can never stop playback. Because it *is* hand-edited, the reading
+  is deliberately forgiving in three ways. Only a **syntax** error costs the whole file: the
+  document is parsed to a `toml::Table` and each setting read out of it by `field`, so
+  `offset = "0.5"` costs `offset` and leaves `cookie-browser` alone — losing that would ask
+  the user to set up again at the next expiry, over a stray quote. Anything the app doesn't
+  read is **named in the log** by `unknown`, because `translate_to` for `translate-to`
+  parses perfectly and does nothing, which is the worst way for a setting to fail. And
+  values are trimmed and range-checked in `validated`: `nan`, `inf` and 300s offsets become
+  0 or ±`MAX_LYRICS_OFFSET`. What can't be recovered — a duplicate key, an unclosed string,
+  `1e400` — falls back whole, with the line and column in the warning.
+  `lyrics.offset` shifts every lyric line
   against the record's timings (negative = early, positive = late); it is applied by
   shifting the clock handed to `active_index`/`next_boundary`, never the cached records.
-  `lyrics.ai-translation` is the one switch: `false` (the default) is the free translator,
-  so nothing is ever billed or sent to an API unasked, and an unconfigured install behaves
-  exactly as it did before that backend existed. `lyrics.ai-model` and `lyrics.ai-key-env`
-  default to something usable (`"claude-haiku-4-5"`, `"ANTHROPIC_API_KEY"`), so flipping the
-  flag is the only edit needed. The key variable is *named* rather than the key being stored,
-  so `config.toml` stays safe to copy around. `validated` turns the flag back off when the
-  model is blank or no key is found — a half-finished setup falls back to the free path
-  instead of failing on every song.
+  `lyrics.ai-translation` does not *switch* translators, it *offers* one: `i` is the free
+  endpoint whatever the flag says, and `true` adds `I` alongside it. So nothing is billed or
+  sent to an API without a deliberate keypress, and the default install behaves exactly as it
+  did before that backend existed. `lyrics.ai-model` and `lyrics.ai-key-env` default to
+  something usable (`"claude-haiku-4-5"`, `"ANTHROPIC_API_KEY"`), so flipping the flag is the
+  only edit needed. The key variable is *named* rather than the key being stored, so
+  `config.toml` stays safe to copy around. That name is also the whole provider switch:
+  `Provider::for_key_env` reads `DEEPSEEK_API_KEY` as DeepSeek and anything else as
+  Anthropic, since a key belongs to one API and there is nothing else to configure. A model
+  from the *other* family — `claude-haiku-4-5` still sitting there after the key line was
+  swapped — is replaced by that provider's default rather than sent somewhere it would 404;
+  a name neither family claims (a snapshot id, a gateway's own naming) is left alone.
+  `ai_available` is the runtime test — flag on,
+  model named, key found — and gates whether `I` does anything or explains itself; `validated`
+  turns the flag back off when the model is blank or no key is found.
   `lyrics.translate-to` is the language `i` translates into (`"zh"`, `"fr"`, …); it is
   checked against the endpoint's own list at startup and cleared if unknown, because an
   unknown code is answered with the input unchanged rather than an error. Empty (the
@@ -179,15 +212,20 @@ tui/        the ratatui frontend — single `ytm` binary
     showing) and `AUTO` (the record automatic matching resolved to). The record on screen
     is guaranteed a row, since it is often the `/get` hit the search ladder never sees.
   - **Translation**: `i` weaves a translation in under each lyric, in the language
-    `lyrics.translate-to` names. Translated rows are Magenta and italic and carry the same
+    `lyrics.translate-to` names, from the free endpoint. `I` does the same through the AI model,
+    and appears in the hint bar only where `ai_available()` — so the paid path is never a
+    keypress away by accident. They are one `TranslateMode` between them: each key turns its
+    own translator off again and switching is one press, with the badge marking `ai` when
+    that is what is showing. Translated rows are Magenta and italic and carry the same
     `lyric` index as their original (`lyric_rows`), so a pair highlights, wraps and centres
     as the one line it is; the active line's own highlight deliberately stays on the words
     alone. A line whose translation is blank, or identical to the original, gets no row at
-    all. Cached per **lrclib record id**, not per video — a translation belongs to the
-    words, so `c` gets one of its own and two tracks on the same record share one. The
-    cache holds `MAX_TRANSLATIONS` records for the session, oldest evicted first, so
-    skipping back to a song doesn't pay for it twice. `i` twice is the retry after a
-    failure.
+    all. Cached per **lrclib record id and translator**, not per video — a translation
+    belongs to the words, so `c` gets one of its own and two tracks on the same record share
+    one. `MAX_TRANSLATIONS` of them for the session, so replaying a song costs nothing
+    either way; only the AI ones outlive it, in `translations.json`. Pressing the same key
+    twice is the retry after a failure; `r` throws the translation on screen away — memory
+    and disk both — and fetches another, whichever translator made it.
   - **Wrapping** (`wrap_n_lines`) measures display *cells*, not `char`s: a CJK lyric is two
     cells per character and would otherwise run to twice the panel width and be clipped.
 
@@ -217,8 +255,9 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `o` | Toggle queue / songs view |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |
-| `i` | (in lyrics mode) Toggle the translation under each line |
-| `r` | (in lyrics mode) Retry a failed lyrics fetch |
+| `i` | (in lyrics mode) Toggle the translation under each line, from the free endpoint |
+| `I` | (in lyrics mode) The same, translated by the AI model instead — only where `lyrics.ai-translation` set it up |
+| `r` | (in lyrics mode) Redo the translation on screen, or retry a failed lyrics fetch when there are no words yet |
 | `?` | Full keymap overlay (any key closes it) |
 | `q` / `Ctrl+C` | Quit |
 
@@ -272,7 +311,20 @@ runtime. See `ytm-core/src/translate.rs` for what it gets wrong and how that is 
 
 The AI path in `translate/llm.rs` calls the Anthropic Messages API over the workspace's own
 `reqwest` — no SDK, since there is no official Rust one, and no new HTTP stack. `cargo tree -i
-aws-lc-sys` still reports *not found*.
+aws-lc-sys` still reports *not found*. DeepSeek serves the same request shape at its own host,
+so `Provider` carries the four things that differ: the URL, `Authorization: Bearer` against
+Anthropic's `x-api-key`, the `max_tokens` ceiling (8192 there, 32000 here), and whether
+`output_config` can constrain the reply. It can't on DeepSeek, so the schema goes in the
+prompt and `json_object` digs the JSON out of any fence or preamble around it — the two
+alignment checks are what make that safe, since a reply that arrives mangled is rejected and
+the free path answers instead. Measured at 0.04¢ a song on `deepseek-chat`.
+
+Every request sends `thinking: {"type": "disabled"}`, which both providers accept. It is not
+an optimisation: `deepseek-v4-flash` thinks by default, thinking is charged against
+`max_tokens`, and it spent all 8192 of them reasoning — no text block at all, `stop_reason:
+max_tokens`, 80 seconds to fail, then a silent fall through to the free path. Disabled, the
+same request is 3.7s and 541 tokens. Nothing on this path needs deliberation; alignment is a
+rule, not a judgement.
 
 Key deps: `ratatui 0.30`, `ytmusicapi 0.4.2`, `libmpv2 6`, `reqwest 0.12`, `thiserror 1`,
 `mpris-server 0.10` (Linux only),

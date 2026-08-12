@@ -31,16 +31,25 @@ pub const TEMPLATE: &str = "\
 # Press `i` in the lyrics panel to turn it on and off. Empty means the key
 # does nothing, which is the default — translation is never fetched unasked.
 #translate-to = \"\"
-# Translate with Claude instead of the free endpoint. The whole song goes in
-# one request, so a sentence spanning several lyric lines is read as a sentence
-# — the free endpoint splits on newlines and cannot. Costs roughly a cent per
-# song, charged to your own API key. false (the default) is the free translator,
-# which costs nothing and sends nothing to any API.
+
+# Offer an AI model as a second translator, on `I` (shift-i). `i` stays the free
+# one whatever this is set to. The whole song goes in one request, so a sentence
+# spanning several lyric lines is read as a sentence — the free endpoint splits
+# on newlines and cannot. Costs under a cent per song, charged to your own API
+# key; nothing is sent to any API until you press `I`.
 #ai-translation = false
 # Which model, when the above is on.
 #ai-model = \"claude-haiku-4-5\"
-# Environment variable holding the Anthropic API key. The key itself is never
-# read from this file, so config.toml stays safe to copy around.
+# Environment variable holding the API key. The key itself is never read from
+# this file, so config.toml stays safe to copy around.
+#
+# Its name also picks the provider: name a DeepSeek variable and requests go to
+# DeepSeek's Anthropic-compatible endpoint instead. Two lines is the whole
+# switch —
+#   ai-model = \"deepseek-chat\"
+#   ai-key-env = \"DEEPSEEK_API_KEY\"
+# and changing only the key line is enough: a Claude model left behind a
+# DeepSeek key becomes that provider's default.
 #ai-key-env = \"ANTHROPIC_API_KEY\"
 
 [auth]
@@ -63,25 +72,43 @@ pub(crate) const LEGACY_STUB: &str = "# yt-music-tui configuration\n";
 fn seconds<'de, D: Deserializer<'de>>(de: D) -> std::result::Result<f64, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Seconds {
+    enum Either {
         Float(f64),
         Int(i64),
     }
-    Ok(match Seconds::deserialize(de)? {
-        Seconds::Float(f) => f,
-        Seconds::Int(i) => i as f64,
+    Ok(match Either::deserialize(de)? {
+        Either::Float(f) => f,
+        Either::Int(i) => i as f64,
     })
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+/// `offset`, as a type [`field`] can read.
+#[derive(Deserialize)]
+struct Seconds(#[serde(deserialize_with = "seconds")] pub f64);
+
+/// Every section and key this file understands, so a misspelling can be
+/// pointed out instead of silently doing nothing.
+const KNOWN: &[(&str, &[&str])] = &[
+    (
+        "lyrics",
+        &[
+            "offset",
+            "translate-to",
+            "ai-translation",
+            "ai-model",
+            "ai-key-env",
+        ],
+    ),
+    ("auth", &["auto-reauth", "cookie-browser"]),
+];
+
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub lyrics: Lyrics,
     pub auth: Auth,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone)]
 pub struct Auth {
     /// Renew an expired session with yt-dlp instead of asking. Only ever does
     /// anything once [`Auth::cookie_browser`] is known, which is why it can
@@ -103,11 +130,9 @@ impl Default for Auth {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone)]
 pub struct Lyrics {
     /// Seconds to shift every lyric line by. Negative is early, positive late.
-    #[serde(deserialize_with = "seconds")]
     pub offset: f64,
     /// Language code to translate lyrics into — `"zh"`, `"fr"`, `"en"`. Empty
     /// disables translation entirely, which is the default: nothing is ever
@@ -123,12 +148,16 @@ pub struct Lyrics {
     /// Turned off again by [`Config::validated`] when no API key can be found,
     /// so a half-finished setup falls back rather than failing on every song.
     pub ai_translation: bool,
-    /// Claude model to translate with. Only consulted when
-    /// [`Self::ai_translation`] is on.
+    /// Model to translate with. Only consulted when [`Self::ai_translation`]
+    /// is on.
     pub ai_model: String,
-    /// Environment variable holding the Anthropic API key. Named here rather
-    /// than holding the key itself, so `config.toml` stays safe to share and
-    /// the secret lives wherever the user already keeps secrets.
+    /// Environment variable holding the API key. Named here rather than
+    /// holding the key itself, so `config.toml` stays safe to share and the
+    /// secret lives wherever the user already keeps secrets.
+    ///
+    /// Its *name* also picks the provider — `DEEPSEEK_API_KEY` goes to
+    /// DeepSeek's Anthropic-compatible endpoint. A key belongs to one API, so
+    /// there is nothing else to set.
     pub ai_key_env: String,
 }
 
@@ -159,24 +188,79 @@ impl Lyrics {
         std::env::var(name).ok().filter(|k| !k.trim().is_empty())
     }
 
-    /// The translator this configuration selects.
-    ///
-    /// AI only when a model is named *and* its key was found — the two are
-    /// checked together so a partial setup silently uses the free endpoint
-    /// instead of failing on every song.
+    /// Whether the AI backend is usable: asked for, a model named, and its key
+    /// found. `I` is offered only when this is true.
     #[must_use]
-    pub fn backend(&self) -> crate::translate::Backend {
+    pub fn ai_available(&self) -> bool {
+        self.ai_translation && !self.ai_model.is_empty() && self.ai_key().is_some()
+    }
+
+    /// Whose API the key is for, read off the variable's name.
+    #[must_use]
+    pub fn ai_provider(&self) -> crate::translate::Provider {
+        crate::translate::Provider::for_key_env(&self.ai_key_env)
+    }
+
+    /// The translator to use. `use_ai` is the user's choice — `i` against `I` —
+    /// and falls back to the free endpoint when the AI side isn't configured.
+    #[must_use]
+    pub fn backend(&self, use_ai: bool) -> crate::translate::Backend {
         crate::translate::Backend {
             to: self.translate_to.clone(),
             ai: self
                 .ai_key()
-                .filter(|_| self.ai_translation && !self.ai_model.is_empty())
+                .filter(|_| use_ai && self.ai_available())
                 .map(|api_key| crate::translate::Ai {
                     model: self.ai_model.clone(),
                     api_key,
+                    provider: self.ai_provider(),
                 }),
         }
     }
+}
+
+/// One setting, or its default with a word in the log about why.
+///
+/// `config.toml` is hand-edited, so `offset = "0.5"` and `ai-translation =
+/// "true"` are the kind of thing that turns up in it.
+fn field<T: serde::de::DeserializeOwned>(
+    section: Option<&toml::Table>,
+    key: &str,
+    default: T,
+) -> T {
+    let Some(value) = section.and_then(|s| s.get(key)) else {
+        return default;
+    };
+    T::deserialize(value.clone()).unwrap_or_else(|e| {
+        log::warn!("config: {key} = {value:?} won't do ({e}) — using the default");
+        default
+    })
+}
+
+/// Anything in the file this app doesn't read, named as the user wrote it.
+///
+/// Silence here would be worse than it sounds: `translate_to` for
+/// `translate-to` parses perfectly well and simply does nothing, leaving the
+/// user looking at a setting that appears not to work.
+fn unknown(table: &toml::Table) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, value) in table {
+        let Some((_, keys)) = KNOWN.iter().find(|(known, _)| known == name) else {
+            out.push(name.clone());
+            continue;
+        };
+        let Some(section) = value.as_table() else {
+            out.push(name.clone());
+            continue;
+        };
+        out.extend(
+            section
+                .keys()
+                .filter(|key| !keys.contains(&key.as_str()))
+                .map(|key| format!("{name}.{key}")),
+        );
+    }
+    out
 }
 
 impl Config {
@@ -195,8 +279,16 @@ impl Config {
             }
         };
 
-        match toml::from_str::<Self>(&raw) {
-            Ok(config) => config.validated(),
+        // Only a syntax error costs the whole file; a value that is the wrong
+        // *type* costs its own key and nothing else, so a stray quote around a
+        // number can't take the browser setting down with it.
+        match raw.parse::<toml::Table>() {
+            Ok(table) => {
+                for name in unknown(&table) {
+                    log::warn!("config: {name} is not a setting this app reads — ignoring it");
+                }
+                Self::from_table(&table).validated()
+            }
             Err(e) => {
                 log::warn!(
                     "config: {} is not valid TOML ({e}) — using defaults",
@@ -204,6 +296,27 @@ impl Config {
                 );
                 Self::default()
             }
+        }
+    }
+
+    /// Reads each setting on its own, so one unusable value doesn't discard the
+    /// rest of the file.
+    fn from_table(table: &toml::Table) -> Self {
+        let lyrics = table.get("lyrics").and_then(toml::Value::as_table);
+        let auth = table.get("auth").and_then(toml::Value::as_table);
+        let d = Self::default();
+        Self {
+            lyrics: Lyrics {
+                offset: field(lyrics, "offset", Seconds(d.lyrics.offset)).0,
+                translate_to: field(lyrics, "translate-to", d.lyrics.translate_to),
+                ai_translation: field(lyrics, "ai-translation", d.lyrics.ai_translation),
+                ai_model: field(lyrics, "ai-model", d.lyrics.ai_model),
+                ai_key_env: field(lyrics, "ai-key-env", d.lyrics.ai_key_env),
+            },
+            auth: Auth {
+                auto_reauth: field(auth, "auto-reauth", d.auth.auto_reauth),
+                cookie_browser: field(auth, "cookie-browser", d.auth.cookie_browser),
+            },
         }
     }
 
@@ -248,13 +361,35 @@ impl Config {
         // failing, so it is turned off here instead — the free endpoint still
         // works, and the log says why the better one isn't being used.
         self.lyrics.ai_model = self.lyrics.ai_model.trim().to_string();
+        self.lyrics.ai_key_env = self.lyrics.ai_key_env.trim().to_string();
+
+        // The key's variable names the provider, so a model from the *other*
+        // provider can only be left over from before the key was changed — and
+        // sending it would 404 on every song. Substituting the provider's own
+        // default is what the user meant by swapping the key; a name neither
+        // family claims is left alone, since it may well be a snapshot id.
+        let provider = self.lyrics.ai_provider();
+        if let Some(named) = crate::translate::Provider::of_model(&self.lyrics.ai_model)
+            && named != provider
+        {
+            log::warn!(
+                "config: lyrics.ai-model {:?} is not a {} model, and ${} is — using {:?}",
+                self.lyrics.ai_model,
+                provider.label(),
+                self.lyrics.ai_key_env,
+                provider.default_model()
+            );
+            self.lyrics.ai_model = provider.default_model().to_string();
+        }
+
         if self.lyrics.ai_translation {
             if self.lyrics.ai_model.is_empty() {
                 log::warn!("config: lyrics.ai-translation is on but ai-model is empty — off");
                 self.lyrics.ai_translation = false;
             } else if self.lyrics.ai_key().is_some() {
                 log::info!(
-                    "config: lyrics.ai-translation on, {:?} (key from ${})",
+                    "config: lyrics.ai-translation on, {} {:?} (key from ${})",
+                    provider.label(),
                     self.lyrics.ai_model,
                     self.lyrics.ai_key_env
                 );
@@ -349,10 +484,11 @@ impl Lyrics {
 mod tests {
     use super::*;
 
+    /// The shipping path, minus the file read: parse, warn, read each key,
+    /// validate.
     fn parse(src: &str) -> Config {
-        toml::from_str::<Config>(src)
-            .expect("valid toml")
-            .validated()
+        let table = src.parse::<toml::Table>().expect("valid toml");
+        Config::from_table(&table).validated()
     }
 
     // ── ai translation ────────────────────────────────────────────────────
@@ -382,14 +518,14 @@ mod tests {
         // looked for, so a key lying around in the shell can't switch backends.
         let lyrics =
             parse("[lyrics]\nai-translation = false\nai-model = \"claude-opus-5\"\n").lyrics;
-        assert!(lyrics.backend().ai.is_none());
+        assert!(lyrics.backend(true).ai.is_none());
     }
 
     #[test]
     fn an_empty_model_turns_the_flag_back_off() {
         let lyrics = parse("[lyrics]\nai-translation = true\nai-model = \"\"\n").lyrics;
         assert!(!lyrics.ai_translation);
-        assert!(lyrics.backend().ai.is_none());
+        assert!(lyrics.backend(true).ai.is_none());
     }
 
     #[test]
@@ -397,7 +533,48 @@ mod tests {
         let lyrics =
             parse("[lyrics]\nai-translation = true\nai-key-env = \"YTM_NO_SUCH_VAR_XYZ\"\n").lyrics;
         assert!(lyrics.ai_key().is_none());
-        assert!(lyrics.backend().ai.is_none());
+        assert!(lyrics.backend(true).ai.is_none());
+    }
+
+    // ── providers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_key_variable_is_the_whole_provider_switch() {
+        let lyrics = parse(
+            "[lyrics]\nai-translation = true\nai-model = \"deepseek-chat\"\n\
+             ai-key-env = \"DEEPSEEK_API_KEY\"\n",
+        )
+        .lyrics;
+        assert_eq!(lyrics.ai_provider(), crate::translate::Provider::DeepSeek);
+        assert_eq!(lyrics.ai_model, "deepseek-chat");
+        // Untouched, so the default install still goes to Anthropic.
+        assert_eq!(
+            parse("").lyrics.ai_provider(),
+            crate::translate::Provider::Anthropic
+        );
+    }
+
+    #[test]
+    fn changing_only_the_key_leaves_no_model_from_the_wrong_provider() {
+        // What the user actually does: swap the variable name and leave the
+        // model line alone. Sending `claude-haiku-4-5` to DeepSeek would fail
+        // on every song.
+        let lyrics = parse("[lyrics]\nai-key-env = \"DEEPSEEK_API_KEY\"\n").lyrics;
+        assert_eq!(lyrics.ai_model, "deepseek-chat");
+
+        // And back the other way.
+        let lyrics = parse("[lyrics]\nai-model = \"deepseek-chat\"\n").lyrics;
+        assert_eq!(lyrics.ai_model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn a_model_neither_family_claims_is_left_as_written() {
+        // A snapshot id or a gateway's own naming is the user's business.
+        let lyrics = parse(
+            "[lyrics]\nai-model = \"my-proxy/whatever\"\nai-key-env = \"DEEPSEEK_API_KEY\"\n",
+        )
+        .lyrics;
+        assert_eq!(lyrics.ai_model, "my-proxy/whatever");
     }
 
     #[test]
@@ -636,5 +813,107 @@ auto-reauth = true
             .as_deref(),
             Some("+1.2s")
         );
+    }
+
+    // ── a hand-edited file, edited by hand ────────────────────────────────
+
+    #[test]
+    fn a_value_of_the_wrong_type_costs_its_own_key_and_nothing_else() {
+        // The realistic slip is a stray quote round a number. Losing the whole
+        // file over it would take `cookie-browser` down too, and the next
+        // expiry would ask to set up again for no reason.
+        let c = parse(
+            "[lyrics]\noffset = \"0.5\"\ntranslate-to = \"zh\"\n\
+             [auth]\ncookie-browser = \"firefox\"\n",
+        );
+        assert_eq!(c.lyrics.offset, 0.0);
+        assert_eq!(c.lyrics.translate_to, "zh");
+        assert_eq!(c.auth.cookie_browser, "firefox");
+    }
+
+    #[test]
+    fn every_setting_falls_back_on_its_own() {
+        for src in [
+            "[lyrics]\noffset = true\n",
+            "[lyrics]\noffset = \"x\"\n",
+            "[lyrics]\ntranslate-to = 5\n",
+            "[lyrics]\ntranslate-to = [\"zh\"]\n",
+            "[lyrics]\nai-translation = \"true\"\n",
+            "[lyrics]\nai-model = 42\n",
+            "[lyrics]\nai-key-env = false\n",
+            "[auth]\nauto-reauth = \"no\"\n",
+            "[auth]\ncookie-browser = 5\n",
+        ] {
+            let c = parse(src);
+            let d = Config::default();
+            assert_eq!(c.lyrics.offset, d.lyrics.offset, "{src:?}");
+            assert_eq!(c.lyrics.translate_to, d.lyrics.translate_to, "{src:?}");
+            assert_eq!(c.lyrics.ai_translation, d.lyrics.ai_translation, "{src:?}");
+            assert_eq!(c.lyrics.ai_model, d.lyrics.ai_model, "{src:?}");
+            assert_eq!(c.lyrics.ai_key_env, d.lyrics.ai_key_env, "{src:?}");
+            assert_eq!(c.auth.auto_reauth, d.auth.auto_reauth, "{src:?}");
+            assert_eq!(c.auth.cookie_browser, d.auth.cookie_browser, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn a_misspelled_setting_is_named_rather_than_ignored_in_silence() {
+        // `translate_to` parses fine and does nothing whatsoever, which is the
+        // worst way for a setting to fail.
+        let table = "[lyrics]\ntranslate_to = \"zh\"\nofset = 1.0\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(unknown(&table), ["lyrics.ofset", "lyrics.translate_to"]);
+
+        let table = "[lyric]\ntranslate-to = \"zh\"\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(unknown(&table), ["lyric"]);
+
+        // A setting written outside any section is a section as far as TOML is
+        // concerned, and is just as invisible.
+        let table = "offset = 1.0\n".parse::<toml::Table>().unwrap();
+        assert_eq!(unknown(&table), ["offset"]);
+    }
+
+    #[test]
+    fn the_template_and_an_empty_file_raise_nothing() {
+        for src in [TEMPLATE, "", "   \n\t\n", "[lyrics]\n[auth]\n"] {
+            let table = src.parse::<toml::Table>().expect("valid toml");
+            assert!(unknown(&table).is_empty(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_at_all_is_left_to_the_caller() {
+        // Nothing per-key can be recovered from these — `load` falls back to
+        // defaults whole and says so with the line number.
+        for src in [
+            "this is not toml",
+            "[lyrics]\noffset = 1.0\noffset = 2.0\n",
+            "[lyrics]\n[lyrics]\n",
+            "[lyrics]\noffset = 1e400\n",
+        ] {
+            assert!(src.parse::<toml::Table>().is_err(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn a_bom_or_windows_line_endings_are_still_a_config_file() {
+        assert_eq!(parse("\u{feff}[lyrics]\noffset = 1.0\n").lyrics.offset, 1.0);
+        assert_eq!(parse("[lyrics]\r\noffset = 1.0\r\n").lyrics.offset, 1.0);
+    }
+
+    #[test]
+    fn whitespace_round_a_setting_is_not_the_setting() {
+        unsafe { std::env::set_var("YTM_SPACED_KEY", "sk-test") };
+        let c = parse(
+            "[lyrics]\nai-translation = true\nai-model = \"  claude-haiku-4-5  \"\n\
+             ai-key-env = \"  YTM_SPACED_KEY  \"\ntranslate-to = \"  ZH  \"\n",
+        );
+        assert_eq!(c.lyrics.ai_model, "claude-haiku-4-5");
+        assert_eq!(c.lyrics.ai_key_env, "YTM_SPACED_KEY");
+        assert_eq!(c.lyrics.translate_to, "zh");
+        assert!(c.lyrics.ai_available());
     }
 }

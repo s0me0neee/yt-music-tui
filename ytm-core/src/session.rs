@@ -54,6 +54,9 @@ pub fn settings_path() -> PathBuf {
 pub fn lyrics_path() -> PathBuf {
     app_config_dir().join("lyrics.json")
 }
+pub fn translations_path() -> PathBuf {
+    app_config_dir().join("translations.json")
+}
 pub fn config_toml_path() -> PathBuf {
     app_config_dir().join("config.toml")
 }

@@ -1,4 +1,6 @@
-//! Whole-song lyric translation via the Anthropic Messages API.
+//! Whole-song lyric translation via the Anthropic Messages API, or DeepSeek's
+//! compatible one — see [`Provider`], picked from the name of the environment
+//! variable the key comes out of.
 //!
 //! The free path reads its input line by line and so can never see a sentence
 //! spanning three lyric lines. A model given the whole song reads the enjambment
@@ -13,29 +15,111 @@
 //! Either failing rejects the whole reply, and [`super::translate_lines`] falls
 //! through to the free path.
 //!
+//! Neither check sees meaning move between lines, which is what happens when
+//! the model reads two stanzas as one passage — hence [`numbered`], which keeps
+//! the song's blank lines as separators.
+//!
 //! Cost: repeated lines are sent once, so a chorus is translated once however
-//! often it comes round. Measured over three runs of a 40-line Japanese song
-//! into Chinese, Haiku 4.5 came to 0.67¢ — see the `usage` line each request
-//! logs. `app.rs` keeps the result for the session, so a replay is free.
+//! often it comes round. Measured over three runs of a 39-line Japanese song
+//! into Chinese, Haiku 4.5 came to 0.59¢; `deepseek-chat` on a 44-line one came
+//! to 0.04¢ — see the `usage` line each request logs. `app.rs` keeps the
+//! result, for this session and the next.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
+
+/// Which API the key belongs to.
+///
+/// DeepSeek serves the Messages API shape at its own host, so the request built
+/// here is the same one either way — only the URL, the auth header, the output
+/// cap and whether the schema can be enforced differ.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Provider {
+    #[default]
+    Anthropic,
+    DeepSeek,
+}
+
+impl Provider {
+    /// The provider a key variable names — `DEEPSEEK_API_KEY` is DeepSeek's.
+    /// Anything else is Anthropic, which is what it was before this existed.
+    #[must_use]
+    pub fn for_key_env(name: &str) -> Self {
+        if name.to_ascii_uppercase().contains("DEEPSEEK") {
+            Self::DeepSeek
+        } else {
+            Self::Anthropic
+        }
+    }
+
+    /// The provider a model id belongs to, or `None` for a name neither
+    /// family claims — a snapshot id, a proxy's own naming.
+    #[must_use]
+    pub fn of_model(model: &str) -> Option<Self> {
+        let model = model.trim().to_ascii_lowercase();
+        if model.starts_with("deepseek") {
+            Some(Self::DeepSeek)
+        } else if model.starts_with("claude") {
+            Some(Self::Anthropic)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Self::Anthropic => "https://api.anthropic.com/v1/messages",
+            Self::DeepSeek => "https://api.deepseek.com/anthropic/v1/messages",
+        }
+    }
+
+    /// What `lyrics.ai-model` falls back to for this provider.
+    #[must_use]
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Anthropic => "claude-haiku-4-5",
+            Self::DeepSeek => "deepseek-chat",
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::DeepSeek => "DeepSeek",
+        }
+    }
+
+    /// Whether the reply's shape can be *constrained* rather than asked for.
+    /// Only Anthropic's endpoint takes `output_config`; DeepSeek's compatible
+    /// one doesn't, so there the schema goes in the prompt and [`json_object`]
+    /// digs the reply out of whatever wrapping came with it.
+    fn structured_output(self) -> bool {
+        self == Self::Anthropic
+    }
+
+    /// Ceiling on `max_tokens`. DeepSeek rejects a request asking for more
+    /// than its own limit, so the cap is the provider's, not ours.
+    fn token_ceiling(self) -> usize {
+        match self {
+            Self::Anthropic => 32000,
+            Self::DeepSeek => 8192,
+        }
+    }
+}
 
 /// Output cap per distinct line, with a floor and a ceiling. Measured at ~27
 /// tokens a line (the echo, the translation and the JSON around them); the rest
-/// is margin for longer scripts and for a model that thinks first. Headroom is
-/// free — this is a cap, not a reservation.
-/// The floor is what it is because `lyrics.ai-model` is whatever the user
-/// wrote: on a model that thinks by default, thinking comes out of the same
-/// budget, and a short song hitting the cap fails the whole request.
+/// is margin for longer scripts. Headroom is free — this is a cap, not a
+/// reservation — and hitting it fails the whole request, so the floor is
+/// generous.
 const TOKENS_PER_LINE: usize = 200;
 const MIN_TOKENS: usize = 8192;
-const MAX_TOKENS: usize = 32000;
 
 /// One request for a whole song, answered twice over.
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -61,14 +145,20 @@ is discarded whole:
   that was sent, so a `text` belonging to a different line is caught.
 
 Never merge two lines into one entry, and never split one line across two.
-Every line that carries words gets a translation; only a marker — `[Chorus]`,
-`(instrumental)`, a bare `♪` — gets an empty `text`.
+Only a marker — `[Chorus]`, `(instrumental)`, a bare `♪` — gets an empty
+`text`. A line with words in it always comes back with words in it.
 
 Lyric lines break on singing breath, not on grammar: one sentence often runs
-across two or three lines. Translate the sentence as a whole, then distribute
-its meaning across the same lines it occupied — each line carrying the part
-that belongs to it, so the lines read in order as the sentence does and each
-line's own words stay on that line.
+across two or three lines. Read the whole sentence for its sense, then put each
+line's own words on that line and nowhere else.
+
+Where {target} would order those words differently, keep them with their lines
+anyway. Two lines that read a little oddly one after the other are right; one
+line carrying the whole sentence while its neighbour carries nothing is wrong,
+and so is padding that neighbour with words the song never sang.
+
+A blank line in the list is a break in the song, not a line to translate. No
+sentence runs across one, and no line's meaning may move across one.
 
 Keep connectives and contrast markers. If a line ends in one — \"but\", \"though\",
 \"because\", \"and yet\" — that line's translation carries it too. Distributing a
@@ -77,6 +167,17 @@ sentence across lines must not drop the word that joins them.
 Translate the imagery, not the idiom. Keep the register of the original: if it
 is plain, stay plain. Do not add interpretation the source does not carry, and
 do not explain the metaphor.";
+
+/// Added to [`SYSTEM`] where the schema can't be enforced by the API, asking
+/// for what `output_config` would otherwise guarantee.
+const JSON_ONLY: &str = "
+
+Reply with JSON and nothing else — no prose around it, no markdown fence:
+
+{\"lines\":[{\"index\":0,\"source\":\"…\",\"text\":\"…\"}]}
+
+Every entry carries all three keys and no others, `index` a number rather than
+a string, `source` first so the line is copied before it is translated.";
 
 /// The song. The count sits next to the lines because that is where it has to
 /// hold: a model that can see how many it was handed drops far fewer of them.
@@ -93,6 +194,8 @@ const USER: &str = "\
 pub struct Ai {
     pub model: String,
     pub api_key: String,
+    /// Whose key it is — decided by what `lyrics.ai-key-env` names.
+    pub provider: Provider,
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -158,6 +261,38 @@ fn distinct(lines: &[String]) -> (Vec<&str>, HashMap<&str, usize>) {
     (order, seen)
 }
 
+/// The block of lines sent to the model: `index\ttext` per distinct line, with
+/// the song's blank lines kept as bare separators.
+///
+/// The separators are why this walks the original rather than `order`. Without
+/// them the model reads two stanzas as one passage and redistributes meaning
+/// across the join — "until dawn" landing on the line before the one that says
+/// it — which the alignment checks cannot see, because every index and echo is
+/// still correct.
+fn numbered(lines: &[String], seen: &HashMap<&str, usize>) -> String {
+    let mut out = String::new();
+    let mut written = vec![false; seen.len()];
+    let mut gap = false;
+    for line in lines {
+        let text = line.trim();
+        if text.is_empty() {
+            gap = true;
+            continue;
+        }
+        let Some(&i) = seen.get(text) else { continue };
+        if std::mem::replace(&mut written[i], true) {
+            continue;
+        }
+        if !out.is_empty() && gap {
+            out.push('\n');
+        }
+        out.push_str(&format!("{i}\t{text}\n"));
+        gap = false;
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
 /// Translates every line into `to`, one entry per input line.
 pub async fn translate(lines: &[String], to: &str, ai: &Ai) -> Result<Vec<String>, String> {
     let (order, seen) = distinct(lines);
@@ -165,33 +300,50 @@ pub async fn translate(lines: &[String], to: &str, ai: &Ai) -> Result<Vec<String
         return Ok(vec![String::new(); lines.len()]);
     }
 
-    let numbered = order
-        .iter()
-        .enumerate()
-        .map(|(n, line)| format!("{n}\t{line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let numbered = numbered(lines, &seen);
     // The name, not the code: asked for `zh`, Haiku answers in English.
     let target = super::language_name(to).unwrap_or(to);
-    let system = SYSTEM.replace("{target}", target);
+    let mut system = SYSTEM.replace("{target}", target);
     let user = USER
         .replace("{count}", &order.len().to_string())
         .replace("{last}", &(order.len() - 1).to_string())
         .replace("{numbered}", &numbered);
 
-    let max_tokens = (order.len() * TOKENS_PER_LINE).clamp(MIN_TOKENS, MAX_TOKENS);
+    let max_tokens = (order.len() * TOKENS_PER_LINE).clamp(MIN_TOKENS, ai.provider.token_ceiling());
 
-    let response = client()?
-        .post(ENDPOINT)
-        .header("x-api-key", &ai.api_key)
+    // Thinking is off because on a model that does it by default it comes out
+    // of `max_tokens` — `deepseek-v4-flash` spent all 8192 of them reasoning,
+    // emitted no text block at all, and took 80s to fail. Off: 3.7s, 541
+    // tokens. Nothing here needs deliberation; alignment is a rule, not a
+    // judgement. Both providers accept the field.
+    let mut body = json!({
+        "model": ai.model,
+        "max_tokens": max_tokens,
+        "thinking": { "type": "disabled" },
+        "messages": [{ "role": "user", "content": user }],
+    });
+    if ai.provider.structured_output() {
+        body["output_config"] = json!({ "format": { "type": "json_schema", "schema": schema() } });
+    } else {
+        system.push_str(JSON_ONLY);
+    }
+    body["system"] = json!(system);
+
+    // DeepSeek's compatible endpoint takes the bearer form; Anthropic's takes
+    // its own header and rejects a request carrying both.
+    let request = match ai.provider {
+        Provider::Anthropic => client()?
+            .post(ai.provider.endpoint())
+            .header("x-api-key", &ai.api_key),
+        Provider::DeepSeek => client()?
+            .post(ai.provider.endpoint())
+            .bearer_auth(&ai.api_key),
+    };
+
+    let started = std::time::Instant::now();
+    let response = request
         .header("anthropic-version", API_VERSION)
-        .json(&json!({
-            "model": ai.model,
-            "max_tokens": max_tokens,
-            "system": system,
-            "output_config": { "format": { "type": "json_schema", "schema": schema() } },
-            "messages": [{ "role": "user", "content": user }],
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -206,10 +358,16 @@ pub async fn translate(lines: &[String], to: &str, ai: &Ai) -> Result<Vec<String
     }
 
     let reply: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    log_usage(&reply, ai, lines.len(), order.len());
+    log_usage(&reply, ai, lines.len(), order.len(), started.elapsed());
     match reply.get("stop_reason").and_then(Value::as_str) {
         Some("refusal") => return Err("the model declined this request".to_string()),
-        Some("max_tokens") => return Err("reply was truncated".to_string()),
+        // Naming the cap matters: the usual cause is a model that thinks out of
+        // the same budget, and the number is the thing to change.
+        Some("max_tokens") => {
+            return Err(format!(
+                "reply hit the {max_tokens}-token cap and was truncated"
+            ));
+        }
         _ => {}
     }
 
@@ -225,7 +383,7 @@ pub async fn translate(lines: &[String], to: &str, ai: &Ai) -> Result<Vec<String
         .and_then(Value::as_str)
         .ok_or("no text block in the reply")?;
 
-    let done = place(text, &order)?;
+    let done = place(json_object(text), &order)?;
     Ok(lines
         .iter()
         .map(|line| {
@@ -236,8 +394,9 @@ pub async fn translate(lines: &[String], to: &str, ai: &Ai) -> Result<Vec<String
         .collect())
 }
 
-/// What the request cost, so `app.log` can answer it without guesswork.
-fn log_usage(reply: &Value, ai: &Ai, lines: usize, distinct: usize) {
+/// What the request cost and how long it took, so `app.log` can answer both
+/// without guesswork.
+fn log_usage(reply: &Value, ai: &Ai, lines: usize, distinct: usize, took: Duration) {
     let count = |field: &str| {
         reply
             .get("usage")
@@ -246,10 +405,11 @@ fn log_usage(reply: &Value, ai: &Ai, lines: usize, distinct: usize) {
             .unwrap_or(0)
     };
     log::debug!(
-        "translate: {} used {} in / {} out for {distinct} of {lines} lines",
+        "translate: {} used {} in / {} out for {distinct} of {lines} lines in {:.1}s",
         ai.model,
         count("input_tokens"),
         count("output_tokens"),
+        took.as_secs_f64(),
     );
 }
 
@@ -260,6 +420,15 @@ fn api_error(body: &str) -> String {
         .ok()
         .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_string))
         .unwrap_or_else(|| body.chars().take(200).collect())
+}
+
+/// The JSON object inside a reply, dropping a markdown fence or a sentence of
+/// preamble around it. A no-op where the shape was constrained by the API.
+fn json_object(text: &str) -> &str {
+    match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if start < end => &text[start..=end],
+        _ => text,
+    }
 }
 
 /// Whether the model's echo is the line it was handed.
@@ -342,16 +511,40 @@ fn place(text: &str, order: &[&str]) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
+    fn song(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn blanks_and_repeats_are_never_sent() {
-        let lines: Vec<String> = ["one", "", "two", "  one  ", "two"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let lines = song(&["one", "", "two", "  one  ", "two"]);
         let (order, seen) = distinct(&lines);
         assert_eq!(order, ["one", "two"]);
         assert_eq!(seen["one"], 0);
         assert_eq!(seen["two"], 1);
+    }
+
+    #[test]
+    fn a_stanza_break_survives_as_a_blank_line() {
+        // The break is the whole point: without it the model reads both
+        // stanzas as one passage and moves meaning across the join.
+        let lines = song(&["one", "two", "", "three"]);
+        let (_, seen) = distinct(&lines);
+        assert_eq!(numbered(&lines, &seen), "0\tone\n1\ttwo\n\n2\tthree");
+    }
+
+    #[test]
+    fn a_repeat_is_dropped_but_the_break_around_it_is_not() {
+        let lines = song(&["one", "", "one", "", "two"]);
+        let (_, seen) = distinct(&lines);
+        assert_eq!(numbered(&lines, &seen), "0\tone\n\n1\ttwo");
+    }
+
+    #[test]
+    fn leading_and_trailing_blanks_add_nothing() {
+        let lines = song(&["", "  ", "one", "two", "", ""]);
+        let (_, seen) = distinct(&lines);
+        assert_eq!(numbered(&lines, &seen), "0\tone\n1\ttwo");
     }
 
     #[test]
@@ -429,18 +622,25 @@ mod tests {
         assert_eq!(out, ["", "一"]);
     }
 
-    /// Hits the real API. Needs a key:
+    /// Hits the real API. Needs a key — either provider's:
     /// `ANTHROPIC_API_KEY=… cargo test -p ytm-core llm -- --ignored`
     #[tokio::test]
     #[ignore = "network + api key"]
     async fn live_a_split_sentence_is_read_as_one() {
-        let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") else {
-            eprintln!("no ANTHROPIC_API_KEY — skipping");
+        let found = ["ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"]
+            .into_iter()
+            .find_map(|name| {
+                let key = std::env::var(name).ok().filter(|k| !k.trim().is_empty())?;
+                Some((Provider::for_key_env(name), key))
+            });
+        let Some((provider, api_key)) = found else {
+            eprintln!("no ANTHROPIC_API_KEY or DEEPSEEK_API_KEY — skipping");
             return;
         };
         let ai = Ai {
-            model: "claude-haiku-4-5".to_string(),
+            model: provider.default_model().to_string(),
             api_key,
+            provider,
         };
         // Lines 0+1 are one sentence; line 3 stands alone. The free endpoint
         // reads line 0 as a bare noun phrase — this path must not. The repeat
@@ -469,6 +669,57 @@ mod tests {
             assert!(!out[i].is_empty(), "line {i} came back empty");
         }
         assert_eq!(out[0], out[5], "the repeat differs from the original");
+    }
+
+    #[test]
+    fn the_key_variable_picks_the_provider() {
+        assert_eq!(
+            Provider::for_key_env("DEEPSEEK_API_KEY"),
+            Provider::DeepSeek
+        );
+        assert_eq!(Provider::for_key_env("my_deepseek_key"), Provider::DeepSeek);
+        // Anything else is what it always was.
+        assert_eq!(
+            Provider::for_key_env("ANTHROPIC_API_KEY"),
+            Provider::Anthropic
+        );
+        assert_eq!(Provider::for_key_env("WORK_KEY"), Provider::Anthropic);
+        assert_eq!(Provider::for_key_env(""), Provider::Anthropic);
+    }
+
+    #[test]
+    fn a_model_is_claimed_only_by_the_family_that_names_it() {
+        assert_eq!(
+            Provider::of_model("deepseek-chat"),
+            Some(Provider::DeepSeek)
+        );
+        assert_eq!(
+            Provider::of_model("claude-haiku-4-5"),
+            Some(Provider::Anthropic)
+        );
+        // Not ours to reassign — a gateway's own naming, or a snapshot id.
+        assert_eq!(Provider::of_model("gpt-4o"), None);
+        assert_eq!(Provider::of_model(""), None);
+    }
+
+    #[test]
+    fn a_fenced_reply_is_still_a_reply() {
+        // DeepSeek's endpoint takes no schema, so the JSON arrives however the
+        // model felt like wrapping it.
+        let fenced = "```json\n{\"lines\":[{\"index\":0,\"source\":\"one\",\"text\":\"一\"}]}\n```";
+        assert_eq!(
+            place(json_object(fenced), &["one"]).expect("placed"),
+            ["一"]
+        );
+
+        let chatty = "Here you go:\n{\"lines\":[{\"index\":0,\"source\":\"one\",\"text\":\"一\"}]}";
+        assert_eq!(
+            place(json_object(chatty), &["one"]).expect("placed"),
+            ["一"]
+        );
+
+        // Nothing object-shaped in it — left alone for `place` to reject.
+        assert_eq!(json_object("sorry, I can't"), "sorry, I can't");
     }
 
     #[test]

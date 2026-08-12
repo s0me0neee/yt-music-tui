@@ -463,6 +463,15 @@ struct LyricRow {
 /// the AI backend charges for every one that has to be fetched again.
 const MAX_TRANSLATIONS: usize = 64;
 
+/// Which translator the lyrics panel is showing. `i` picks [`Self::Free`] and
+/// `I` picks [`Self::Ai`]; each key turns its own off again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranslateMode {
+    Off,
+    Free,
+    Ai,
+}
+
 /// Per-record translation state, keyed by lrclib id in [`App::translations`].
 /// Terminal like [`LyricsEntry`]: toggling `i` off and on again re-reads the
 /// cache rather than the network.
@@ -679,18 +688,21 @@ pub struct App {
     /// duration, so the wait can't become a permanent block if it never does.
     lyrics_duration_wait: Option<(String, Instant)>,
     // translation
-    /// Toggled by `i`. A mode rather than a per-song setting, like lyrics
+    /// Set by `i` / `I`. A mode rather than a per-song setting, like lyrics
     /// themselves: turn it on once and it follows you through the queue.
-    translate_on: bool,
+    translate_mode: TranslateMode,
     translate_tx: std::sync::mpsc::Sender<TranslateMsg>,
     translate_rx: std::sync::mpsc::Receiver<TranslateMsg>,
     /// Translations by lrclib record id — by *record* rather than by video, so
     /// picking a different one with `c` gets a translation of its own and two
     /// tracks on the same record share one.
-    translations: std::collections::HashMap<u64, TranslationEntry>,
+    translations: std::collections::HashMap<(u64, bool), TranslationEntry>,
     /// Insertion order for [`Self::translations`], oldest first, so the map can
     /// be bounded without holding a whole session's songs.
-    translation_order: Vec<u64>,
+    translation_order: Vec<(u64, bool)>,
+    /// The same thing on disk, so a song is translated once rather than once a
+    /// session. `r` drops a record from it to get a fresh translation.
+    saved_translations: persistence::Translations,
     /// User settings from `config.toml`, read once at startup.
     config: ytm_core::Config,
     /// MPRIS: the media keys and the desktop's player list. `None` when there
@@ -752,11 +764,12 @@ impl App {
             lyrics_picker: None,
             lyrics_overrides: persistence::load_lyrics_overrides(),
             lyrics_duration_wait: None,
-            translate_on: false,
+            translate_mode: TranslateMode::Off,
             translate_tx,
             translate_rx,
             translations: std::collections::HashMap::new(),
             translation_order: Vec::new(),
+            saved_translations: persistence::load_translations(),
             config,
             lyrics_dirty: false,
             media,
@@ -954,7 +967,15 @@ impl App {
 
     /// Drops the cached entry so the next tick re-fetches — the escape hatch
     /// from a sticky `Failed`/`Missing`.
+    /// `r` in lyrics mode. Retries whichever half is on screen: with a
+    /// translation showing, that is the translation — it is the part that cost
+    /// something and the part a user re-reads and dislikes. With no words at
+    /// all, it is the lyrics fetch that failed.
     fn retry_lyrics(&mut self) {
+        if self.translate_mode != TranslateMode::Off && self.current_lyrics().is_some() {
+            self.retranslate();
+            return;
+        }
         if let Some(id) = self.current_video_id() {
             self.lyrics_cache.remove(&id);
             // The words may come back from a different record, and last
@@ -966,41 +987,75 @@ impl App {
 
     // ── translation ───────────────────────────────────────────────────────────
 
-    /// `i`. Off when `config.toml` names no language, since there is nothing to
-    /// translate into and silently doing nothing would look like a broken key.
+    /// `i` — the free translator, which is what translation means unless the
+    /// user asks otherwise.
     fn toggle_translation(&mut self) {
+        self.select_translator(TranslateMode::Free);
+    }
+
+    /// `I` — the AI model instead, offered only when `config.toml` set it up. There
+    /// is nothing to enable at runtime, so say where the switch is.
+    fn toggle_ai_translation(&mut self) {
+        if !self.config.lyrics.ai_available() {
+            self.notify("Set lyrics.ai-translation = true in config.toml for this");
+            return;
+        }
+        self.select_translator(TranslateMode::Ai);
+    }
+
+    /// Turns `want` on, or off again when it is already what is showing.
+    fn select_translator(&mut self, want: TranslateMode) {
         if self.config.lyrics.translate_to.is_empty() {
             self.notify("Set lyrics.translate-to in config.toml (e.g. \"zh\")");
             return;
         }
-        self.translate_on = !self.translate_on;
+        self.translate_mode = if self.translate_mode == want {
+            TranslateMode::Off
+        } else {
+            want
+        };
         // Only the wrapped rows change: keep the scroll position and whether
         // the panel is following, so the view doesn't jump under the user.
         self.lyrics_rows = None;
-        if !self.translate_on {
+        if self.translate_mode == TranslateMode::Off {
             self.notify("Translation off");
             return;
         }
-        // Turning it back on is also the retry: a failure is otherwise sticky
-        // for the rest of the session, and the usual cause is a network that
-        // has since come back.
-        if let Some(id) = self.current_lyrics().map(|l| l.id)
-            && matches!(self.translations.get(&id), Some(TranslationEntry::Failed))
+        // Pressing the key again is also the retry, since a failure is
+        // otherwise sticky for the rest of the session.
+        if let Some(key) = self.current_translation_key()
+            && matches!(self.translations.get(&key), Some(TranslationEntry::Failed))
         {
-            self.translations.remove(&id);
+            self.translations.remove(&key);
         }
         self.notify(format!(
-            "Translating to {}",
-            self.config.lyrics.translate_to
+            "Translating to {} with {}",
+            self.config.lyrics.translate_to,
+            self.translator_name()
         ));
         self.ensure_translation();
+    }
+
+    /// What the badge and the toasts call the translator in use.
+    fn translator_name(&self) -> String {
+        if self.translate_mode == TranslateMode::Ai {
+            self.config.lyrics.ai_model.clone()
+        } else {
+            "the free endpoint".to_string()
+        }
+    }
+
+    /// Cache key for the record on screen under the current translator.
+    fn current_translation_key(&self) -> Option<(u64, bool)> {
+        let id = self.current_lyrics().map(|l| l.id)?;
+        Some((id, self.translate_mode == TranslateMode::Ai))
     }
 
     /// Starts a translation for whatever record is on screen, unless one is
     /// cached or already in flight — the same one-shot shape as
     /// [`Self::ensure_lyrics`], and what makes `i` free to press twice.
     fn ensure_translation(&mut self) {
-        if !self.translate_on || self.config.lyrics.translate_to.is_empty() {
+        if self.translate_mode == TranslateMode::Off || self.config.lyrics.translate_to.is_empty() {
             return;
         }
         let Some(found) = self.current_lyrics() else {
@@ -1018,20 +1073,32 @@ impl App {
             return;
         }
 
-        if self.translations.contains_key(&record_id) {
+        let ai = self.translate_mode == TranslateMode::Ai;
+        let key = (record_id, ai);
+        if self.translations.contains_key(&key) {
             return;
         }
-        // Held for the session, oldest evicted first: skipping back and forth
-        // then costs one translation a song rather than one a play, which on
-        // the AI backend is real money — see `translate/llm.rs`.
-        self.translation_order.retain(|&id| id != record_id);
+        // Held for the session, oldest evicted first, so skipping back and
+        // forth costs one translation a song rather than one a play.
+        self.translation_order.retain(|&k| k != key);
         while self.translation_order.len() >= MAX_TRANSLATIONS {
             let oldest = self.translation_order.remove(0);
             self.translations.remove(&oldest);
         }
-        self.translation_order.push(record_id);
+        self.translation_order.push(key);
 
-        let backend = self.config.lyrics.backend();
+        let backend = self.config.lyrics.backend(ai);
+        // Only `I` has anything on disk to find: the free endpoint is re-asked
+        // each session, so its translation can improve rather than being kept
+        // for ever.
+        if ai && let Some(done) = self.saved_translations.get(record_id, &backend.to) {
+            log::debug!("translate: lrclib #{record_id} came from translations.json");
+            self.translations
+                .insert(key, TranslationEntry::Ready(done.to_vec()));
+            self.lyrics_rows = None;
+            return;
+        }
+
         log::info!(
             "translate: {} lines of lrclib #{record_id} into {} via {}",
             lines.len(),
@@ -1041,8 +1108,7 @@ impl App {
                 .as_ref()
                 .map_or("the free endpoint", |a| &a.model)
         );
-        self.translations
-            .insert(record_id, TranslationEntry::Loading);
+        self.translations.insert(key, TranslationEntry::Loading);
         ytm_core::translate::spawn_translate(
             &self.lyrics_handle,
             record_id,
@@ -1052,15 +1118,64 @@ impl App {
         );
     }
 
+    /// `r` in lyrics mode with a translation on screen: forget it, on disk as
+    /// well as in memory, and fetch another.
+    fn retranslate(&mut self) {
+        let Some(key) = self.current_translation_key() else {
+            return;
+        };
+        // One in flight is enough: dropping it here would leave the first
+        // request running and pay for a second answer to overwrite it.
+        if matches!(self.translations.get(&key), Some(TranslationEntry::Loading)) {
+            self.notify("Already translating…");
+            return;
+        }
+        let (record_id, _) = key;
+        self.translations.remove(&key);
+        self.translation_order.retain(|&k| k != key);
+        // Nothing on disk for the free translator, so this is a no-op there.
+        if self.saved_translations.remove(record_id) {
+            self.save_translations();
+        }
+        self.lyrics_rows = None;
+        self.notify(format!("Re-translating with {}", self.translator_name()));
+        self.ensure_translation();
+    }
+
+    /// Writes `translations.json`. A failure costs the next session a
+    /// re-translation, which is not worth interrupting playback over.
+    fn save_translations(&self) {
+        if let Err(e) = persistence::save_translations(&self.saved_translations) {
+            log::warn!("translate: couldn't write translations.json: {e}");
+        }
+    }
+
     /// Drain completed translations. Keyed by record, so a result that arrives
     /// after the user has skipped on is still worth keeping.
     fn drain_translations(&mut self) {
-        while let Ok(TranslateMsg::Done { record_id, result }) = self.translate_rx.try_recv() {
-            let on_screen = self.current_lyrics().map(|l| l.id) == Some(record_id);
+        while let Ok(TranslateMsg::Done {
+            record_id,
+            ai,
+            result,
+        }) = self.translate_rx.try_recv()
+        {
+            let on_screen = self.current_translation_key() == Some((record_id, ai));
             let entry = match result {
-                Ok(lines) => {
+                Ok(done) => {
                     log::info!("translate: lrclib #{record_id} done");
-                    TranslationEntry::Ready(lines)
+                    // Kept only when the model answered. An AI request that
+                    // fell back to the free endpoint is not what `I` bought, so
+                    // it isn't stored and gets another go at the model.
+                    if !done.model.is_empty() {
+                        self.saved_translations.set(
+                            record_id,
+                            &self.config.lyrics.translate_to,
+                            &done.model,
+                            done.lines.clone(),
+                        );
+                        self.save_translations();
+                    }
+                    TranslationEntry::Ready(done.lines)
                 }
                 Err(e) => {
                     log::warn!("translate: lrclib #{record_id} failed: {e}");
@@ -1073,7 +1188,7 @@ impl App {
                     TranslationEntry::Failed
                 }
             };
-            self.translations.insert(record_id, entry);
+            self.translations.insert((record_id, ai), entry);
             // Rebuild the wrapped rows with the translation woven in — but
             // leave the scroll alone, since the user may have moved it while
             // waiting.
@@ -1084,25 +1199,33 @@ impl App {
     }
 
     /// The translation to show under the on-screen record's lines, if it has
-    /// arrived and `i` is on.
+    /// arrived and a translator is selected.
     fn shown_translation(&self, record_id: u64) -> Option<&[String]> {
-        if !self.translate_on {
-            return None;
-        }
-        match self.translations.get(&record_id) {
+        let ai = match self.translate_mode {
+            TranslateMode::Off => return None,
+            TranslateMode::Ai => true,
+            TranslateMode::Free => false,
+        };
+        match self.translations.get(&(record_id, ai)) {
             Some(TranslationEntry::Ready(lines)) => Some(lines),
             _ => None,
         }
     }
 
-    /// The lyrics header's translation badge: which language `i` turned on, and
-    /// how the fetch is getting on. Absent when translation is off.
+    /// The lyrics header's badge: the language, an `ai` mark when `I` chose the
+    /// model, and how the fetch is getting on.
     fn translation_badge(&self, record_id: u64) -> Option<Span<'static>> {
-        if !self.translate_on {
-            return None;
-        }
-        let lang = self.config.lyrics.translate_to.clone();
-        Some(match self.translations.get(&record_id) {
+        let ai = match self.translate_mode {
+            TranslateMode::Off => return None,
+            TranslateMode::Ai => true,
+            TranslateMode::Free => false,
+        };
+        let lang = format!(
+            "{}{}",
+            self.config.lyrics.translate_to,
+            if ai { " ai" } else { "" }
+        );
+        Some(match self.translations.get(&(record_id, ai)) {
             Some(TranslationEntry::Ready(_)) => {
                 Span::styled(format!("⇄ {lang}"), theme::TRANSLATION)
             }
@@ -1491,6 +1614,9 @@ impl App {
                             KeyCode::Char('c') if self.lyrics_mode => self.open_lyrics_picker(),
                             KeyCode::Char('r') if self.lyrics_mode => self.retry_lyrics(),
                             KeyCode::Char('i') if self.lyrics_mode => self.toggle_translation(),
+                            KeyCode::Char('I') if self.lyrics_mode => {
+                                self.toggle_ai_translation();
+                            }
                             KeyCode::PageDown if self.lyrics_mode => self.scroll_lyrics(5),
                             KeyCode::PageUp if self.lyrics_mode => self.scroll_lyrics(-5),
                             // ── quit ──────────────────────────────────────────────────
@@ -1826,15 +1952,29 @@ impl App {
                 ("spc", "pause"),
             ]
         } else if self.lyrics_mode {
-            &[
-                ("y", "close"),
-                ("c", "source"),
-                ("i", "translate"),
-                ("spc", "pause"),
-                ("p/n", "skip"),
-                ("j/k", "scroll"),
-                ("?", "keys"),
-            ]
+            // `I` is only offered where it does something.
+            if self.config.lyrics.ai_available() {
+                &[
+                    ("y", "close"),
+                    ("c", "source"),
+                    ("i", "translate"),
+                    ("I", "ai"),
+                    ("spc", "pause"),
+                    ("p/n", "skip"),
+                    ("j/k", "scroll"),
+                    ("?", "keys"),
+                ]
+            } else {
+                &[
+                    ("y", "close"),
+                    ("c", "source"),
+                    ("i", "translate"),
+                    ("spc", "pause"),
+                    ("p/n", "skip"),
+                    ("j/k", "scroll"),
+                    ("?", "keys"),
+                ]
+            }
         } else {
             match (self.active_panel, self.show_queue) {
                 (Panel::Playlists, _) => &[
@@ -1915,7 +2055,8 @@ impl App {
             ("y", "Toggle lyrics"),
             ("c", "Choose lyrics source (in lyrics)"),
             ("i", "Toggle translation (in lyrics)"),
-            ("r", "Retry lyrics (in lyrics)"),
+            ("I", "Translate with the AI model instead"),
+            ("r", "Redo (translation or lyrics)"),
             ("", ""),
             ("?", "Close this help"),
             ("q  ·  Ctrl+C", "Quit"),

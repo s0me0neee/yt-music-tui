@@ -34,7 +34,7 @@ mod llm;
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
-pub use llm::Ai;
+pub use llm::{Ai, Provider};
 
 /// Which translator to use, and into what.
 ///
@@ -497,6 +497,17 @@ async fn translate_distinct(lines: &[&str], to: &str) -> (Vec<Option<String>>, O
     (out, error)
 }
 
+/// A finished translation and what produced it.
+pub struct Translated {
+    /// One entry per input line, empty where nothing could be translated.
+    pub lines: Vec<String>,
+    /// The model, or empty when the free endpoint answered — including when it
+    /// answered *because* the AI path failed. Callers that cache this need to
+    /// know which they got, or a fallback would be kept as if it were the model
+    /// the user is paying for.
+    pub model: String,
+}
+
 /// Translates `lines` into `to`, one translation per input line.
 ///
 /// The result is always the same length as the input; a line that is blank or
@@ -510,17 +521,27 @@ async fn translate_distinct(lines: &[&str], to: &str) -> (Vec<Option<String>>, O
 pub async fn translate_lines(
     lines: &[String],
     backend: &Backend,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Translated, String> {
     if let Some(ai) = &backend.ai {
         match llm::translate(lines, &backend.to, ai).await {
-            Ok(out) => return Ok(out),
+            Ok(lines) => {
+                return Ok(Translated {
+                    lines,
+                    model: ai.model.clone(),
+                });
+            }
             // Falling through rather than surfacing the error is deliberate: a
             // rate limit or a spent balance should cost quality, not the
             // feature. The log says which; the panel keeps showing lyrics.
             Err(e) => log::warn!("translate: {} failed ({e}) — falling back", ai.model),
         }
     }
-    translate_free(lines, &backend.to).await
+    translate_free(lines, &backend.to)
+        .await
+        .map(|lines| Translated {
+            lines,
+            model: String::new(),
+        })
 }
 
 /// The free path, unchanged from before the AI backend existed: the
@@ -577,7 +598,10 @@ async fn translate_free(lines: &[String], to: &str) -> std::result::Result<Vec<S
 pub enum TranslateMsg {
     Done {
         record_id: u64,
-        result: std::result::Result<Vec<String>, String>,
+        /// Which translator was *asked for*. Not the same as what answered:
+        /// the AI path falls back, and the caller filed its request under this.
+        ai: bool,
+        result: std::result::Result<Translated, String>,
     },
 }
 
@@ -589,9 +613,14 @@ pub fn spawn_translate(
     backend: Backend,
     tx: Sender<TranslateMsg>,
 ) {
+    let ai = backend.ai.is_some();
     handle.spawn(async move {
         let result = translate_lines(&lines, &backend).await;
-        let _ = tx.send(TranslateMsg::Done { record_id, result });
+        let _ = tx.send(TranslateMsg::Done {
+            record_id,
+            ai,
+            result,
+        });
     });
 }
 

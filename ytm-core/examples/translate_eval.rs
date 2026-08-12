@@ -9,34 +9,56 @@
 //!     < lines.txt > pairs.jsonl
 //! ```
 //!
+//! `DEEPSEEK_API_KEY` works the same way, and picks that provider.
+//!
 //! `ai` is empty on every line when no key is set, which is also a fair way to
 //! check that the free path still works on its own.
 
-use ytm_core::translate::{Ai, Backend, translate_lines};
+use ytm_core::translate::{Ai, Backend, Provider, translate_lines};
+
+/// The first key set, and whose it is.
+fn key() -> Option<(Provider, String)> {
+    ["ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            let key = std::env::var(name).ok().filter(|k| !k.trim().is_empty())?;
+            Some((Provider::for_key_env(name), key))
+        })
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let to = std::env::args().nth(1).unwrap_or_else(|| "zh".to_string());
-    let model = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "claude-haiku-4-5".to_string());
     let lines: Vec<String> = std::io::read_to_string(std::io::stdin())?
         .lines()
         .map(str::to_string)
         .collect();
 
-    let free = translate_lines(&lines, &Backend::free(&to)).await?;
+    let free = translate_lines(&lines, &Backend::free(&to)).await?.lines;
 
-    let ai = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(api_key) if !api_key.trim().is_empty() => {
+    let ai = match key() {
+        Some((provider, api_key)) => {
+            let model = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| provider.default_model().to_string());
             let backend = Backend {
                 to: to.clone(),
-                ai: Some(Ai { model, api_key }),
+                ai: Some(Ai {
+                    model,
+                    api_key,
+                    provider,
+                }),
             };
-            translate_lines(&lines, &backend).await?
+            let done = translate_lines(&lines, &backend).await?;
+            // Empty when the AI path failed and the free endpoint answered
+            // instead — the two columns would otherwise be silently identical.
+            if done.model.is_empty() {
+                eprintln!("the AI path fell back to the free endpoint — see the log");
+            }
+            done.lines
         }
-        _ => {
-            eprintln!("no ANTHROPIC_API_KEY — free path only");
+        None => {
+            eprintln!("no ANTHROPIC_API_KEY or DEEPSEEK_API_KEY — free path only");
             vec![String::new(); lines.len()]
         }
     };

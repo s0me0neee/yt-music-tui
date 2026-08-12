@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::library::Library;
 use crate::player::TrackRef;
-use crate::session::{lyrics_path, queue_path, settings_path};
+use crate::session::{lyrics_path, queue_path, settings_path, translations_path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueEntry {
@@ -106,6 +106,116 @@ pub fn load_lyrics_overrides() -> LyricsOverrides {
         .unwrap_or_default()
 }
 
+// ── translations ─────────────────────────────────────────────────────────────
+
+/// AI translations kept between sessions, so a song is paid for once.
+///
+/// Only the AI ones: the free endpoint costs nothing but a wait, and a
+/// translation kept for ever is a translation that can never improve. `i` asks
+/// for a fresh one each session; `I` reuses what it already bought.
+///
+/// Keyed by lrclib record id — a translation belongs to the words, so two
+/// tracks on the same record share one and `c` gets its own.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Translations {
+    /// Record id as a string, since JSON object keys are strings.
+    #[serde(default)]
+    entries: std::collections::HashMap<String, CachedTranslation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedTranslation {
+    /// What it was translated into; `lyrics.translate-to` can change between
+    /// sessions, and last week's language is no use.
+    pub language: String,
+    /// The model that produced it, empty for the free endpoint.
+    #[serde(default)]
+    pub model: String,
+    /// Unix seconds, for evicting the oldest once the file is at its cap.
+    #[serde(default)]
+    pub saved_at: u64,
+    /// One entry per lyric line of the record.
+    pub lines: Vec<String>,
+}
+
+/// Records kept on disk. A few kilobytes each; past this the oldest goes.
+const MAX_SAVED_TRANSLATIONS: usize = 1000;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl Translations {
+    /// What was bought for `record_id`, if it is in the language now
+    /// configured.
+    #[must_use]
+    pub fn get(&self, record_id: u64, language: &str) -> Option<&[String]> {
+        let entry = self.entries.get(&record_id.to_string())?;
+        (entry.language == language).then_some(entry.lines.as_slice())
+    }
+
+    pub fn set(&mut self, record_id: u64, language: &str, model: &str, lines: Vec<String>) {
+        self.entries.insert(
+            record_id.to_string(),
+            CachedTranslation {
+                language: language.to_string(),
+                model: model.to_string(),
+                saved_at: now_secs(),
+                lines,
+            },
+        );
+        self.evict();
+    }
+
+    /// Forgets one, so the next `I` buys another — what `r` does with a
+    /// translation you don't like. `true` if there was one to forget.
+    pub fn remove(&mut self, record_id: u64) -> bool {
+        self.entries.remove(&record_id.to_string()).is_some()
+    }
+
+    /// Drops the oldest until the file is back under the cap.
+    fn evict(&mut self) {
+        while self.entries.len() > MAX_SAVED_TRANSLATIONS {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(id, e)| (e.saved_at, (*id).clone()))
+                .map(|(id, _)| id.clone())
+            else {
+                return;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+pub fn save_translations(translations: &Translations) -> Result<()> {
+    std::fs::write(
+        translations_path(),
+        serde_json::to_string_pretty(translations)?,
+    )?;
+    Ok(())
+}
+
+pub fn load_translations() -> Translations {
+    std::fs::read_to_string(translations_path())
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
 /// Serialises a live queue into a [`QueueState`] ready for [`save_queue`].
 /// Returns `None` if the queue is empty or none of its entries resolve to a
 /// (non-empty) video ID.
@@ -187,4 +297,70 @@ pub fn try_restore(library: &Library, saved: &QueueState) -> RestoreOutcome {
 
     let position = saved.position.filter(|&p| p < queue.len()).or(Some(0));
     RestoreOutcome::Ready { queue, position }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines() -> Vec<String> {
+        vec!["\u{4e00}".to_string(), "\u{4e8c}".to_string()]
+    }
+
+    #[test]
+    fn what_was_bought_comes_back() {
+        let mut saved = Translations::default();
+        saved.set(7, "zh", "claude-haiku-4-5", lines());
+        assert_eq!(saved.get(7, "zh").unwrap(), lines());
+        assert!(saved.get(8, "zh").is_none());
+    }
+
+    #[test]
+    fn a_translation_comes_back_in_the_language_it_was_stored_under() {
+        let mut saved = Translations::default();
+        saved.set(7, "zh", "claude-haiku-4-5", lines());
+        // `lyrics.translate-to` changed between sessions.
+        assert!(saved.get(7, "fr").is_none());
+    }
+
+    #[test]
+    fn r_forgets_one_and_leaves_the_rest() {
+        let mut saved = Translations::default();
+        saved.set(7, "zh", "claude-haiku-4-5", lines());
+        saved.set(8, "zh", "claude-haiku-4-5", lines());
+        assert!(saved.remove(7));
+        assert!(!saved.remove(7));
+        assert!(saved.get(7, "zh").is_none());
+        assert!(saved.get(8, "zh").is_some());
+    }
+
+    #[test]
+    fn the_file_stops_growing_at_the_cap() {
+        let mut saved = Translations::default();
+        for id in 0..MAX_SAVED_TRANSLATIONS as u64 + 10 {
+            // Set directly rather than through `set`, which stamps the clock.
+            saved.entries.insert(
+                id.to_string(),
+                CachedTranslation {
+                    language: "zh".to_string(),
+                    model: "claude-haiku-4-5".to_string(),
+                    saved_at: id,
+                    lines: lines(),
+                },
+            );
+            saved.evict();
+        }
+        assert_eq!(saved.len(), MAX_SAVED_TRANSLATIONS);
+        assert!(saved.get(0, "zh").is_none());
+        assert!(saved.get(MAX_SAVED_TRANSLATIONS as u64 + 9, "zh").is_some());
+    }
+
+    #[test]
+    fn a_translations_file_survives_a_round_trip() {
+        let mut saved = Translations::default();
+        saved.set(7, "zh", "claude-haiku-4-5", lines());
+        let json = serde_json::to_string_pretty(&saved).expect("serialised");
+        let back: Translations = serde_json::from_str(&json).expect("parsed");
+        assert_eq!(back.get(7, "zh").unwrap(), lines());
+    }
 }
