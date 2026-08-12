@@ -6,8 +6,8 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-pub use ytmusicapi::{Album, Artist};
 use ytmusicapi::YTMusicClient;
+pub use ytmusicapi::{Album, Artist};
 
 use crate::error::{Error, Result};
 

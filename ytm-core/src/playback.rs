@@ -23,8 +23,9 @@ pub enum Cmd {
     Prefetch(String), // pre-resolve CDN URL before the user presses play
     Pause,
     Resume,
-    Seek(i64),  // relative seconds
-    Volume(u8), // 0-100
+    Seek(f64),    // relative seconds
+    SeekAbs(f64), // absolute position, seconds
+    Volume(u8),   // 0-100
     Stop,
 }
 
@@ -232,6 +233,9 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         init.set_property("script-opts", "ytdl_hook-ytdl_path=yt-dlp")?;
         init.set_property("gapless-audio", "yes")?;
         init.set_property("audio-display", "no")?;
+        // What PipeWire/PulseAudio calls this stream, so the system mixer
+        // lists the app under its own name and slider rather than "mpv".
+        init.set_property("audio-client-name", "ytm")?;
         init.set_property("cache", "yes")?;
         init.set_property("demuxer-readahead-secs", 30i64)?;
         init.set_property("cache-pause-initial", "no")?; // start ASAP, don't pre-fill
@@ -372,6 +376,13 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         let ds = d.to_string();
                         if let Err(e) = mpv.command("seek", &[ds.as_str(), "relative"]) {
                             log::warn!("[audio] seek failed: {e}");
+                        }
+                    }
+                    Cmd::SeekAbs(t) => {
+                        log::debug!("[audio] SeekAbs {t:.1}s");
+                        let ts = t.to_string();
+                        if let Err(e) = mpv.command("seek", &[ts.as_str(), "absolute"]) {
+                            log::warn!("[audio] absolute seek failed: {e}");
                         }
                     }
                     Cmd::Volume(v) => {

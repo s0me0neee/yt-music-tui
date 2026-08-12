@@ -19,7 +19,10 @@ use throbber_widgets_tui::{Throbber, ThrobberState};
 use ytm_core::library::SongBatch;
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
-use ytm_core::{AppendOutcome, AudioState, Library, Player, RemoveOutcome, Track, TranslateMsg};
+use ytm_core::{
+    AppendOutcome, AudioState, Library, MediaCmd, MediaControls, NowPlaying, PlayState, Player,
+    RemoveOutcome, Track, TrackInfo, TranslateMsg,
+};
 
 // ── theme ────────────────────────────────────────────────────────────────────
 
@@ -456,6 +459,10 @@ struct LyricRow {
     translated: bool,
 }
 
+/// Translations kept before the oldest is dropped. A few kilobytes each, and
+/// the AI backend charges for every one that has to be fetched again.
+const MAX_TRANSLATIONS: usize = 64;
+
 /// Per-record translation state, keyed by lrclib id in [`App::translations`].
 /// Terminal like [`LyricsEntry`]: toggling `i` off and on again re-reads the
 /// cache rather than the network.
@@ -677,12 +684,18 @@ pub struct App {
     translate_on: bool,
     translate_tx: std::sync::mpsc::Sender<TranslateMsg>,
     translate_rx: std::sync::mpsc::Receiver<TranslateMsg>,
-    /// Keyed by lrclib record id, not by video: a translation belongs to the
-    /// words. Two tracks resolving to the same record share one, and picking a
-    /// different record with `c` correctly gets a translation of its own.
+    /// Translations by lrclib record id — by *record* rather than by video, so
+    /// picking a different one with `c` gets a translation of its own and two
+    /// tracks on the same record share one.
     translations: std::collections::HashMap<u64, TranslationEntry>,
+    /// Insertion order for [`Self::translations`], oldest first, so the map can
+    /// be bounded without holding a whole session's songs.
+    translation_order: Vec<u64>,
     /// User settings from `config.toml`, read once at startup.
     config: ytm_core::Config,
+    /// MPRIS: the media keys and the desktop's player list. `None` when there
+    /// is no session bus to serve on.
+    media: Option<MediaControls>,
 }
 
 impl App {
@@ -702,6 +715,8 @@ impl App {
 
         let (lyrics_tx, lyrics_rx) = std::sync::mpsc::channel();
         let (translate_tx, translate_rx) = std::sync::mpsc::channel();
+
+        let media = MediaControls::new(&rt);
 
         Self {
             library,
@@ -741,8 +756,10 @@ impl App {
             translate_tx,
             translate_rx,
             translations: std::collections::HashMap::new(),
+            translation_order: Vec::new(),
             config,
             lyrics_dirty: false,
+            media,
         }
     }
 
@@ -990,25 +1007,39 @@ impl App {
             return;
         };
         let record_id = found.id;
-        if self.translations.contains_key(&record_id) {
-            return;
-        }
         let lines: Vec<String> = match &found.kind {
             ytm_core::LyricsKind::Synced(lines) => lines.iter().map(|l| l.text.clone()).collect(),
             ytm_core::LyricsKind::Plain(lines) => lines.clone(),
-            // Nothing to translate, and no entry cached either — an
-            // instrumental that later resolves to a real record should still
-            // get one.
+            // Nothing to translate, and no entry held either — an instrumental
+            // that later resolves to a real record should still get one.
             ytm_core::LyricsKind::Instrumental => return,
         };
         if lines.iter().all(|l| l.trim().is_empty()) {
             return;
         }
 
-        let to = self.config.lyrics.translate_to.clone();
+        if self.translations.contains_key(&record_id) {
+            return;
+        }
+        // Held for the session, oldest evicted first: skipping back and forth
+        // then costs one translation a song rather than one a play, which on
+        // the AI backend is real money — see `translate/llm.rs`.
+        self.translation_order.retain(|&id| id != record_id);
+        while self.translation_order.len() >= MAX_TRANSLATIONS {
+            let oldest = self.translation_order.remove(0);
+            self.translations.remove(&oldest);
+        }
+        self.translation_order.push(record_id);
+
+        let backend = self.config.lyrics.backend();
         log::info!(
-            "translate: {} lines of lrclib #{record_id} into {to}",
-            lines.len()
+            "translate: {} lines of lrclib #{record_id} into {} via {}",
+            lines.len(),
+            backend.to,
+            backend
+                .ai
+                .as_ref()
+                .map_or("the free endpoint", |a| &a.model)
         );
         self.translations
             .insert(record_id, TranslationEntry::Loading);
@@ -1016,7 +1047,7 @@ impl App {
             &self.lyrics_handle,
             record_id,
             lines,
-            to,
+            backend,
             self.translate_tx.clone(),
         );
     }
@@ -1080,6 +1111,111 @@ impl App {
             }
             _ => Span::styled(format!("⇄ {lang}…"), theme::DIM),
         })
+    }
+
+    // ── MPRIS ─────────────────────────────────────────────────────────────────
+
+    /// Acts on anything the desktop asked for — a media key, GNOME's player
+    /// widget, `playerctl`. Commands are collected first because acting on one
+    /// needs `&mut self` while the channel is borrowed from `self.media`.
+    fn drain_media(&mut self) {
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        let mut cmds = Vec::new();
+        while let Some(cmd) = media.try_recv() {
+            cmds.push(cmd);
+        }
+
+        for cmd in cmds {
+            log::debug!("[mpris] {cmd:?}");
+            match cmd {
+                MediaCmd::Play => self.player.resume(&self.library),
+                MediaCmd::Pause => {
+                    self.player.set_paused(true);
+                }
+                MediaCmd::PlayPause => self.player.play_pause(&self.library),
+                MediaCmd::Stop => self.player.stop(),
+                MediaCmd::Next => {
+                    self.player.next(&self.library);
+                    self.sync_queue_view();
+                }
+                // Same double-press gesture as `p`: the media key on a
+                // keyboard is the same button, and this is what one does
+                // everywhere else.
+                MediaCmd::Previous => {
+                    if self.player.restart_or_previous(&self.library) {
+                        self.sync_queue_view();
+                    }
+                }
+                MediaCmd::Seek(secs) => self.player.seek(secs),
+                MediaCmd::SeekTo(secs) => self.player.seek_to(secs),
+                MediaCmd::Volume(v) => self.player.set_volume(v),
+                MediaCmd::Mode(mode) => self.player.set_mode(mode),
+                // The same door SIGTERM uses: the loop checks this at the top
+                // of every tick, so the usual save-on-exit path still runs.
+                MediaCmd::Quit => ytm_core::shutdown::request_shutdown(),
+            }
+        }
+    }
+
+    /// Publishes the current state to the desktop. Called every tick; the
+    /// diffing that decides whether anything reaches D-Bus lives in
+    /// `MediaControls::update`.
+    fn update_media(&mut self) {
+        if self.media.is_none() {
+            return;
+        }
+        let now = self.now_playing();
+        if let Some(media) = self.media.as_mut() {
+            media.update(&now);
+        }
+    }
+
+    fn now_playing(&self) -> NowPlaying {
+        let ast = self.player.audio_state();
+        let playing = self.player.playing();
+
+        let track = playing
+            .and_then(|(pl, song)| self.library.track(pl, song))
+            .map(|t| TrackInfo {
+                id: t.video_id.clone().unwrap_or_default(),
+                title: t.title.clone().unwrap_or_default(),
+                artists: t.artists.iter().map(|a| a.name.clone()).collect(),
+                album: t.album.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+                // mpv's duration is the accurate one but arrives a beat late,
+                // so YouTube's stands in until it does.
+                length: if ast.total > 0.0 {
+                    ast.total
+                } else {
+                    t.duration_seconds.unwrap_or(0).into()
+                },
+            });
+
+        // A queue restored from disk has a track but has never been handed to
+        // mpv, so Stopped — not Paused — is the honest answer: `Play` starts
+        // it from the beginning, which is exactly what `start_current` does.
+        let state = if playing.is_none() || !self.player.playback_started() {
+            PlayState::Stopped
+        } else if ast.paused {
+            PlayState::Paused
+        } else {
+            PlayState::Playing
+        };
+
+        let queued = !self.player.queue().is_empty();
+        NowPlaying {
+            state,
+            track,
+            mode: self.player.mode(),
+            volume: self.player.volume(),
+            // The queue wraps, so there is always a next once it is non-empty.
+            can_go_next: queued,
+            can_go_previous: queued,
+            can_play: queued || playing.is_some(),
+            can_seek: !ast.loading && ast.total > 0.0,
+            position: ast.elapsed,
+        }
     }
 
     /// Attempt to restore a saved queue. Called after every song-batch arrival;
@@ -1161,6 +1297,7 @@ impl App {
             self.drain_song_channel();
             self.drain_lyrics();
             self.drain_translations();
+            self.drain_media();
             // Kicked off from here rather than on each key: this one lookup
             // covers entering lyrics mode, p/n, auto-advance and Enter alike.
             if self.lyrics_mode
@@ -1185,6 +1322,9 @@ impl App {
             if self.player.handle_song_end(&self.library) {
                 self.sync_queue_view();
             }
+            // After the auto-advance above, so a track change reaches the
+            // desktop on the same tick the UI shows it.
+            self.update_media();
             if event::poll(self.poll_timeout())? {
                 match event::read()? {
                     Event::Mouse(me) => self.handle_mouse(me),
@@ -1289,19 +1429,15 @@ impl App {
                                 self.filter_mode = true;
                             }
                             // ── playback ──────────────────────────────────────────────
-                            KeyCode::Char(' ') => {
-                                if self.player.playing().is_some() {
-                                    if self.player.playback_started() {
-                                        self.player.toggle_pause();
-                                    } else {
-                                        // Restored from saved state — start playback now.
-                                        self.player.start_current(&self.library);
-                                    }
-                                }
-                            }
+                            // Resumes, pauses, or — for a queue restored from
+                            // saved state — starts playback.
+                            KeyCode::Char(' ') => self.player.play_pause(&self.library),
+                            // First press restarts the track; a second within
+                            // half a second goes back one instead.
                             KeyCode::Char('p') => {
-                                self.player.prev(&self.library);
-                                self.sync_queue_view();
+                                if self.player.restart_or_previous(&self.library) {
+                                    self.sync_queue_view();
+                                }
                             }
                             KeyCode::Char('n') => {
                                 self.player.next(&self.library);
@@ -1344,8 +1480,8 @@ impl App {
                                 }
                             }
                             // ── seek ──────────────────────────────────────────────────
-                            KeyCode::Left => self.player.seek(-5),
-                            KeyCode::Right => self.player.seek(5),
+                            KeyCode::Left => self.player.seek(-5.0),
+                            KeyCode::Right => self.player.seek(5.0),
                             // ── volume ────────────────────────────────────────────────
                             KeyCode::Up => self.player.adjust_volume(5),
                             KeyCode::Down => self.player.adjust_volume(-5),
@@ -1566,8 +1702,8 @@ impl App {
                     self.player.toggle_pause();
                 }
             }
-            KeyCode::Left => self.player.seek(-5),
-            KeyCode::Right => self.player.seek(5),
+            KeyCode::Left => self.player.seek(-5.0),
+            KeyCode::Right => self.player.seek(5.0),
             _ => {}
         }
         false
@@ -1765,7 +1901,8 @@ impl App {
             ("Esc", "Clear filter · back · close"),
             ("", ""),
             ("space", "Pause / resume"),
-            ("p / n", "Previous / next in queue"),
+            ("p", "Restart track · again for previous"),
+            ("n", "Next in queue"),
             ("← / →", "Seek ∓5s"),
             ("↑ / ↓", "Volume ±5"),
             ("m", "Mute / unmute"),

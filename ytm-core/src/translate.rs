@@ -1,4 +1,11 @@
-//! Lyric translation, on top of the [`rust_translate`] crate.
+//! Lyric translation. Two backends, chosen by [`Backend`].
+//!
+//! `lyrics.ai-translation = true` sends the whole song to Claude in one request
+//! — see [`llm`]. Everything else in this file is the free path, which is what
+//! runs by default and is described below; the AI path falls back to it on any
+//! failure, so the feature never disappears, only its quality changes.
+//!
+//! ── the free path ────────────────────────────────────────────────────────────
 //!
 //! [`rust_translate`] is the transport; this module is the policy, the same
 //! split as [`lrclib`](lrclib) and [`crate::lyrics`]. The crate is a thin
@@ -22,8 +29,39 @@
 //! context); if it doesn't, the song is re-fetched a sentence at a time, which
 //! is slower but cannot silently lose half a line.
 
+mod llm;
+
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
+
+pub use llm::Ai;
+
+/// Which translator to use, and into what.
+///
+/// Built once from `config.toml`. [`Backend::ai`] is `Some` only when
+/// `lyrics.ai-translation` is true *and* a key was found — so the default is the
+/// free path below, unchanged from before the AI backend existed, costing
+/// nothing and sending nothing to any API.
+#[derive(Debug, Clone)]
+pub struct Backend {
+    /// Language code, already normalised by `Config::validated`.
+    pub to: String,
+    /// When set, translate the whole song with Claude instead. Nothing on this
+    /// path is pre-processed: a model that sees every line reads a sentence
+    /// spanning several of them by itself.
+    pub ai: Option<Ai>,
+}
+
+impl Backend {
+    /// The free endpoint — what an unconfigured install uses.
+    #[must_use]
+    pub fn free(to: impl Into<String>) -> Self {
+        Self {
+            to: to.into(),
+            ai: None,
+        }
+    }
+}
 
 /// Sentence terminators, used to cut a line into pieces small enough that the
 /// endpoint cannot split one — the fallback when batching came back short.
@@ -61,6 +99,133 @@ pub fn normalise_language(code: &str) -> Option<&'static str> {
     rust_translate::supported_languages::get_languages()
         .into_iter()
         .find(|known| known.eq_ignore_ascii_case(want))
+}
+
+/// English names for the codes [`normalise_language`] accepts.
+///
+/// Only the AI path needs these, and it needs them badly: asked to translate
+/// into `zh`, Haiku answers in *English* — three times out of three, measured.
+/// A code is something a prompt can quietly ignore; a name is not.
+/// `every_language_the_endpoint_knows_has_a_name` keeps this in step with the
+/// crate's list.
+const LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("af", "Afrikaans"),
+    ("sq", "Albanian"),
+    ("am", "Amharic"),
+    ("ar", "Arabic"),
+    ("hy", "Armenian"),
+    ("az", "Azerbaijani"),
+    ("eu", "Basque"),
+    ("be", "Belarusian"),
+    ("bn", "Bengali"),
+    ("bs", "Bosnian"),
+    ("bg", "Bulgarian"),
+    ("ca", "Catalan"),
+    ("ceb", "Cebuano"),
+    ("ny", "Chichewa"),
+    ("zh", "Chinese (Simplified)"),
+    ("zh-TW", "Chinese (Traditional)"),
+    ("co", "Corsican"),
+    ("hr", "Croatian"),
+    ("cs", "Czech"),
+    ("da", "Danish"),
+    ("nl", "Dutch"),
+    ("en", "English"),
+    ("eo", "Esperanto"),
+    ("et", "Estonian"),
+    ("tl", "Filipino"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("fy", "Frisian"),
+    ("gl", "Galician"),
+    ("ka", "Georgian"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("gu", "Gujarati"),
+    ("ht", "Haitian Creole"),
+    ("ha", "Hausa"),
+    ("haw", "Hawaiian"),
+    ("he", "Hebrew"),
+    ("hi", "Hindi"),
+    ("hmn", "Hmong"),
+    ("hu", "Hungarian"),
+    ("is", "Icelandic"),
+    ("ig", "Igbo"),
+    ("id", "Indonesian"),
+    ("ga", "Irish"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("jv", "Javanese"),
+    ("kn", "Kannada"),
+    ("kk", "Kazakh"),
+    ("km", "Khmer"),
+    ("rw", "Kinyarwanda"),
+    ("ko", "Korean"),
+    ("ku", "Kurdish (Kurmanji)"),
+    ("ky", "Kyrgyz"),
+    ("lo", "Lao"),
+    ("la", "Latin"),
+    ("lv", "Latvian"),
+    ("lt", "Lithuanian"),
+    ("lb", "Luxembourgish"),
+    ("mk", "Macedonian"),
+    ("mg", "Malagasy"),
+    ("ms", "Malay"),
+    ("ml", "Malayalam"),
+    ("mt", "Maltese"),
+    ("mi", "Maori"),
+    ("mr", "Marathi"),
+    ("mn", "Mongolian"),
+    ("my", "Myanmar (Burmese)"),
+    ("ne", "Nepali"),
+    ("no", "Norwegian"),
+    ("or", "Odia (Oriya)"),
+    ("ps", "Pashto"),
+    ("fa", "Persian"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("pa", "Punjabi"),
+    ("ro", "Romanian"),
+    ("ru", "Russian"),
+    ("sm", "Samoan"),
+    ("gd", "Scots Gaelic"),
+    ("sr", "Serbian"),
+    ("st", "Sesotho"),
+    ("sn", "Shona"),
+    ("sd", "Sindhi"),
+    ("si", "Sinhala"),
+    ("sk", "Slovak"),
+    ("sl", "Slovenian"),
+    ("so", "Somali"),
+    ("es", "Spanish"),
+    ("su", "Sundanese"),
+    ("sw", "Swahili"),
+    ("sv", "Swedish"),
+    ("tg", "Tajik"),
+    ("ta", "Tamil"),
+    ("te", "Telugu"),
+    ("th", "Thai"),
+    ("tr", "Turkish"),
+    ("uk", "Ukrainian"),
+    ("ur", "Urdu"),
+    ("ug", "Uyghur"),
+    ("uz", "Uzbek"),
+    ("vi", "Vietnamese"),
+    ("cy", "Welsh"),
+    ("xh", "Xhosa"),
+    ("yi", "Yiddish"),
+    ("yo", "Yoruba"),
+    ("zu", "Zulu"),
+];
+
+/// The English name of a language code — `zh` → `Chinese (Simplified)`.
+#[must_use]
+pub fn language_name(code: &str) -> Option<&'static str> {
+    let want = code.trim();
+    LANGUAGE_NAMES
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(want))
+        .map(|(_, name)| *name)
 }
 
 /// Percent-encodes `text` for use as a query value.
@@ -344,8 +509,24 @@ async fn translate_distinct(lines: &[&str], to: &str) -> (Vec<Option<String>>, O
 /// discarded: most of a translated song is worth having.
 pub async fn translate_lines(
     lines: &[String],
-    to: &str,
+    backend: &Backend,
 ) -> std::result::Result<Vec<String>, String> {
+    if let Some(ai) = &backend.ai {
+        match llm::translate(lines, &backend.to, ai).await {
+            Ok(out) => return Ok(out),
+            // Falling through rather than surfacing the error is deliberate: a
+            // rate limit or a spent balance should cost quality, not the
+            // feature. The log says which; the panel keeps showing lyrics.
+            Err(e) => log::warn!("translate: {} failed ({e}) — falling back", ai.model),
+        }
+    }
+    translate_free(lines, &backend.to).await
+}
+
+/// The free path, unchanged from before the AI backend existed: the
+/// `rust-translate` crate over `translate_a/single`, with the probe and
+/// per-sentence fallback that work around its dropped segments.
+async fn translate_free(lines: &[String], to: &str) -> std::result::Result<Vec<String>, String> {
     let mut order: Vec<&str> = Vec::new();
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for line in lines {
@@ -405,11 +586,11 @@ pub fn spawn_translate(
     handle: &tokio::runtime::Handle,
     record_id: u64,
     lines: Vec<String>,
-    to: String,
+    backend: Backend,
     tx: Sender<TranslateMsg>,
 ) {
     handle.spawn(async move {
-        let result = translate_lines(&lines, &to).await;
+        let result = translate_lines(&lines, &backend).await;
         let _ = tx.send(TranslateMsg::Done { record_id, result });
     });
 }
@@ -428,6 +609,18 @@ mod tests {
         // The one code with capitals in it, so the canonical spelling has to
         // come back from the list rather than from what the user typed.
         assert_eq!(normalise_language("zh-tw"), Some("zh-TW"));
+    }
+
+    #[test]
+    fn every_language_the_endpoint_knows_has_a_name() {
+        // The AI prompt names the target language rather than coding it, so a
+        // code the table has missed would be translated into English instead.
+        for code in rust_translate::supported_languages::get_languages() {
+            assert!(language_name(code).is_some(), "{code} has no name");
+        }
+        assert_eq!(language_name("zh"), Some("Chinese (Simplified)"));
+        assert_eq!(language_name("ZH-tw"), Some("Chinese (Traditional)"));
+        assert_eq!(language_name("zzz"), None);
     }
 
     #[test]
@@ -594,7 +787,7 @@ mod tests {
         // No network touched: `translate_lines` returns before spawning
         // anything when every line is blank.
         let lines = vec![String::new(), "   ".to_string()];
-        assert_eq!(translate_lines(&lines, "zh").await.unwrap(), ["", ""]);
+        assert_eq!(translate_free(&lines, "zh").await.unwrap(), ["", ""]);
     }
 
     /// The mapping step on its own, with the fetch stubbed out — the part that
@@ -657,7 +850,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
 
-        let out = translate_lines(&lines, "zh").await.expect("translated");
+        let out = translate_free(&lines, "zh").await.expect("translated");
         assert_eq!(out.len(), lines.len());
         // The `&`/`#` line survives whole rather than collapsing to one word.
         assert!(out[0].contains('1'), "query was corrupted: {:?}", out[0]);
@@ -705,7 +898,7 @@ mod tests {
                 .collect();
 
             let started = std::time::Instant::now();
-            let out = translate_lines(&lines, "zh").await.expect("translated");
+            let out = translate_free(&lines, "zh").await.expect("translated");
             eprintln!(
                 "{} lines ({} distinct) in {:?}",
                 lines.len(),

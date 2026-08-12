@@ -11,6 +11,24 @@ use crate::playback::{AudioEngine, AudioState, Cmd};
 /// A track's position within a [`Library`]: `(playlist_idx, song_idx)`.
 pub type TrackRef = (usize, usize);
 
+/// How far into a track `previous` still means "the track before this one"
+/// rather than "restart this one". See [`Player::restart_or_previous`].
+const RESTART_WINDOW_SECS: f64 = 3.0;
+
+/// Whether a `previous` press should step back a track rather than restart the
+/// one playing.
+///
+/// The test is where playback *is*, not how fast the button was pressed — which
+/// is what makes a run of presses walk back through the queue. The first press
+/// restarts and so leaves the position at zero, so every press after it steps
+/// back, at whatever speed the user gets round to it.
+///
+/// `loading` counts as the start: between tracks there is no position yet, and
+/// the audio thread can be a tick behind in reporting the new one.
+fn should_step_back(elapsed: f64, loading: bool) -> bool {
+    loading || elapsed < RESTART_WINDOW_SECS
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayMode {
     Cycle,
@@ -131,7 +149,11 @@ impl Player {
     /// The volume to persist across runs: while muted this is the pre-mute
     /// level, so quitting muted doesn't save a level of 0.
     pub fn effective_volume(&self) -> u8 {
-        if self.muted { self.pre_mute_vol } else { self.volume }
+        if self.muted {
+            self.pre_mute_vol
+        } else {
+            self.volume
+        }
     }
 
     // ── playback ─────────────────────────────────────────────────────────────
@@ -157,12 +179,68 @@ impl Player {
         if ast.loading {
             return false;
         }
-        self.audio.send(if ast.paused { Cmd::Resume } else { Cmd::Pause });
+        self.audio
+            .send(if ast.paused { Cmd::Resume } else { Cmd::Pause });
         true
     }
 
-    pub fn seek(&self, delta_secs: i64) {
+    /// Pauses or resumes explicitly. Unlike [`Player::toggle_pause`] this is
+    /// idempotent, which is what MPRIS's separate `Pause`/`Play` calls need —
+    /// pressing pause twice must not resume. Returns `true` if a command was
+    /// actually sent.
+    pub fn set_paused(&self, paused: bool) -> bool {
+        let ast = self.audio.state();
+        if ast.loading || ast.paused == paused {
+            return false;
+        }
+        self.audio
+            .send(if paused { Cmd::Pause } else { Cmd::Resume });
+        true
+    }
+
+    /// Play/pause on one key: resumes, pauses, or — for a queue restored from
+    /// disk that hasn't been started yet — begins playback.
+    pub fn play_pause(&mut self, library: &Library) {
+        if self.playing.is_none() {
+            return;
+        }
+        if self.playback_started {
+            self.toggle_pause();
+        } else {
+            self.start_current(library);
+        }
+    }
+
+    /// Resumes, or starts a restored queue. Never pauses — see
+    /// [`Player::set_paused`] for why that matters.
+    pub fn resume(&mut self, library: &Library) {
+        if self.playing.is_none() {
+            return;
+        }
+        if self.playback_started {
+            self.set_paused(false);
+        } else {
+            self.start_current(library);
+        }
+    }
+
+    /// Stops playback but keeps the queue and its position, so a later
+    /// [`Player::resume`] picks the same track up from the start. That is what
+    /// MPRIS `Stop` means, as opposed to the queue-emptying stop in
+    /// [`Player::remove_from_queue`].
+    pub fn stop(&mut self) {
+        self.audio.send(Cmd::Stop);
+        self.playback_started = false;
+    }
+
+    pub fn seek(&self, delta_secs: f64) {
         self.audio.send(Cmd::Seek(delta_secs));
+    }
+
+    /// Seeks to an absolute position. MPRIS's `SetPosition` is absolute, and
+    /// rounding it into a relative hop would cost up to half a second.
+    pub fn seek_to(&self, secs: f64) {
+        self.audio.send(Cmd::SeekAbs(secs.max(0.0)));
     }
 
     /// Sets the volume (0-100) and clears mute.
@@ -195,8 +273,17 @@ impl Player {
     }
 
     pub fn cycle_mode(&mut self) {
-        let old = self.mode;
-        self.mode = self.mode.next();
+        self.set_mode(self.mode.next());
+    }
+
+    /// Switches directly to `mode`, reordering the live queue to match. MPRIS
+    /// addresses the same three states as an orthogonal `LoopStatus` plus
+    /// `Shuffle`, so it needs to name one rather than step through them.
+    pub fn set_mode(&mut self, mode: PlayMode) {
+        if mode == self.mode {
+            return;
+        }
+        let old = std::mem::replace(&mut self.mode, mode);
         self.sync_queue_to_mode(old);
     }
 
@@ -232,6 +319,33 @@ impl Player {
 
     pub fn prev(&mut self, library: &Library) {
         self.advance(library, -1);
+    }
+
+    /// What a previous-track button does in most players: a press part-way
+    /// through a track restarts it, and a press at the start steps back a
+    /// track.
+    ///
+    /// Since the restart leaves playback at zero, a run of presses walks back
+    /// through the queue one track at a time — first press to the top of this
+    /// one, then one track per press after that — with no timing to get right.
+    ///
+    /// Returns `true` if playback moved to a different track.
+    pub fn restart_or_previous(&mut self, library: &Library) -> bool {
+        // Nothing has been handed to mpv yet — a queue restored from disk has
+        // no "beginning of this track" to return to, so the press should move.
+        if !self.playback_started {
+            self.prev(library);
+            return true;
+        }
+
+        let ast = self.audio.state();
+        if should_step_back(ast.elapsed, ast.loading) {
+            self.prev(library);
+            true
+        } else {
+            self.seek_to(0.0);
+            false
+        }
     }
 
     /// Call once per tick. Advances (or replays, in `Single` mode) when the
@@ -337,7 +451,9 @@ impl Player {
             return;
         };
         self.playing = Some(track);
-        if let Some(video_id) = library.track(track.0, track.1).and_then(|t| t.video_id.as_deref())
+        if let Some(video_id) = library
+            .track(track.0, track.1)
+            .and_then(|t| t.video_id.as_deref())
         {
             self.prefetch(video_id);
         }
@@ -405,7 +521,10 @@ impl Player {
         let Some(&(pl, next_song)) = self.queue.get(next_pos) else {
             return;
         };
-        if let Some(id) = library.track(pl, next_song).and_then(|t| t.video_id.as_deref()) {
+        if let Some(id) = library
+            .track(pl, next_song)
+            .and_then(|t| t.video_id.as_deref())
+        {
             self.prefetch(id);
         }
     }
@@ -426,5 +545,44 @@ impl Player {
                 .iter()
                 .position(|&(p, s)| p == song_pl && s == song);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the decision is tested here: building a [`Player`] would boot
+    /// libmpv, which is not something a unit test should need.
+    #[test]
+    fn a_press_part_way_through_restarts_the_track() {
+        assert!(!should_step_back(61.5, false));
+        // The boundary belongs to the restart, so the window reads as the
+        // half-open [0, 3s) the constant describes.
+        assert!(!should_step_back(RESTART_WINDOW_SECS, false));
+    }
+
+    #[test]
+    fn a_press_at_the_start_steps_back_a_track() {
+        assert!(should_step_back(0.0, false));
+        assert!(should_step_back(RESTART_WINDOW_SECS - 0.001, false));
+    }
+
+    /// The point of the whole thing: the restart leaves playback at zero, so
+    /// the press after it steps back — and so does the one after that, however
+    /// long the user takes over it.
+    #[test]
+    fn every_press_after_the_restart_steps_back_again() {
+        assert!(!should_step_back(48.0, false)); // press 1 — restarts
+        assert!(should_step_back(0.0, false)); // press 2 — back a track
+        assert!(should_step_back(0.0, false)); // press 3 — back another
+    }
+
+    /// A track change leaves the audio thread a tick behind in reporting the
+    /// new position, so without this a fast press would read the *old* track's
+    /// elapsed and restart instead of stepping back.
+    #[test]
+    fn a_track_still_loading_counts_as_the_start() {
+        assert!(should_step_back(203.0, true));
     }
 }

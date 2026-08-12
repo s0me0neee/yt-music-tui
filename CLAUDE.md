@@ -13,7 +13,11 @@ cargo test <name>    # run a single test by name
 
 cargo test -p lrclib -- --ignored   # the live lrclib.net API tests
 cargo test -p ytm-core translate -- --ignored   # the live translation tests
+cargo test -p ytm-core mpris -- --ignored       # needs a session D-Bus
 ```
+
+While the app is running, `playerctl -p ytm status|metadata|play-pause` talks to it, and
+`dbus-monitor "type='signal',path='/org/mpris/MediaPlayer2'"` shows what it emits.
 
 ### Linking libmpv
 
@@ -72,23 +76,59 @@ tui/        the ratatui frontend — single `ytm` binary
   playlist's tracks back over an `mpsc` channel as they arrive.
 - **`playback.rs`** — `AudioEngine` owns an in-process **libmpv** instance (`libmpv2`) on its
   own thread, plus an `Arc<Mutex<AudioState>>` snapshot. `AudioState::elapsed` is the live
-  playback position, fed by an mpv `time-pos` property observer.
+  playback position, fed by an mpv `time-pos` property observer. `audio-client-name` is set
+  to `ytm` so PipeWire/PulseAudio lists the app under its own name in the system mixer
+  rather than as "mpv".
 - **`player.rs`** — `Player`: queue, play modes, volume/mute, song-end advance.
 - **`lyrics.rs`** — policy over `lrclib`. `LyricsService::best_for` layers `/get` (exact, has
   duration, returns one) over `/search` (returns many, ignores duration), preferring synced
   over plain; `rank` does duration-proximity scoring client-side. `spawn_best`/`spawn_choices`
   do the fetching in background tokio tasks.
-- **`translate.rs`** — policy over the `rust-translate` crate, which wraps Google's public
-  `translate_a/single` endpoint. Two of the crate's flaws are handled here, and both are
-  silent if they aren't: it interpolates the text straight into the URL (a lyric with `&`,
-  `#` or `%` in it comes back mangled — hence `percent_encode`), and it returns only the
-  *first segment* of the reply, dropping everything past the first full stop. So a reply is
-  only used when it can be proved complete — one line back per line sent. `translate_lines`
-  probes with the first batch: whole ⇒ the rest of the song goes the same way (Japanese
-  sources come back in one piece, so a song is a couple of requests); short ⇒ re-fetched a
-  sentence at a time via `sentence_pieces`, which the endpoint cannot segment further.
-  Blank and repeated lines are never sent, so a chorus costs one request. Returns one entry
-  per input line, empty where nothing could be translated.
+- **`translate.rs`** — two backends behind one `translate_lines`, chosen by `Backend`.
+  `lyrics.ai-translation = false` (the default) is the **free path**, described below and
+  unchanged from before the AI backend existed. `true` routes to **`translate/llm.rs`**,
+  which sends the whole song to the Messages API in one request with no pre-processing: a
+  model that sees every line reads a sentence spanning several of them by itself. Alignment
+  is enforced rather than hoped for, and `place` checks it twice: the reply is constrained
+  to one `{index, source, text}` per line sent, so a dropped, repeated or out-of-range line
+  is an error rather than a silent shift; and each entry's `source` — the model's verbatim
+  copy of the line it is translating — is compared against what actually went out, which
+  catches the case the index set can't, a reply of the right length and numbering whose text
+  has slipped a line. Writing the line out before translating it also keeps the model on
+  *that* line, so the drift the echo detects happens less to begin with. The prompt names
+  the target language rather than coding it: asked for `zh`, Haiku answers in *English*
+  three times out of three, hence `language_name`. Blank and repeated lines are never sent,
+  so a chorus is translated once and its repeats agree by construction. Measured over three
+  runs of a 40-line song, Haiku 4.5 costs 0.67¢ (the `usage` line in `app.log` says what
+  each one actually cost); against a hand-translated record it beat the free path on 53% of
+  lines and lost on 2%. Any failure — rate limit, spent balance, bad model id, either
+  alignment check — logs and falls through to the free path, so the feature never
+  disappears, only its quality changes.
+
+  The free path is policy over the `rust-translate` crate, which wraps Google's public
+  `translate_a/single`. Two of the crate's flaws are handled here and both are silent if
+  they aren't: it interpolates text straight into the URL (a lyric containing `&`, `#` or
+  `%` comes back mangled — hence `percent_encode`), and it returns only the *first segment*
+  of the reply, dropping everything past the first full stop. So a reply is used only when
+  it can be *proved* complete — one line back per line sent. `translate_distinct` probes
+  with the first batch: whole ⇒ the rest of the song goes the same way (Japanese comes back
+  in one segment, so a song is a couple of requests); short ⇒ re-fetched a sentence at a
+  time via `sentence_pieces`, which the endpoint cannot segment further. Blank and repeated
+  lines are never sent, so a chorus costs one request. Returns one entry per input line,
+  empty where nothing could be translated.
+- **`mpris.rs`** — MPRIS2 over the session D-Bus, via `mpris-server`. This is what makes the
+  keyboard's media keys work *and* what lists the app as a player in GNOME/KDE: both grab
+  `XF86Audio*` globally and forward to whoever owns an `org.mpris.MediaPlayer2.*` bus name,
+  so the TUI grabs no keys itself — it could not under Wayland anyway. Same shape as
+  `playback.rs`: an `Arc<Mutex<NowPlaying>>` the D-Bus tasks read, plus an `mpsc` of
+  `MediaCmd` the event loop drains, since `Player` is not shared. `MediaControls::update` is
+  called every tick but only emits `PropertiesChanged` on an actual change; `Position` is
+  never among them, deliberately — the spec keeps it out and has clients poll it, with
+  `Seeked` (emitted on a position jump larger than a tick can explain) as the only push.
+  MPRIS splits looping and shuffle where `PlayMode` fuses them, so `LoopStatus::None` is
+  answered as `Playlist`: this player always wraps. No session bus (ssh, headless) ⇒ `new`
+  returns `None` with a log line and nothing else changes. Linux-only; other targets get a
+  same-shaped stub so `app.rs` needs no `cfg`.
 - **`persistence.rs`** — `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID).
 - **`config.rs`** — `config.toml`, the hand-edited settings, read once at startup. Every
@@ -96,6 +136,14 @@ tui/        the ratatui frontend — single `ytm` binary
   log warning, so a typo can never stop playback. `lyrics.offset` shifts every lyric line
   against the record's timings (negative = early, positive = late); it is applied by
   shifting the clock handed to `active_index`/`next_boundary`, never the cached records.
+  `lyrics.ai-translation` is the one switch: `false` (the default) is the free translator,
+  so nothing is ever billed or sent to an API unasked, and an unconfigured install behaves
+  exactly as it did before that backend existed. `lyrics.ai-model` and `lyrics.ai-key-env`
+  default to something usable (`"claude-haiku-4-5"`, `"ANTHROPIC_API_KEY"`), so flipping the
+  flag is the only edit needed. The key variable is *named* rather than the key being stored,
+  so `config.toml` stays safe to copy around. `validated` turns the flag back off when the
+  model is blank or no key is found — a half-finished setup falls back to the free path
+  instead of failing on every song.
   `lyrics.translate-to` is the language `i` translates into (`"zh"`, `"fr"`, …); it is
   checked against the endpoint's own list at startup and cleared if unknown, because an
   unknown code is answered with the input unchanged rather than an error. Empty (the
@@ -136,8 +184,10 @@ tui/        the ratatui frontend — single `ytm` binary
     as the one line it is; the active line's own highlight deliberately stays on the words
     alone. A line whose translation is blank, or identical to the original, gets no row at
     all. Cached per **lrclib record id**, not per video — a translation belongs to the
-    words, so `c` gets one of its own and two tracks on the same record share one. `i`
-    twice is the retry after a failure.
+    words, so `c` gets one of its own and two tracks on the same record share one. The
+    cache holds `MAX_TRANSLATIONS` records for the session, oldest evicted first, so
+    skipping back to a song doesn't pay for it twice. `i` twice is the retry after a
+    failure.
   - **Wrapping** (`wrap_n_lines`) measures display *cells*, not `char`s: a CJK lyric is two
     cells per character and would otherwise run to twice the panel width and be clipped.
 
@@ -157,7 +207,7 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `/` | Enter filter mode (songs or queue panel) |
 | `Esc` | Re-centre lyrics → close lyrics → clear filter → back to playlists → quit |
 | `Space` | Pause / resume |
-| `p` / `n` | Previous / next in queue |
+| `p` / `n` | Previous / next in queue — `p` past 3 s into a track restarts it, at the start it goes back one. Since the restart leaves playback at zero, a run of presses walks back a track at a time, untimed (`Player::restart_or_previous`, shared with the MPRIS `Previous` key) |
 | `←` / `→` | Seek −5s / +5s |
 | `↑` / `↓` | Volume +5 / −5 |
 | `m` | Mute / unmute |
@@ -188,8 +238,9 @@ main.rs
   └─ library::spawn_library_fetch()   └─ App::run()
        (tokio tasks → mpsc)                └─ event_loop
                                                 ├─ drain_song_channel / drain_lyrics
-                                                │  / drain_translations
+                                                │  / drain_translations / drain_media
                                                 ├─ render
+                                                ├─ update_media → MPRIS → D-Bus
                                                 └─ Player → AudioEngine → libmpv
 ```
 
@@ -204,11 +255,26 @@ Do not bump `lrclib` to 0.13 casually — it would add a second HTTP stack plus 
 C build (needs cc + cmake). Verify with `cargo tree -i aws-lc-sys` (should report *not found*).
 Note 0.12 has no `query` feature; `.query()` is unconditional there.
 
-`rust-translate 0.1.3` brings no HTTP stack of its own — its `reqwest 0.12.4` resolves to the
-0.12 already in the graph. It does ask for tokio's `full` feature set, which unifies across
-the workspace; that costs build time, nothing at runtime. Its API is three free async
-functions and a language list; see `ytm-core/src/translate.rs` for what it gets wrong.
+**`mpris-server 0.10`** is a Linux-only target dependency, so Windows and macOS builds never
+see zbus at all. Its `tokio` feature matters more than it looks: zbus picks a reactor by
+asking `Handle::try_current()` *while the connection is being built*, so `Server::new` has to
+be called from inside the runtime (`MediaControls::new` uses `Handle::block_on` for exactly
+this) or it silently starts a second, async-io driver thread. `async-io` is compiled either
+way — mpris-server depends on zbus with default features, and features unify — which costs
+build time only. zbus 5 shares nothing with the reqwest 0.12 stack; `cargo tree -i aws-lc-sys`
+still reports *not found*.
+
+`rust-translate 0.1.3` is the free path's transport, and the source of `supported_languages`
+that `normalise_language` checks `lyrics.translate-to` against. It brings no HTTP stack of its
+own — its `reqwest 0.12.4` resolves to the 0.12 already in the graph. It does ask for tokio's
+`full` feature set, which unifies across the workspace; that costs build time, nothing at
+runtime. See `ytm-core/src/translate.rs` for what it gets wrong and how that is handled.
+
+The AI path in `translate/llm.rs` calls the Anthropic Messages API over the workspace's own
+`reqwest` — no SDK, since there is no official Rust one, and no new HTTP stack. `cargo tree -i
+aws-lc-sys` still reports *not found*.
 
 Key deps: `ratatui 0.30`, `ytmusicapi 0.4.2`, `libmpv2 6`, `reqwest 0.12`, `thiserror 1`,
+`mpris-server 0.10` (Linux only),
 `rust-translate 0.1.3`, `ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.8`,
 `throbber-widgets-tui 0.11`.

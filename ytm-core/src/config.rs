@@ -31,6 +31,17 @@ pub const TEMPLATE: &str = "\
 # Press `i` in the lyrics panel to turn it on and off. Empty means the key
 # does nothing, which is the default — translation is never fetched unasked.
 #translate-to = \"\"
+# Translate with Claude instead of the free endpoint. The whole song goes in
+# one request, so a sentence spanning several lyric lines is read as a sentence
+# — the free endpoint splits on newlines and cannot. Costs roughly a cent per
+# song, charged to your own API key. false (the default) is the free translator,
+# which costs nothing and sends nothing to any API.
+#ai-translation = false
+# Which model, when the above is on.
+#ai-model = \"claude-haiku-4-5\"
+# Environment variable holding the Anthropic API key. The key itself is never
+# read from this file, so config.toml stays safe to copy around.
+#ai-key-env = \"ANTHROPIC_API_KEY\"
 
 [auth]
 # Renew an expired session by re-running yt-dlp against the browser below,
@@ -92,7 +103,7 @@ impl Default for Auth {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Lyrics {
     /// Seconds to shift every lyric line by. Negative is early, positive late.
@@ -105,6 +116,67 @@ pub struct Lyrics {
     /// Normalised by [`Config::validated`] to the spelling the endpoint uses,
     /// and cleared if it isn't a language the endpoint knows.
     pub translate_to: String,
+    /// Translate with Claude instead of the free endpoint. `false` — the
+    /// default — is the original behaviour in every respect: the `rust-translate`
+    /// path, no API key, nothing billed, nothing sent to any API.
+    ///
+    /// Turned off again by [`Config::validated`] when no API key can be found,
+    /// so a half-finished setup falls back rather than failing on every song.
+    pub ai_translation: bool,
+    /// Claude model to translate with. Only consulted when
+    /// [`Self::ai_translation`] is on.
+    pub ai_model: String,
+    /// Environment variable holding the Anthropic API key. Named here rather
+    /// than holding the key itself, so `config.toml` stays safe to share and
+    /// the secret lives wherever the user already keeps secrets.
+    pub ai_key_env: String,
+}
+
+impl Default for Lyrics {
+    fn default() -> Self {
+        Self {
+            offset: 0.0,
+            translate_to: String::new(),
+            // Off, so the default install behaves exactly as it did before this
+            // backend existed. The model and key-variable names default to
+            // something usable, so turning the flag on is the only edit needed.
+            ai_translation: false,
+            ai_model: "claude-haiku-4-5".to_string(),
+            ai_key_env: "ANTHROPIC_API_KEY".to_string(),
+        }
+    }
+}
+
+impl Lyrics {
+    /// The API key, read from the environment variable [`Self::ai_key_env`]
+    /// names. `None` when unset or blank.
+    #[must_use]
+    pub fn ai_key(&self) -> Option<String> {
+        let name = self.ai_key_env.trim();
+        if name.is_empty() {
+            return None;
+        }
+        std::env::var(name).ok().filter(|k| !k.trim().is_empty())
+    }
+
+    /// The translator this configuration selects.
+    ///
+    /// AI only when a model is named *and* its key was found — the two are
+    /// checked together so a partial setup silently uses the free endpoint
+    /// instead of failing on every song.
+    #[must_use]
+    pub fn backend(&self) -> crate::translate::Backend {
+        crate::translate::Backend {
+            to: self.translate_to.clone(),
+            ai: self
+                .ai_key()
+                .filter(|_| self.ai_translation && !self.ai_model.is_empty())
+                .map(|api_key| crate::translate::Ai {
+                    model: self.ai_model.clone(),
+                    api_key,
+                }),
+        }
+    }
 }
 
 impl Config {
@@ -171,6 +243,30 @@ impl Config {
                 String::new()
             }
         };
+
+        // A model with no key behind it would fail on the first lyric and keep
+        // failing, so it is turned off here instead — the free endpoint still
+        // works, and the log says why the better one isn't being used.
+        self.lyrics.ai_model = self.lyrics.ai_model.trim().to_string();
+        if self.lyrics.ai_translation {
+            if self.lyrics.ai_model.is_empty() {
+                log::warn!("config: lyrics.ai-translation is on but ai-model is empty — off");
+                self.lyrics.ai_translation = false;
+            } else if self.lyrics.ai_key().is_some() {
+                log::info!(
+                    "config: lyrics.ai-translation on, {:?} (key from ${})",
+                    self.lyrics.ai_model,
+                    self.lyrics.ai_key_env
+                );
+            } else {
+                log::warn!(
+                    "config: lyrics.ai-translation is on but ${} is empty or unset — \
+                     falling back to the free translator",
+                    self.lyrics.ai_key_env
+                );
+                self.lyrics.ai_translation = false;
+            }
+        }
 
         self
     }
@@ -257,6 +353,51 @@ mod tests {
         toml::from_str::<Config>(src)
             .expect("valid toml")
             .validated()
+    }
+
+    // ── ai translation ────────────────────────────────────────────────────
+
+    #[test]
+    fn ai_translation_is_off_unless_asked_for() {
+        // The whole point of the flag: an install nobody has configured behaves
+        // exactly as it did before the backend existed, and bills nothing.
+        assert!(!parse("").lyrics.ai_translation);
+        assert!(!parse("[lyrics]\n").lyrics.ai_translation);
+        assert!(!Config::default().lyrics.ai_translation);
+        assert!(!parse(TEMPLATE).lyrics.ai_translation);
+    }
+
+    #[test]
+    fn the_flag_alone_is_enough_to_turn_it_on() {
+        // Model and key-variable names default to something usable, so nobody
+        // has to name a model to get started.
+        let lyrics = parse("[lyrics]\nai-translation = true\n").lyrics;
+        assert_eq!(lyrics.ai_model, "claude-haiku-4-5");
+        assert_eq!(lyrics.ai_key_env, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn the_flag_off_means_the_free_backend_whatever_else_is_set() {
+        // Independent of the environment: with the flag off, no key is even
+        // looked for, so a key lying around in the shell can't switch backends.
+        let lyrics =
+            parse("[lyrics]\nai-translation = false\nai-model = \"claude-opus-5\"\n").lyrics;
+        assert!(lyrics.backend().ai.is_none());
+    }
+
+    #[test]
+    fn an_empty_model_turns_the_flag_back_off() {
+        let lyrics = parse("[lyrics]\nai-translation = true\nai-model = \"\"\n").lyrics;
+        assert!(!lyrics.ai_translation);
+        assert!(lyrics.backend().ai.is_none());
+    }
+
+    #[test]
+    fn a_key_variable_that_names_nothing_yields_no_key() {
+        let lyrics =
+            parse("[lyrics]\nai-translation = true\nai-key-env = \"YTM_NO_SUCH_VAR_XYZ\"\n").lyrics;
+        assert!(lyrics.ai_key().is_none());
+        assert!(lyrics.backend().ai.is_none());
     }
 
     #[test]
