@@ -2,8 +2,8 @@
 name = "yt-music-tui"
 version = "0.1.0"
 edition = "2024"
-#WARN:remove secret and clientid when puslished, and publish in a new repo to pervent history leak
-#
+repository = "https://github.com/s0me0neee/yt-music-tui.git"
+
 [[bin]]
 name = "ytm"
 path = "src/main.rs"
