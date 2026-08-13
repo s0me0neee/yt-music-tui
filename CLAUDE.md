@@ -241,6 +241,9 @@ tui/        the ratatui frontend — single `ytm` binary
   which model answered, and nothing is written when that model is *empty*: an `I` request
   the free endpoint ended up answering is not what `I` bought, so it is dropped and `I` gets
   another go at the model. Capped at `MAX_SAVED_TRANSLATIONS`, oldest written evicted first.
+  Keyed by record alone, since a translation belongs to the words — so `App::retranslate`
+  clears it only when `I`'s own translation is the one on screen. `r` under the free one
+  re-fetches the free one and leaves what was paid for where it is.
 - **`config.rs`** — `config.toml`, the hand-edited settings, read once at startup. Every
   value has a working default and a missing or malformed file falls back to those with a
   log warning, so a typo can never stop playback. Because it *is* hand-edited, the reading

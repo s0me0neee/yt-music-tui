@@ -2032,11 +2032,15 @@ impl App {
             self.notify("Already translating…");
             return;
         }
-        let (record_id, _) = key;
+        let (record_id, ai) = key;
         self.translations.remove(&key);
         self.translation_order.retain(|&k| k != key);
-        // Nothing on disk for the free translator, so this is a no-op there.
-        if self.saved_translations.remove(record_id) {
+        // Only where the model's own translation is the one being thrown away.
+        // `translations.json` is keyed by record alone — a translation belongs
+        // to the words — so forgetting it from under the *free* translation
+        // would discard what `I` was charged for, to redo a translation that
+        // costs nothing. The next `I` would then buy it again.
+        if ai && self.saved_translations.remove(record_id) {
             self.save_translations();
         }
         self.lyrics_rows = None;
