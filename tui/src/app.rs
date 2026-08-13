@@ -3282,13 +3282,15 @@ impl App {
             return;
         };
 
-        // A square of cells: they are about twice as tall as wide, so a cover
-        // `n` columns across needs `n / 2` rows. Bounded by both, and by a
-        // ceiling — a cover taller than the column leaves nothing for the text.
-        let side = u16::min(body.width.saturating_sub(2), (body.height / 2).max(1) * 2);
-        let side = side.min(MAX_COVER_COLS) / 2 * 2; // even, so the halves land on cells
-        let (cover_w, cover_h) = (side, side / 2);
-        let can_draw = self.covers_enabled && cover_w >= 8 && body.height > cover_h + 4;
+        // A square of *pixels*, which is not a fixed number of rows: how tall a
+        // cell is compared to how wide is the terminal's business, and assuming
+        // it is exactly twice is what left covers stretched. `square_cells`
+        // asks. The room left for the words is the other bound — a cover taller
+        // than half the column leaves nothing to put under it.
+        let max_cols = body.width.saturating_sub(2).min(MAX_COVER_COLS);
+        let max_rows = (body.height / 2).min(body.height.saturating_sub(4));
+        let (cover_w, cover_h) = kitty::square_cells(max_cols, max_rows);
+        let can_draw = self.covers_enabled && cover_w >= 8 && cover_h >= 1;
 
         // The words, built before anything is placed: the card is centred as a
         // whole, so where the cover goes depends on how many lines follow it.
@@ -3545,31 +3547,38 @@ impl App {
         // to do it — below this the list is worth more than the picture.
         const COVER_COLS: u16 = 20;
         let show_cover = self.covers_enabled && body.width > COVER_COLS + 30 && body.height >= 12;
-        let (list_area, cover_area) = if show_cover {
+        let (list_area, column) = if show_cover {
             let [list, gap, cover] = body.layout(&Layout::horizontal([
                 Constraint::Fill(1),
                 Constraint::Length(2),
                 Constraint::Length(COVER_COLS),
             ]));
             let _ = gap;
-            // Square-ish: cells are about twice as tall as they are wide.
-            let side = Rect {
-                height: (COVER_COLS / 2).min(cover.height),
-                ..cover
-            };
-            (list, Some(side))
+            (list, Some(cover))
         } else {
             (body, None)
         };
+        // Square in pixels rather than in some assumed ratio of cells, and
+        // centred in its column since it may be narrower than one.
+        let cover_area = column.and_then(|column| {
+            let (w, h) = kitty::square_cells(COVER_COLS, (COVER_COLS / 2).min(column.height));
+            (w > 0 && h > 0).then(|| Rect {
+                x: column.x + column.width.saturating_sub(w) / 2,
+                width: w,
+                height: h,
+                ..column
+            })
+        });
         self.cover_target =
             cover_area.and_then(|rect| Some((search.selected()?.video_id.clone(), rect)));
 
-        // The details under the cover, which the image must not overlap.
-        if let (Some(cover), Some(hit)) = (cover_area, search.selected()) {
+        // The details under the cover, which the image must not overlap. Full
+        // column width, whatever the picture above them came to.
+        if let (Some(column), Some(cover), Some(hit)) = (column, cover_area, search.selected()) {
             let below = Rect {
                 y: cover.y + cover.height + 1,
                 height: body.height.saturating_sub(cover.height + 1),
-                ..cover
+                ..column
             };
             if below.height > 0 {
                 // Centred under the cover, as the now-playing card is: the art

@@ -63,6 +63,47 @@ pub fn cell_size() -> (u32, u32) {
     }
 }
 
+/// The cell box, within `max_cols` × `max_rows`, whose **pixels** come closest
+/// to square — and the largest such box where several are equally close.
+///
+/// A terminal cell is not square and is not reliably twice as tall as it is
+/// wide either. Reserving `n` columns by `n / 2` rows and calling it a square
+/// is therefore a guess, and the terminal scales the image to fill exactly the
+/// cells it is given: on a cell of 9×20 that guess is 216 pixels across by 240
+/// down, and a cover drawn in it is stretched 11% vertically. Which is what
+/// "slightly stretched" looks like.
+///
+/// So the box is chosen against the cell size the terminal actually reports.
+/// Whole cells are all that can be reserved, so an exact square is not always
+/// reachable — the scan gives up columns to get closer, since a cover a couple
+/// of columns narrower is not something anyone can see, and one that is
+/// visibly taller than it is wide is.
+#[must_use]
+pub fn square_cells(max_cols: u16, max_rows: u16) -> (u16, u16) {
+    square_cells_for(max_cols, max_rows, cell_size())
+}
+
+fn square_cells_for(max_cols: u16, max_rows: u16, (cell_w, cell_h): (u32, u32)) -> (u16, u16) {
+    let mut best = (0, 0);
+    let mut best_err = f64::INFINITY;
+    // Downwards, so the largest of several equally square boxes is the one
+    // that gets in first and the comparison below can demand an improvement.
+    for cols in (1..=max_cols).rev() {
+        let across = f64::from(u32::from(cols) * cell_w);
+        let rows = (across / f64::from(cell_h)).round().max(1.0);
+        if rows > f64::from(max_rows) {
+            continue;
+        }
+        let down = rows * f64::from(cell_h);
+        let err = (across - down).abs() / across.max(down);
+        if err < best_err {
+            best = (cols, rows as u16);
+            best_err = err;
+        }
+    }
+    best
+}
+
 /// Whether this terminal speaks the kitty graphics protocol.
 ///
 /// Kitty itself, and the two other terminals that implement it. Ghostty sets
@@ -140,8 +181,13 @@ impl Canvas {
         // old one has to go first, or both are on screen at once.
         self.delete();
 
+        // Shaped to the box, not fitted inside it. The terminal scales what it
+        // is given to fill `area` exactly, so an image of any other shape
+        // arrives stretched by the difference — and a 16:9 video thumbnail is
+        // squashed into the square rather than sitting in a band across the
+        // middle of it.
         let (cell_w, cell_h) = cell_size();
-        let scaled = cover.scaled(
+        let scaled = cover.filling(
             u32::from(area.width) * cell_w,
             u32::from(area.height) * cell_h,
         );
@@ -261,6 +307,64 @@ mod tests {
         // A move counts as a change, not just a different id.
         let moved = Rect::new(2, 1, 10, 5);
         assert!(!canvas.shown.as_ref().is_some_and(|(_, r)| *r == moved));
+    }
+
+    /// The pixel dimensions of a cell box, for asserting on its shape.
+    fn px(cols: u16, rows: u16, (cell_w, cell_h): (u32, u32)) -> (u32, u32) {
+        (u32::from(cols) * cell_w, u32::from(rows) * cell_h)
+    }
+
+    #[test]
+    fn a_box_of_cells_is_square_in_pixels() {
+        // The ordinary case, where a cell really is twice as tall as it is
+        // wide and the old `cols / 2` was right.
+        assert_eq!(square_cells_for(24, 12, (10, 20)), (24, 12));
+
+        // The case that was stretched: 24 columns by 12 rows of these is 216
+        // across and 240 down, an 11% difference nobody asked for. Giving up
+        // four columns buys an exact square.
+        let cell = (9, 20);
+        let (cols, rows) = square_cells_for(24, 12, cell);
+        let (w, h) = px(cols, rows, cell);
+        assert_eq!(w, h, "{cols}x{rows} cells is {w}x{h} px");
+
+        // A HiDPI cell, where the ratio is 2.2 rather than 2.
+        let cell = (20, 44);
+        let (cols, rows) = square_cells_for(24, 12, cell);
+        assert_eq!(px(cols, rows, cell).0, px(cols, rows, cell).1);
+    }
+
+    #[test]
+    fn an_odd_cell_gets_as_close_to_square_as_whole_cells_allow() {
+        // 13x30 has no exact square inside 24x12 — 30/13 columns per row is
+        // not a whole number anywhere in range — so the best available is
+        // taken instead of a wrong one.
+        let cell = (13, 30);
+        let (cols, rows) = square_cells_for(24, 12, cell);
+        let (w, h) = px(cols, rows, cell);
+        let err = f64::from(w.abs_diff(h)) / f64::from(w.max(h));
+        assert!(err < 0.05, "{cols}x{rows} is {w}x{h} px, {err:.3} out");
+    }
+
+    #[test]
+    fn a_box_never_exceeds_what_it_was_offered() {
+        for cell in [(10, 20), (9, 20), (20, 44), (13, 30), (6, 13)] {
+            for (max_cols, max_rows) in [(24, 12), (20, 10), (8, 3), (40, 40)] {
+                let (cols, rows) = square_cells_for(max_cols, max_rows, cell);
+                assert!(
+                    cols <= max_cols && rows <= max_rows,
+                    "{cols}x{rows} {cell:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_room_means_no_cover() {
+        // Nothing fits, and the caller draws the words alone rather than a
+        // one-row smear of album art.
+        assert_eq!(square_cells_for(24, 0, (10, 20)), (0, 0));
+        assert_eq!(square_cells_for(0, 12, (10, 20)), (0, 0));
     }
 
     #[test]

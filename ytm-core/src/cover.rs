@@ -145,7 +145,52 @@ impl Cover {
         let ratio = ratio.min(f64::from(max_h) / f64::from(self.height));
         let width = ((f64::from(self.width) * ratio).round() as u32).max(1);
         let height = ((f64::from(self.height) * ratio).round() as u32).max(1);
+        self.resampled(width, height)
+    }
 
+    /// A copy with the *shape* of `box_w × box_h`, as large as the source
+    /// allows.
+    ///
+    /// Fills rather than fits: a 16:9 video thumbnail put in a square box is
+    /// squashed into it rather than letterboxed inside it, which is what the
+    /// panel wants — the box is a fixed part of the layout and a picture
+    /// floating in the middle of it with empty bands above and below reads as
+    /// a mistake.
+    ///
+    /// Only the shape is guaranteed, not the size: nothing is ever *enlarged*
+    /// here, since sending a terminal more pixels than the source had is
+    /// bandwidth spent inventing detail. Matching the box's shape exactly is
+    /// what matters, because the terminal scales whatever it is given to fill
+    /// the cells it was told to fill — an image of any other shape arrives
+    /// stretched.
+    #[must_use]
+    pub fn filling(&self, box_w: u32, box_h: u32) -> Cover {
+        if box_w == 0 || box_h == 0 || self.width == 0 || self.height == 0 {
+            return self.clone();
+        }
+        // The box's shape at the largest size neither axis has to be invented
+        // for: shrink the wider-in-proportion axis to the source, not past it.
+        let scale = f64::min(
+            f64::from(self.width) / f64::from(box_w),
+            f64::from(self.height) / f64::from(box_h),
+        )
+        .min(1.0);
+        let width = ((f64::from(box_w) * scale).round() as u32).max(1);
+        let height = ((f64::from(box_h) * scale).round() as u32).max(1);
+        self.resampled(width, height)
+    }
+
+    /// This cover at exactly `width` × `height`, each axis scaled on its own.
+    ///
+    /// Box-averaged: every destination pixel is the mean of the source pixels
+    /// it covers, which is what keeps an edge smooth where point sampling
+    /// would drop most of them. Enlarging works but repeats pixels — callers
+    /// avoid asking.
+    #[must_use]
+    fn resampled(&self, width: u32, height: u32) -> Cover {
+        if width == 0 || height == 0 || self.width == 0 || self.height == 0 {
+            return self.clone();
+        }
         let mut rgb = Vec::with_capacity((width * height * 3) as usize);
         for y in 0..height {
             // The source rows this destination row averages over.
@@ -185,10 +230,17 @@ pub struct CoverMsg {
 /// Fetches and decodes one cover in the background, sized to be drawn at
 /// `draw_px` — the largest square, in pixels, the caller will ever put it in.
 ///
-/// It comes back already scaled to that, rather than at the size fetched: the
+/// It comes back already squared to that, rather than at the size fetched: the
 /// downscale is the same box-average the drawing would do anyway, and doing it
 /// here does it once, off the UI thread, and leaves the caller holding the
 /// pixels it can show instead of the four times as many it asked the CDN for.
+///
+/// Squared with [`Cover::filling`] rather than fitted, and that is the half
+/// worth stating: a video's thumbnail arrives 16:9 and the panel draws it in a
+/// square either way, so fitting it here would hold a 240×135 strip and leave
+/// the terminal to stretch it back up to 240 — a picture softer than the one
+/// that arrived, for no saving. Squashing while the full-size original is
+/// still in hand keeps every axis at the resolution it is drawn at.
 ///
 /// Failures are reported rather than retried: a cover that doesn't arrive
 /// costs a blank square, and the panel it decorates is still fully usable.
@@ -201,7 +253,7 @@ pub fn spawn_fetch(
 ) {
     let url = at_size(&url, fetch_px(draw_px));
     handle.spawn(async move {
-        let result = fetch(&url).await.map(|c| c.scaled(draw_px, draw_px));
+        let result = fetch(&url).await.map(|c| c.filling(draw_px, draw_px));
         if let Err(e) = &result {
             log::debug!("cover: {video_id} failed ({e})");
         }
@@ -340,6 +392,52 @@ mod tests {
         assert_eq!(small.rgb[0], 1);
         // Second spans 4..8 → (4+5+6+7)/4 = 5.
         assert_eq!(small.rgb[3], 5);
+    }
+
+    // ── filling a box, which is what a cover is actually drawn into ────────
+
+    #[test]
+    fn a_video_thumbnail_is_squashed_into_the_square_rather_than_banded() {
+        // 16:9, which is what a video result carries where a song carries
+        // album art. Fitted inside the square it would sit in a band across
+        // the middle of a box the layout has already reserved.
+        let out = ramp(480, 270).filling(240, 240);
+        assert_eq!((out.width, out.height), (240, 240));
+        assert_eq!(out.rgb.len(), 240 * 240 * 3);
+    }
+
+    #[test]
+    fn a_square_cover_stays_square() {
+        let out = ramp(480, 480).filling(240, 240);
+        assert_eq!((out.width, out.height), (240, 240));
+    }
+
+    #[test]
+    fn the_shape_is_the_boxs_whatever_the_source_was() {
+        // The property the terminal cares about: it scales what it is given to
+        // fill the cells it was told to fill, so anything other than the box's
+        // own shape arrives stretched by the difference.
+        for (w, h) in [(480, 270), (270, 480), (480, 480), (100, 400)] {
+            let out = ramp(w, h).filling(240, 120);
+            assert_eq!(
+                out.width * 120,
+                out.height * 240,
+                "{w}x{h} came out {}x{}",
+                out.width,
+                out.height
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_smaller_than_the_box_is_not_enlarged_to_fit_it() {
+        // Sending more pixels than arrived is bandwidth spent on detail that
+        // was never there; the terminal can scale up by itself.
+        let out = ramp(120, 120).filling(240, 240);
+        assert_eq!((out.width, out.height), (120, 120));
+        // Still the box's shape, just smaller.
+        let out = ramp(120, 120).filling(240, 120);
+        assert_eq!((out.width, out.height), (120, 60));
     }
 
     #[test]
