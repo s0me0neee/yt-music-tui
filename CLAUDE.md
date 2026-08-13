@@ -310,6 +310,13 @@ tui/        the ratatui frontend — single `ytm` binary
     the right direction to be wrong in when the failure mode is base64 sprayed across the
     screen. `q=2` on every escape suppresses the terminal's reply, which crossterm would
     otherwise read as keypresses.
+  - **Fitting** (`fit_meta`) is the one rule for a title with metadata after it: the title
+    has first claim on the width, each following field takes what is left, and anything cut
+    is marked `…`. Used by the songs list, the queue, the search results and the player bar,
+    because a `Table` otherwise clips at the column edge — mid-word, and mid-*character* on a
+    CJK title, with nothing to show that anything was lost. The width each list can offer is
+    computed from its own columns (`track_text_width` and friends) rather than guessed, so
+    the ellipsis lands exactly where the clip used to.
   - **Wrapping** (`wrap_n_lines`) measures display *cells*, not `char`s: a CJK lyric is two
     cells per character and would otherwise run to twice the panel width and be clipped.
 

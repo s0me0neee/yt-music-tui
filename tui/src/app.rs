@@ -307,6 +307,38 @@ fn wrap_n_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     result
 }
 
+/// A title with metadata after it, fitted to `budget` display cells.
+///
+/// The title has first claim; each field after it takes what is left, in
+/// order, and anything cut is marked with `…`. Without this a `Table` clips
+/// the row at the column edge instead — which cuts mid-word, and with a CJK
+/// title mid-character, so a row ends in a half-drawn glyph and no sign that
+/// anything is missing.
+fn fit_meta(
+    title: &str,
+    title_style: Style,
+    rest: &[(String, Style)],
+    budget: usize,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(truncate_line(title, budget), title_style)];
+    let mut used = width_of(title).min(budget);
+    for (text, style) in rest {
+        if text.is_empty() {
+            continue;
+        }
+        let left = budget.saturating_sub(used + width_of(SEP));
+        // Below this there is room for the separator and an ellipsis and
+        // nothing else, which says less than stopping does.
+        if left <= 3 {
+            break;
+        }
+        spans.push(Span::styled(SEP, theme::DIM));
+        spans.push(Span::styled(truncate_line(text, left), *style));
+        used += width_of(SEP) + width_of(text).min(left);
+    }
+    spans
+}
+
 /// Truncates to `max` display cells, appending `…`. Measured in cells rather
 /// than chars so wide (CJK, emoji) titles don't over-run their column.
 fn truncate_line(text: &str, max: usize) -> String {
@@ -336,6 +368,16 @@ fn truncate_line(text: &str, max: usize) -> String {
 /// as `70:11` and clipped anything over 100 minutes.
 fn fmt_secs(secs: f64) -> String {
     fmt_duration(secs.max(0.0) as u64)
+}
+
+/// The same, rounded rather than truncated.
+///
+/// For a *total* that is what the rest of the UI already shows: YouTube gives
+/// whole seconds, mpv gives the real length, and truncating 191.6s printed
+/// `3:11` under a list that said `3:12`. Elapsed still truncates — a clock
+/// should not reach `0:01` before the first second is out.
+fn fmt_secs_rounded(secs: f64) -> String {
+    fmt_duration(secs.max(0.0).round() as u64)
 }
 
 fn fmt_duration(secs: u64) -> String {
@@ -2967,6 +3009,9 @@ impl App {
             return;
         }
 
+        // Cursor gutter, column spacing and the count column, as in the track
+        // lists — a playlist name is no more readable clipped than a title is.
+        let name_w = (list_body(body, count).width as usize).saturating_sub(2 + 1 + 4);
         let rows: Vec<Row> = self
             .library
             .entries()
@@ -2976,7 +3021,7 @@ impl App {
                 let playing = self.player.playing().is_some_and(|(pl, _)| pl == i);
                 Row::new([
                     Cell::from(Span::styled(
-                        entry.playlist.title.clone(),
+                        truncate_line(&entry.playlist.title, name_w),
                         if playing {
                             theme::PLAYING
                         } else {
@@ -3040,8 +3085,10 @@ impl App {
             query.push(Span::styled("█", theme::WARN));
         }
         if !search.results.is_empty() {
+            // `  ·  ` like every other section status, rather than a bare gap.
+            query.push(Span::styled(SEP, theme::DIM));
             query.push(Span::styled(
-                format!("  {} results", search.results.len()),
+                format!("{} results", search.results.len()),
                 theme::DIM,
             ));
         }
@@ -3135,60 +3182,68 @@ impl App {
                 ..cover
             };
             if below.height > 0 {
-                let mut lines = vec![Line::styled(
-                    truncate_line(&hit.title, below.width as usize),
-                    theme::PRIMARY,
-                )];
+                // Centred under the cover, as the now-playing card is: the art
+                // is the only thing here with a shape, so the words sit with it.
+                let mut lines = vec![
+                    Line::styled(
+                        truncate_line(&hit.title, below.width as usize),
+                        theme::PRIMARY,
+                    )
+                    .centered(),
+                ];
                 for (text, style) in [
                     (hit.artist.clone(), theme::META),
                     (hit.album.clone(), theme::DIM),
                 ] {
                     if !text.is_empty() {
-                        lines.push(Line::styled(
-                            truncate_line(&text, below.width as usize),
-                            style,
-                        ));
+                        lines.push(
+                            Line::styled(truncate_line(&text, below.width as usize), style)
+                                .centered(),
+                        );
                     }
                 }
                 let (marker, style) = kind_marker(hit.kind);
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled(marker.trim().to_string(), style),
-                    Span::styled(
-                        if hit.duration.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  {}", hit.duration)
-                        },
-                        theme::DIM,
-                    ),
-                ]));
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(marker.trim().to_string(), style),
+                        Span::styled(
+                            if hit.duration.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{SEP}{}", hit.duration)
+                            },
+                            theme::DIM,
+                        ),
+                    ])
+                    .centered(),
+                );
                 // Only when it isn't obvious from the marker: an art track is
                 // the catalogue audio, which is not what "video" promises.
                 if hit.kind == ResultKind::Video {
-                    lines.push(Line::styled("audio only", theme::DIM));
+                    lines.push(Line::styled("audio only", theme::DIM).centered());
                 }
                 frame.render_widget(Paragraph::new(lines), below);
             }
         }
 
+        // Cursor gutter, two column gaps, the kind marker and the duration.
+        let text_w = (list_body(list_area, search.results.len()).width as usize)
+            .saturating_sub(2 + 7 + 1 + 7 + 1);
         let rows: Vec<Row> = search
             .results
             .iter()
             .map(|hit| {
                 let (marker, marker_style) = kind_marker(hit.kind);
-                let mut spans = vec![Span::styled(
-                    truncate_line(&hit.title, (list_area.width / 2) as usize),
+                let spans = fit_meta(
+                    &hit.title,
                     theme::PRIMARY,
-                )];
-                if !hit.artist.is_empty() {
-                    spans.push(Span::styled(SEP, theme::DIM));
-                    spans.push(Span::styled(hit.artist.clone(), theme::META));
-                }
-                if !hit.album.is_empty() {
-                    spans.push(Span::styled(SEP, theme::DIM));
-                    spans.push(Span::styled(hit.album.clone(), theme::DIM));
-                }
+                    &[
+                        (hit.artist.clone(), theme::META),
+                        (hit.album.clone(), theme::DIM),
+                    ],
+                    text_w,
+                );
                 Row::new(vec![
                     Cell::from(Line::styled(marker, marker_style)),
                     Cell::from(Line::from(spans)),
@@ -3335,7 +3390,8 @@ impl App {
             if self.filter_mode {
                 spans.push(Span::styled("█", theme::WARN));
             }
-            spans.push(Span::styled(format!("  {shown}/{total}"), theme::DIM));
+            spans.push(Span::styled(SEP, theme::DIM));
+            spans.push(Span::styled(format!("{shown}/{total}"), theme::DIM));
             return Some(Line::from(spans));
         }
         (total > 0).then(|| Line::styled(format!("{total}"), theme::DIM))
@@ -3349,6 +3405,7 @@ impl App {
         number: usize,
         num_w: usize,
         playing: bool,
+        width: usize,
     ) -> Row<'static> {
         let title = track
             .and_then(|t| t.title.as_deref())
@@ -3359,19 +3416,19 @@ impl App {
         let mut spans = vec![
             Span::styled(if playing { "♫ " } else { "  " }, theme::PLAYING),
             Span::styled(format!("{number:>num_w$}  "), theme::DIM),
-            Span::styled(
-                title,
-                if playing {
-                    theme::PLAYING
-                } else {
-                    theme::PRIMARY
-                },
-            ),
         ];
-        if !artists.is_empty() {
-            spans.push(Span::styled(SEP, theme::DIM));
-            spans.push(Span::styled(artists, theme::META));
-        }
+        // What the marker and the number have already taken.
+        let budget = width.saturating_sub(num_w + 4);
+        spans.extend(fit_meta(
+            &title,
+            if playing {
+                theme::PLAYING
+            } else {
+                theme::PRIMARY
+            },
+            &[(artists, theme::META)],
+            budget,
+        ));
 
         Row::new([
             Cell::from(Line::from(spans)),
@@ -3387,6 +3444,13 @@ impl App {
 
     /// Column widths shared by both track lists. `8` fits `1:02:03`.
     const TRACK_COLS: [Constraint; 2] = [Constraint::Fill(1), Constraint::Length(8)];
+
+    /// Cells left for a track row's text, once the cursor gutter, the column
+    /// spacing and the duration have taken theirs. Computed rather than
+    /// guessed, so the ellipsis lands exactly where the clip used to.
+    fn track_text_width(area: Rect) -> usize {
+        (area.width as usize).saturating_sub(2 + 1 + 8)
+    }
 
     fn track_table(rows: Vec<Row<'static>>, focused: bool) -> Table<'static> {
         Table::new(rows, Self::TRACK_COLS)
@@ -3503,6 +3567,9 @@ impl App {
             spans.push(Span::styled(format!("offset {offset}"), theme::WARN));
             spans.push(Span::styled(SEP, theme::DIM));
         }
+        // An em-dash, not the `·` separator: the record's title and artist are
+        // one field between them, and `·` is what divides fields from each
+        // other. Flattening the two reads as four peers instead of three.
         spans.push(Span::styled(
             format!("{} — {}", found.track_name, found.artist_name),
             theme::DIM,
@@ -3849,6 +3916,9 @@ impl App {
 
         let playing = self.player.playing();
         let num_w = all_songs.len().to_string().len();
+        // The scrollbar takes two columns when the list overflows, so the
+        // width a row may use depends on how many rows there are.
+        let width = Self::track_text_width(list_body(body, filtered.len()));
         let rows: Vec<Row> = filtered
             .iter()
             .map(|&i| {
@@ -3857,6 +3927,7 @@ impl App {
                     i + 1,
                     num_w,
                     current_pl.map(|pl| (pl, i)) == playing,
+                    width,
                 )
             })
             .collect();
@@ -3918,6 +3989,7 @@ impl App {
         }
 
         let num_w = queue.len().to_string().len();
+        let width = Self::track_text_width(list_body(body, filtered.len()));
         let rows: Vec<Row> = filtered
             .iter()
             .map(|&q_pos| {
@@ -3927,6 +3999,7 @@ impl App {
                     q_pos + 1,
                     num_w,
                     Some(q_pos) == queue_pos,
+                    width,
                 )
             })
             .collect();
@@ -4000,22 +4073,16 @@ impl App {
                 },
             )];
             let budget = left.width.saturating_sub(2) as usize;
-            spans.push(Span::styled(
-                truncate_line(&title_text, budget),
+            spans.extend(fit_meta(
+                &title_text,
                 if ast.paused {
                     theme::DIM
                 } else {
                     theme::PRIMARY
                 },
+                &[(artist_text.unwrap_or_default(), theme::META)],
+                budget,
             ));
-            if let Some(artist) = &artist_text {
-                let used = width_of(&title_text).min(budget);
-                let rest = budget.saturating_sub(used + SEP.len());
-                if rest > 3 {
-                    spans.push(Span::styled(SEP, theme::DIM));
-                    spans.push(Span::styled(truncate_line(artist, rest), theme::META));
-                }
-            }
             Line::from(spans)
         };
 
@@ -4087,7 +4154,7 @@ impl App {
             let s = track.artist_names();
             (!s.is_empty()).then_some(s)
         };
-        (title, artist, fmt_secs(ast.elapsed), fmt_secs(ast.total))
+        (title, artist, fmt_secs(ast.elapsed), fmt_secs_rounded(ast.total))
     }
 }
 
@@ -4698,6 +4765,78 @@ mod tests {
             let text: String = shown.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.contains('?'), "no `?` in 80 columns: {text:?}");
         }
+    }
+
+    #[test]
+    fn a_row_that_fits_is_left_whole() {
+        let spans = fit_meta("Echo", theme::PRIMARY, &[("Crusher-P".into(), theme::META)], 40);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Echo  ·  Crusher-P");
+    }
+
+    #[test]
+    fn a_row_that_does_not_fit_says_so_rather_than_stopping_mid_word() {
+        // What a `Table` does instead is clip at the column edge, which with a
+        // CJK title cuts a character in half.
+        let spans = fit_meta(
+            "Once Upon A Time (Melodic House & Techno Extended Mix)",
+            theme::PRIMARY,
+            &[("Max Oazo".into(), theme::META)],
+            20,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(width_of(&text), 20);
+        assert!(text.ends_with('…'), "{text:?}");
+    }
+
+    #[test]
+    fn the_title_has_first_claim_and_the_rest_take_what_is_left() {
+        let spans = fit_meta(
+            "Echo",
+            theme::PRIMARY,
+            &[("Crusher-P".into(), theme::META), ("An Album".into(), theme::DIM)],
+            24,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        // Title and artist whole; the album is what gets cut.
+        assert!(text.starts_with("Echo  ·  Crusher-P"), "{text:?}");
+        assert!(width_of(&text) <= 24, "{text:?} is {}", width_of(&text));
+    }
+
+    #[test]
+    fn a_field_with_no_room_left_is_dropped_whole() {
+        // Four cells of ellipsis and separator would say less than nothing.
+        let spans = fit_meta("Echo", theme::PRIMARY, &[("Crusher-P".into(), theme::META)], 8);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Echo");
+    }
+
+    #[test]
+    fn an_empty_field_costs_no_separator() {
+        let spans = fit_meta("Echo", theme::PRIMARY, &[(String::new(), theme::META)], 40);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Echo", "a track with no artist gets no dangling `·`");
+    }
+
+    #[test]
+    fn a_wide_title_is_measured_in_cells() {
+        // Eight CJK characters are sixteen cells, so half of them fit in ten.
+        let spans = fit_meta("君の名前を呼ぶよ", theme::PRIMARY, &[], 10);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(width_of(&text) <= 10, "{text:?} is {}", width_of(&text));
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn a_total_is_rounded_and_an_elapsed_is_not() {
+        // mpv reports the real length; the track list shows YouTube's whole
+        // seconds. Truncating printed 3:11 under a list that said 3:12.
+        assert_eq!(fmt_secs_rounded(191.6), "3:12");
+        assert_eq!(fmt_secs(191.6), "3:11");
+        // A clock must not reach 0:01 before the first second is out.
+        assert_eq!(fmt_secs(0.9), "0:00");
+        assert_eq!(fmt_secs_rounded(0.0), "0:00");
+        assert_eq!(fmt_secs_rounded(-5.0), "0:00");
     }
 
     #[test]
