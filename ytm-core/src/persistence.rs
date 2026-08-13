@@ -158,6 +158,13 @@ impl Translations {
         (entry.language == language).then_some(entry.lines.as_slice())
     }
 
+    /// Saves one, replacing whatever this record had before.
+    ///
+    /// One entry per record, whichever model or provider produced it — which
+    /// is what makes a redo a *replacement* and a changed `ai-model` a
+    /// translation the app keeps rather than a second copy to pay for. The
+    /// model is recorded for the log and for a reader of the file; it is not
+    /// part of the key.
     pub fn set(&mut self, record_id: u64, language: &str, model: &str, lines: Vec<String>) {
         self.entries.insert(
             record_id.to_string(),
@@ -169,12 +176,6 @@ impl Translations {
             },
         );
         self.evict();
-    }
-
-    /// Forgets one, so the next `I` buys another — what `r` does with a
-    /// translation you don't like. `true` if there was one to forget.
-    pub fn remove(&mut self, record_id: u64) -> bool {
-        self.entries.remove(&record_id.to_string()).is_some()
     }
 
     /// Drops the oldest until the file is back under the cap.
@@ -535,14 +536,28 @@ mod tests {
     }
 
     #[test]
-    fn r_forgets_one_and_leaves_the_rest() {
+    fn a_record_holds_one_translation_whichever_model_made_it() {
+        // What `r` does: the redo's answer replaces what was there, so the
+        // next session loads the new one. And a model swapped in `config.toml`
+        // overwrites rather than accumulating a copy per model.
         let mut saved = Translations::default();
-        saved.set(7, "zh", "claude-haiku-4-5", lines());
-        saved.set(8, "zh", "claude-haiku-4-5", lines());
-        assert!(saved.remove(7));
-        assert!(!saved.remove(7));
-        assert!(saved.get(7, "zh").is_none());
-        assert!(saved.get(8, "zh").is_some());
+        saved.set(7, "zh", "deepseek-chat", lines());
+        saved.set(8, "zh", "deepseek-chat", lines());
+
+        let redone = vec!["\u{4e09}".to_string(), "\u{56db}".to_string()];
+        saved.set(7, "zh", "claude-haiku-4-5", redone.clone());
+        assert_eq!(saved.len(), 2, "one entry per record, not per model");
+        assert_eq!(saved.get(7, "zh").unwrap(), redone);
+        assert_eq!(saved.get(8, "zh").unwrap(), lines());
+    }
+
+    #[test]
+    fn a_model_the_config_no_longer_names_is_still_a_hit() {
+        // A translation belongs to the words, so switching provider does not
+        // re-bill a library that has already been translated.
+        let mut saved = Translations::default();
+        saved.set(7, "zh", "deepseek-chat", lines());
+        assert_eq!(saved.get(7, "zh").unwrap(), lines());
     }
 
     #[test]

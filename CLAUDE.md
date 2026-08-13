@@ -235,15 +235,22 @@ tui/        the ratatui frontend — single `ytm` binary
   number across: `build_queue_state` drops an entry with no video id and `try_restore` drops
   one whose playlist is gone — the synthetic search playlist, every time — and
   `follow_position` applies the same rule `Player::remap_refs` does, or the queue comes back
-  playing a song it wasn't on. Only the AI ones: the free endpoint costs nothing but
-  a wait, so `i` asks again each session and its translation can improve, while `I` reuses
-  what it bought. The entry records the language — a changed `translate-to` is a miss — and
-  which model answered, and nothing is written when that model is *empty*: an `I` request
-  the free endpoint ended up answering is not what `I` bought, so it is dropped and `I` gets
-  another go at the model. Capped at `MAX_SAVED_TRANSLATIONS`, oldest written evicted first.
-  Keyed by record alone, since a translation belongs to the words — so `App::retranslate`
-  clears it only when `I`'s own translation is the one on screen. `r` under the free one
-  re-fetches the free one and leaves what was paid for where it is.
+  playing a song it wasn't on.
+
+  `translations.json` holds **one translation per lrclib record**, and the rules around it
+  are all consequences of that. *Only the AI ones are in it*: the free endpoint costs
+  nothing but a wait, so `i` asks again each session and its translation can improve, while
+  `I` reuses what it bought — and nothing is written when the answering model is *empty*, an
+  `I` request the free endpoint ended up serving being not what `I` bought. *One per record,
+  whichever model made it*: the model is recorded for the log, never keyed on, so swapping
+  `ai-model` or providers costs nothing and cannot accumulate a copy per model. The language
+  is keyed on, since last week's `translate-to` is no use. *A redo replaces rather than
+  clears*: `App::retranslate` forces a fresh request past the cache and lets the answer
+  overwrite the entry when it lands, so a redo that hits a rate limit leaves the paid
+  translation where it was instead of throwing it away and putting nothing in its place.
+  Under the free translator `r` does the same thing minus the disk, since there is nothing
+  of `i`'s down there to replace. Capped at `MAX_SAVED_TRANSLATIONS`, oldest written evicted
+  first.
 - **`config.rs`** — `config.toml`, the hand-edited settings, read once at startup. Every
   value has a working default and a missing or malformed file falls back to those with a
   log warning, so a typo can never stop playback. Because it *is* hand-edited, the reading
@@ -346,8 +353,8 @@ tui/        the ratatui frontend — single `ytm` binary
     belongs to the words, so `c` gets one of its own and two tracks on the same record share
     one. `MAX_TRANSLATIONS` of them for the session, so replaying a song costs nothing
     either way; only the AI ones outlive it, in `translations.json`. Pressing the same key
-    twice is the retry after a failure; `r` throws the translation on screen away — memory
-    and disk both — and fetches another, whichever translator made it.
+    twice is the retry after a failure; `r` fetches another, whichever translator made the
+    one on screen, and the answer replaces what was saved when it arrives.
   - **Search**: `s` opens it — a query line, then results. Songs are listed before videos and
     each row is marked `♪ song` or `▶ video` with its length, because the two are genuinely
     different things and the choice should be deliberate. `↵` plays (through

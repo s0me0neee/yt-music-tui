@@ -1957,6 +1957,12 @@ impl App {
     /// cached or already in flight — the same one-shot shape as
     /// [`Self::ensure_lyrics`], and what makes `i` free to press twice.
     fn ensure_translation(&mut self) {
+        self.fetch_translation(false);
+    }
+
+    /// The same, with `force` skipping what is on disk — a redo asked for a new
+    /// translation, not the one it already has.
+    fn fetch_translation(&mut self, force: bool) {
         if self.translate_mode == TranslateMode::Off || self.config.lyrics.translate_to.is_empty() {
             return;
         }
@@ -1992,8 +1998,11 @@ impl App {
         let backend = self.config.lyrics.backend(ai);
         // Only `I` has anything on disk to find: the free endpoint is re-asked
         // each session, so its translation can improve rather than being kept
-        // for ever.
-        if ai && let Some(done) = self.saved_translations.get(record_id, &backend.to) {
+        // for ever. `force` is a redo, which is asking for a new one.
+        if !force
+            && ai
+            && let Some(done) = self.saved_translations.get(record_id, &backend.to)
+        {
             log::debug!("translate: lrclib #{record_id} came from translations.json");
             self.translations
                 .insert(key, TranslationEntry::Ready(done.to_vec()));
@@ -2020,8 +2029,16 @@ impl App {
         );
     }
 
-    /// `r` in lyrics mode with a translation on screen: forget it, on disk as
-    /// well as in memory, and fetch another.
+    /// `r` in lyrics mode with a translation on screen: fetch another, and let
+    /// it replace what is held.
+    ///
+    /// The saved copy is *replaced* rather than deleted first, which is the
+    /// difference between a redo and a discard: an entry written on arrival
+    /// overwrites the old one, while deleting up front would mean a redo that
+    /// hit a rate limit had thrown away a translation the model was paid for
+    /// and put nothing in its place. Under the free translation there is
+    /// nothing saved either way — `i` is re-asked every session — but the redo
+    /// applies to it just the same.
     fn retranslate(&mut self) {
         let Some(key) = self.current_translation_key() else {
             return;
@@ -2032,20 +2049,11 @@ impl App {
             self.notify("Already translating…");
             return;
         }
-        let (record_id, ai) = key;
         self.translations.remove(&key);
         self.translation_order.retain(|&k| k != key);
-        // Only where the model's own translation is the one being thrown away.
-        // `translations.json` is keyed by record alone — a translation belongs
-        // to the words — so forgetting it from under the *free* translation
-        // would discard what `I` was charged for, to redo a translation that
-        // costs nothing. The next `I` would then buy it again.
-        if ai && self.saved_translations.remove(record_id) {
-            self.save_translations();
-        }
         self.lyrics_rows = None;
         self.notify(format!("Re-translating with {}", self.translator_name()));
-        self.ensure_translation();
+        self.fetch_translation(true);
     }
 
     /// Writes `translations.json`. A failure costs the next session a
