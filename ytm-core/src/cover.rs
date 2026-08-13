@@ -70,6 +70,40 @@ pub fn at_size(url: &str, px: u32) -> String {
     format!("{base}={}", rewritten.join("-"))
 }
 
+/// The full-resolution frame behind a YouTube *video* thumbnail, where one
+/// exists.
+///
+/// [`at_size`] can do nothing for these: a video's thumbnail is served from
+/// `i.ytimg.com` as `hqdefault.jpg?sqp=…`, a signed crop with no size to
+/// rewrite, and it arrives 400×225 — enough on an ordinary terminal, soft on a
+/// HiDPI one where the same box is 640 pixels across. `maxresdefault.jpg` is
+/// the same frame at 1280×720.
+///
+/// It is an *attempt*, though, and the caller falls back: the file only exists
+/// for videos uploaded in HD. Measured across five, three had it and two
+/// answered 404. That is why this returns a candidate rather than a
+/// replacement — a missed guess costs one small request, and getting it costs
+/// three times the detail on every screen that can show it.
+fn hd_variant(url: &str) -> Option<String> {
+    let base = url.split_once('?').map_or(url, |(base, _)| base);
+    let (prefix, name) = base.rsplit_once('/')?;
+    if !prefix.contains("i.ytimg.com/vi") {
+        return None;
+    }
+    // The named sizes YouTube serves, smallest up. Anything else — including
+    // `maxresdefault` itself — is left alone rather than guessed at.
+    const SMALLER: &[&str] = &[
+        "default.jpg",
+        "mqdefault.jpg",
+        "hqdefault.jpg",
+        "sddefault.jpg",
+        "hq720.jpg",
+    ];
+    SMALLER
+        .contains(&name)
+        .then(|| format!("{prefix}/maxresdefault.jpg"))
+}
+
 /// The most a cover response may weigh, and the largest image it may claim to
 /// be.
 ///
@@ -151,18 +185,18 @@ impl Cover {
     /// A copy with the *shape* of `box_w × box_h`, as large as the source
     /// allows.
     ///
-    /// Fills rather than fits: a 16:9 video thumbnail put in a square box is
-    /// squashed into it rather than letterboxed inside it, which is what the
-    /// panel wants — the box is a fixed part of the layout and a picture
-    /// floating in the middle of it with empty bands above and below reads as
-    /// a mistake.
+    /// This is the last step before the terminal, and it exists because of
+    /// what the terminal does: it scales whatever it is handed to fill exactly
+    /// the cells it was told to fill, so an image of any other shape arrives
+    /// stretched by the difference. Where the box was built from the picture's
+    /// own proportions — which is how the panels build one — this changes
+    /// nothing except the last few pixels of rounding.
     ///
     /// Only the shape is guaranteed, not the size: nothing is ever *enlarged*
     /// here, since sending a terminal more pixels than the source had is
-    /// bandwidth spent inventing detail. Matching the box's shape exactly is
-    /// what matters, because the terminal scales whatever it is given to fill
-    /// the cells it was told to fill — an image of any other shape arrives
-    /// stretched.
+    /// bandwidth spent inventing detail it can invent itself. A small
+    /// thumbnail is sent small and scaled up at the far end, which — the shape
+    /// being right — is a clean enlargement rather than a stretch.
     #[must_use]
     pub fn filling(&self, box_w: u32, box_h: u32) -> Cover {
         if box_w == 0 || box_h == 0 || self.width == 0 || self.height == 0 {
@@ -230,17 +264,14 @@ pub struct CoverMsg {
 /// Fetches and decodes one cover in the background, sized to be drawn at
 /// `draw_px` — the largest square, in pixels, the caller will ever put it in.
 ///
-/// It comes back already squared to that, rather than at the size fetched: the
+/// It comes back already scaled to that, rather than at the size fetched: the
 /// downscale is the same box-average the drawing would do anyway, and doing it
 /// here does it once, off the UI thread, and leaves the caller holding the
 /// pixels it can show instead of the four times as many it asked the CDN for.
 ///
-/// Squared with [`Cover::filling`] rather than fitted, and that is the half
-/// worth stating: a video's thumbnail arrives 16:9 and the panel draws it in a
-/// square either way, so fitting it here would hold a 240×135 strip and leave
-/// the terminal to stretch it back up to 240 — a picture softer than the one
-/// that arrived, for no saving. Squashing while the full-size original is
-/// still in hand keeps every axis at the resolution it is drawn at.
+/// The picture keeps its own shape here — `draw_px` bounds it, it does not
+/// describe it. A video's thumbnail is 16:9 and comes back 16:9; what it is
+/// drawn in is the panel's business, and the panel builds a box to match.
 ///
 /// Failures are reported rather than retried: a cover that doesn't arrive
 /// costs a blank square, and the panel it decorates is still fully usable.
@@ -253,11 +284,26 @@ pub fn spawn_fetch(
 ) {
     let url = at_size(&url, fetch_px(draw_px));
     handle.spawn(async move {
-        let result = fetch(&url).await.map(|c| c.filling(draw_px, draw_px));
-        if let Err(e) = &result {
+        let mut got = match hd_variant(&url) {
+            Some(hd) => match fetch(&hd).await {
+                Ok(cover) => Ok(cover),
+                // No HD frame for this one, which is ordinary — the advertised
+                // thumbnail is what the row promised in the first place.
+                Err(e) => {
+                    log::debug!("cover: {video_id} has no maxres frame ({e})");
+                    fetch(&url).await
+                }
+            },
+            None => fetch(&url).await,
+        };
+        got = got.map(|c| c.scaled(draw_px, draw_px));
+        if let Err(e) = &got {
             log::debug!("cover: {video_id} failed ({e})");
         }
-        let _ = tx.send(CoverMsg { video_id, result });
+        let _ = tx.send(CoverMsg {
+            video_id,
+            result: got,
+        });
     });
 }
 
@@ -334,6 +380,40 @@ mod tests {
     }
 
     #[test]
+    fn a_videos_thumbnail_is_asked_for_at_full_resolution() {
+        // What a search row advertises: a signed crop with no size to rewrite,
+        // which arrives 400×225.
+        assert_eq!(
+            hd_variant("https://i.ytimg.com/vi/3UJZ8CndI8Y/hqdefault.jpg?sqp=-oaymwEW&rs=AMzJ")
+                .as_deref(),
+            Some("https://i.ytimg.com/vi/3UJZ8CndI8Y/maxresdefault.jpg")
+        );
+        assert!(hd_variant("https://i.ytimg.com/vi/abc/sddefault.jpg").is_some());
+    }
+
+    #[test]
+    fn nothing_else_is_guessed_at() {
+        // Album art, which `at_size` already handles and which has no
+        // `maxresdefault` to ask for.
+        assert_eq!(
+            hd_variant("https://yt3.googleusercontent.com/abc=w480-h480-l90-rj"),
+            None
+        );
+        // Already the biggest.
+        assert_eq!(
+            hd_variant("https://i.ytimg.com/vi/abc/maxresdefault.jpg"),
+            None
+        );
+        // A name we don't know is not one to replace.
+        assert_eq!(
+            hd_variant("https://i.ytimg.com/vi/abc/oardefault.jpg"),
+            None
+        );
+        assert_eq!(hd_variant("https://example.com/hqdefault.jpg"), None);
+        assert_eq!(hd_variant("nonsense"), None);
+    }
+
+    #[test]
     fn a_size_that_is_not_a_number_is_not_rewritten() {
         // `w` here is part of a word, not a width.
         let url = "https://x/abc=wide-hd-rj";
@@ -397,17 +477,14 @@ mod tests {
     // ── filling a box, which is what a cover is actually drawn into ────────
 
     #[test]
-    fn a_video_thumbnail_is_squashed_into_the_square_rather_than_banded() {
-        // 16:9, which is what a video result carries where a song carries
-        // album art. Fitted inside the square it would sit in a band across
-        // the middle of a box the layout has already reserved.
-        let out = ramp(480, 270).filling(240, 240);
-        assert_eq!((out.width, out.height), (240, 240));
-        assert_eq!(out.rgb.len(), 240 * 240 * 3);
-    }
+    fn a_cover_keeps_its_shape_through_the_box_built_for_it() {
+        // What the panels actually do: a 16:9 thumbnail into a 16:9 box, and
+        // album art into a square one. Neither is distorted, which is the
+        // whole arrangement — the box is built from the picture.
+        let out = ramp(480, 270).filling(320, 180);
+        assert_eq!((out.width, out.height), (320, 180));
+        assert_eq!(out.rgb.len(), 320 * 180 * 3);
 
-    #[test]
-    fn a_square_cover_stays_square() {
         let out = ramp(480, 480).filling(240, 240);
         assert_eq!((out.width, out.height), (240, 240));
     }

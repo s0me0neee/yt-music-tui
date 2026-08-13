@@ -207,18 +207,21 @@ tui/        the ratatui frontend — single `ytm` binary
   search row advertises, and the size asked for is the *terminal's*: `spawn_fetch` takes the
   largest square any panel could draw the cover in, requests twice that (`fetch_px`, floored
   at 480 and capped at 1080 — measured, the CDN serves any size up to 1400 exactly and
-  anything beyond as 1400), and returns it squashed into that square. So what is held in
+  anything beyond as 1400), and returns it scaled to fit that square. So what is held in
   memory is what can be shown, and the 2× is there because the resampling box-averages: 2×2
   source pixels per output pixel is what makes an edge land smoothly rather than being point
   sampled.
-  Squashed rather than fitted, by `Cover::filling`, and that is the difference between a
-  song and a video: the album art a song carries is served square (measured, 480×480), while
-  a video's thumbnail is 16:9 (400×225 from `i.ytimg.com`, a URL `at_size` leaves alone
-  since it carries no resize parameters). The panel draws both in the same square box, so
-  fitting the video would hold a 240×135 strip and leave the terminal to stretch it back to
-  240 — the same picture, 78% taller. `filling` gives the box's *shape* at the largest size
-  neither axis has to be invented for, so nothing is ever enlarged here, and it runs again at
-  draw time against the rectangle the panel actually got.
+  A cover keeps its **own shape** the whole way — `draw_px` bounds it, it does not describe
+  it. Album art is served square (measured, 480×480) and a video's thumbnail is 16:9, and
+  what each is drawn in is the panel's business: `kitty::fit_cells` builds a box to match.
+  Getting a video's *resolution* right needs one more step, since `at_size` can do nothing
+  for it — the row advertises `i.ytimg.com/…/hqdefault.jpg?sqp=…`, a signed crop with no
+  size to rewrite, which arrives 400×225. `hd_variant` asks for `maxresdefault.jpg` instead,
+  the same frame at 1280×720, and falls back to the advertised URL when it 404s: measured
+  over five videos, three had one and two didn't. `Cover::filling` is the last step before
+  the terminal, giving the image the box's exact shape so the terminal's own fill has
+  nothing left to stretch; it never enlarges, since the far end can do that itself and a
+  clean enlargement of the right shape is all that is wanted.
   How big what comes back may be is not the CDN's to decide: the body is read in chunks
   against `MAX_BYTES` rather than with `bytes()`, and `decode` reads the JPEG *header* first
   so a claimed size past `MAX_DECODE_PX` is refused before `width × height × 3` is allocated
@@ -402,14 +405,18 @@ tui/        the ratatui frontend — single `ytm` binary
     unlike the support handshake above it cannot hang — and falls back to 10×20 on a zero, an
     implausible size, or no tty. `App::cover_draw_px` turns that into the pixels the
     now-playing card's `MAX_COVER_COLS`-wide box comes to, which is what gets fetched.
-    The *shape* of that box is the same measurement used the other way round. A cell is not
-    square and is not reliably twice as tall as it is wide either, so `n` columns by `n / 2`
-    rows — which is what both panels reserved — is a square only by luck: on a 9×20 cell it
-    is 216 across by 240 down, and since the terminal scales the image to fill exactly the
-    cells it was given, the cover is stretched 11% vertically. `square_cells` picks the
-    largest box within the offered columns and rows whose *pixels* come closest to square,
-    giving up a column or two where that buys an exact one, and both the card and the search
-    panel lay their covers out with it.
+    The *shape* of that box is the same measurement used the other way round, and
+    `fit_cells` is where both panels get theirs. Two things it settles at once. A cell is
+    not square and is not reliably twice as tall as it is wide either, so `n` columns by
+    `n / 2` rows — which is what both panels reserved — is a square only by luck: on a 9×20
+    cell it is 216 across by 240 down, and since the terminal scales the image to fill
+    exactly the cells it was given, the cover comes out 11% too tall. And a cover is not
+    always square to begin with, so the box is built from the *picture's* proportions rather
+    than an assumed one — `App::cover_aspect` reads them off the cover once it has arrived,
+    and answers square until then, which is what album art is and what the reserved block
+    should look like while it loads. Whole cells rarely divide out exactly, so the largest
+    box within `ASPECT_TOLERANCE` (3%, about nine pixels on a 300-pixel cover) wins rather
+    than the exact one — area is visible where the last few pixels of shape are not.
   - **Fitting** (`fit_meta`) is the one rule for a title with metadata after it: the title
     has first claim on the width, each following field takes what is left, and anything cut
     is marked `…`. Used by the songs list, the queue, the search results and the player bar,

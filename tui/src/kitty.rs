@@ -63,39 +63,60 @@ pub fn cell_size() -> (u32, u32) {
     }
 }
 
-/// The cell box, within `max_cols` × `max_rows`, whose **pixels** come closest
-/// to square — and the largest such box where several are equally close.
+/// How far a box's shape may sit from the picture's before it is worth giving
+/// up space to correct it.
 ///
-/// A terminal cell is not square and is not reliably twice as tall as it is
-/// wide either. Reserving `n` columns by `n / 2` rows and calling it a square
-/// is therefore a guess, and the terminal scales the image to fill exactly the
-/// cells it is given: on a cell of 9×20 that guess is 216 pixels across by 240
-/// down, and a cover drawn in it is stretched 11% vertically. Which is what
-/// "slightly stretched" looks like.
+/// Whole cells are all that can be reserved, so most shapes are not exactly
+/// reachable and something has to give. Three percent of a 300-pixel cover is
+/// nine pixels along one edge — not a thing anyone can see — while dropping
+/// columns until the arithmetic comes out exact costs area that is plainly
+/// visible. So the largest box inside this tolerance wins, and only when
+/// nothing is inside it does the closest one win instead.
+const ASPECT_TOLERANCE: f64 = 0.03;
+
+/// The largest cell box within `max_cols` × `max_rows` whose **pixels** carry
+/// the shape of an `aspect` (width, height) picture.
 ///
-/// So the box is chosen against the cell size the terminal actually reports.
-/// Whole cells are all that can be reserved, so an exact square is not always
-/// reachable — the scan gives up columns to get closer, since a cover a couple
-/// of columns narrower is not something anyone can see, and one that is
-/// visibly taller than it is wide is.
+/// Both halves of that are load-bearing. A terminal cell is not square and is
+/// not reliably twice as tall as it is wide either, so `n` columns by `n / 2`
+/// rows is a square only by luck — on a 9×20 cell it is 216 pixels across by
+/// 240 down, and since the terminal scales the image to fill exactly the cells
+/// it was given, everything in it comes out 11% too tall. And a cover is not
+/// always square to begin with: album art is, a video's thumbnail is 16:9, and
+/// giving the second one the first one's box is what squashes it.
+///
+/// So the box is built from the picture's own shape and the cell size the
+/// terminal reports, and the image is then sent shaped to the box — which,
+/// because the box was built from it, changes nothing about how it looks.
 #[must_use]
-pub fn square_cells(max_cols: u16, max_rows: u16) -> (u16, u16) {
-    square_cells_for(max_cols, max_rows, cell_size())
+pub fn fit_cells(max_cols: u16, max_rows: u16, aspect: (u32, u32)) -> (u16, u16) {
+    fit_cells_for(max_cols, max_rows, aspect, cell_size())
 }
 
-fn square_cells_for(max_cols: u16, max_rows: u16, (cell_w, cell_h): (u32, u32)) -> (u16, u16) {
+fn fit_cells_for(
+    max_cols: u16,
+    max_rows: u16,
+    (aspect_w, aspect_h): (u32, u32),
+    (cell_w, cell_h): (u32, u32),
+) -> (u16, u16) {
+    if aspect_w == 0 || aspect_h == 0 {
+        return (0, 0);
+    }
+    let want = f64::from(aspect_w) / f64::from(aspect_h);
     let mut best = (0, 0);
     let mut best_err = f64::INFINITY;
-    // Downwards, so the largest of several equally square boxes is the one
-    // that gets in first and the comparison below can demand an improvement.
+    // Downwards, so the first box inside the tolerance is the biggest one.
     for cols in (1..=max_cols).rev() {
         let across = f64::from(u32::from(cols) * cell_w);
-        let rows = (across / f64::from(cell_h)).round().max(1.0);
+        let rows = (across / want / f64::from(cell_h)).round().max(1.0);
         if rows > f64::from(max_rows) {
             continue;
         }
         let down = rows * f64::from(cell_h);
-        let err = (across - down).abs() / across.max(down);
+        let err = (across / down - want).abs() / want;
+        if err <= ASPECT_TOLERANCE {
+            return (cols, rows as u16);
+        }
         if err < best_err {
             best = (cols, rows as u16);
             best_err = err;
@@ -314,47 +335,79 @@ mod tests {
         (u32::from(cols) * cell_w, u32::from(rows) * cell_h)
     }
 
-    #[test]
-    fn a_box_of_cells_is_square_in_pixels() {
-        // The ordinary case, where a cell really is twice as tall as it is
-        // wide and the old `cols / 2` was right.
-        assert_eq!(square_cells_for(24, 12, (10, 20)), (24, 12));
-
-        // The case that was stretched: 24 columns by 12 rows of these is 216
-        // across and 240 down, an 11% difference nobody asked for. Giving up
-        // four columns buys an exact square.
-        let cell = (9, 20);
-        let (cols, rows) = square_cells_for(24, 12, cell);
+    /// How far a box's pixels sit from the shape asked for.
+    fn shape_error(cols: u16, rows: u16, (aw, ah): (u32, u32), cell: (u32, u32)) -> f64 {
         let (w, h) = px(cols, rows, cell);
-        assert_eq!(w, h, "{cols}x{rows} cells is {w}x{h} px");
-
-        // A HiDPI cell, where the ratio is 2.2 rather than 2.
-        let cell = (20, 44);
-        let (cols, rows) = square_cells_for(24, 12, cell);
-        assert_eq!(px(cols, rows, cell).0, px(cols, rows, cell).1);
+        let want = f64::from(aw) / f64::from(ah);
+        (f64::from(w) / f64::from(h) - want).abs() / want
     }
 
     #[test]
-    fn an_odd_cell_gets_as_close_to_square_as_whole_cells_allow() {
-        // 13x30 has no exact square inside 24x12 — 30/13 columns per row is
-        // not a whole number anywhere in range — so the best available is
-        // taken instead of a wrong one.
-        let cell = (13, 30);
-        let (cols, rows) = square_cells_for(24, 12, cell);
-        let (w, h) = px(cols, rows, cell);
-        let err = f64::from(w.abs_diff(h)) / f64::from(w.max(h));
-        assert!(err < 0.05, "{cols}x{rows} is {w}x{h} px, {err:.3} out");
+    fn album_art_gets_a_box_that_is_square_in_pixels() {
+        // The ordinary case, where a cell really is twice as tall as it is
+        // wide and the old `cols / 2` was right.
+        assert_eq!(fit_cells_for(32, 16, (1, 1), (10, 20)), (32, 16));
+
+        // The case that came out stretched: 24 columns by 12 rows of a 9x20
+        // cell is 216 across and 240 down, an 11% difference nobody asked for.
+        for cell in [(9, 20), (20, 44), (13, 30), (6, 13)] {
+            let (cols, rows) = fit_cells_for(32, 16, (1, 1), cell);
+            let err = shape_error(cols, rows, (1, 1), cell);
+            let (w, h) = px(cols, rows, cell);
+            assert!(
+                err <= ASPECT_TOLERANCE,
+                "{cell:?}: {w}x{h} px, {err:.3} out"
+            );
+        }
+    }
+
+    #[test]
+    fn a_video_thumbnail_gets_a_box_of_its_own_shape() {
+        // 16:9, which is what a video result carries where a song carries
+        // album art. Given the square one it was squashed into it.
+        for cell in [(10, 20), (9, 20), (20, 44), (13, 30)] {
+            let (cols, rows) = fit_cells_for(32, 16, (16, 9), cell);
+            let err = shape_error(cols, rows, (16, 9), cell);
+            let (w, h) = px(cols, rows, cell);
+            assert!(
+                err <= ASPECT_TOLERANCE,
+                "{cell:?}: {w}x{h} px, {err:.3} out"
+            );
+            // And it is wider than it is tall, which a square box would not be.
+            assert!(w > h, "{cell:?}: {w}x{h} px");
+        }
+    }
+
+    #[test]
+    fn the_box_is_the_biggest_shape_allows_rather_than_the_exact_one() {
+        // Whole cells rarely divide exactly, and dropping columns until they
+        // do costs area that is visible where the last few pixels of shape are
+        // not. 24 columns of a 9x20 cell is 1.8% off square and kept.
+        let (cols, rows) = fit_cells_for(24, 12, (1, 1), (9, 20));
+        assert_eq!((cols, rows), (24, 11));
+        assert!(shape_error(cols, rows, (1, 1), (9, 20)) <= ASPECT_TOLERANCE);
+    }
+
+    #[test]
+    fn a_shape_no_box_can_carry_falls_back_to_the_closest() {
+        // A panoramic cover in a box only six rows tall: nothing inside the
+        // tolerance fits, so the least wrong is taken rather than nothing.
+        let (cols, rows) = fit_cells_for(32, 2, (16, 9), (10, 20));
+        assert!(cols > 0 && rows > 0, "{cols}x{rows}");
+        assert!(rows <= 2);
     }
 
     #[test]
     fn a_box_never_exceeds_what_it_was_offered() {
         for cell in [(10, 20), (9, 20), (20, 44), (13, 30), (6, 13)] {
-            for (max_cols, max_rows) in [(24, 12), (20, 10), (8, 3), (40, 40)] {
-                let (cols, rows) = square_cells_for(max_cols, max_rows, cell);
-                assert!(
-                    cols <= max_cols && rows <= max_rows,
-                    "{cols}x{rows} {cell:?}"
-                );
+            for aspect in [(1, 1), (16, 9), (9, 16), (4, 3)] {
+                for (max_cols, max_rows) in [(32, 16), (24, 12), (20, 10), (8, 3), (40, 40)] {
+                    let (cols, rows) = fit_cells_for(max_cols, max_rows, aspect, cell);
+                    assert!(
+                        cols <= max_cols && rows <= max_rows,
+                        "{cols}x{rows} {cell:?} {aspect:?}"
+                    );
+                }
             }
         }
     }
@@ -363,8 +416,10 @@ mod tests {
     fn no_room_means_no_cover() {
         // Nothing fits, and the caller draws the words alone rather than a
         // one-row smear of album art.
-        assert_eq!(square_cells_for(24, 0, (10, 20)), (0, 0));
-        assert_eq!(square_cells_for(0, 12, (10, 20)), (0, 0));
+        assert_eq!(fit_cells_for(24, 0, (1, 1), (10, 20)), (0, 0));
+        assert_eq!(fit_cells_for(0, 12, (1, 1), (10, 20)), (0, 0));
+        // A picture with no size to speak of, which is not one to lay out.
+        assert_eq!(fit_cells_for(24, 12, (0, 0), (10, 20)), (0, 0));
     }
 
     #[test]

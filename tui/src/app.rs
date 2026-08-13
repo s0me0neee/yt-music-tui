@@ -830,9 +830,9 @@ fn initial_picker_row(items: &[TrackLyrics], on_screen: Option<u64>, overridden:
 const MAX_COVERS: usize = 32;
 
 /// Widest a cover is ever drawn, in cells — the now-playing card's ceiling, and
-/// more than the search panel's 20. It is what a cover is fetched and kept at,
-/// so nothing is held at a size no panel can put on screen.
-const MAX_COVER_COLS: u16 = 24;
+/// more than the search panel's. It is what a cover is fetched and kept at, so
+/// nothing is held at a size no panel can put on screen.
+const MAX_COVER_COLS: u16 = 32;
 
 /// The search panel: a query line, a result list, and optionally the "add to"
 /// popup over the top of it.
@@ -1456,14 +1456,26 @@ impl App {
         Self::cover_draw_px_for(kitty::cell_size())
     }
 
-    /// The square above, for a given cell size. The cover is square and the
-    /// card's box is `MAX_COVER_COLS` wide by half that tall, so whichever axis
-    /// works out to more pixels is what the image has to satisfy.
+    /// The square above, for a given cell size. A cover keeps its own shape, so
+    /// this bounds the longer edge whichever that is: `MAX_COVER_COLS` across
+    /// for a wide picture, the rows that come to for a tall one.
     fn cover_draw_px_for((cell_w, cell_h): (u32, u32)) -> u32 {
         u32::max(
             u32::from(MAX_COVER_COLS) * cell_w,
             u32::from(MAX_COVER_COLS / 2) * cell_h,
         )
+    }
+
+    /// The shape of the cover held for `video_id` — what its box is built from.
+    ///
+    /// Square until the picture arrives, which is right for the album art that
+    /// is most of them and settles by itself for a video's 16:9 thumbnail: the
+    /// card reserves its space either way, so the only thing that moves is the
+    /// reserved block, once, on the frame the image lands.
+    fn cover_aspect(&self, video_id: Option<&str>) -> (u32, u32) {
+        video_id
+            .and_then(|id| self.covers.get(id))
+            .map_or((1, 1), |cover| (cover.width, cover.height))
     }
 
     fn drain_covers(&mut self) {
@@ -3282,14 +3294,14 @@ impl App {
             return;
         };
 
-        // A square of *pixels*, which is not a fixed number of rows: how tall a
-        // cell is compared to how wide is the terminal's business, and assuming
-        // it is exactly twice is what left covers stretched. `square_cells`
-        // asks. The room left for the words is the other bound — a cover taller
-        // than half the column leaves nothing to put under it.
+        // The picture's own shape in the terminal's own cells — see
+        // `kitty::fit_cells`. The rows left for the words are the other bound:
+        // title, artist, album, a rule and the length come to six, plus the
+        // blank row between them and the art.
         let max_cols = body.width.saturating_sub(2).min(MAX_COVER_COLS);
-        let max_rows = (body.height / 2).min(body.height.saturating_sub(4));
-        let (cover_w, cover_h) = kitty::square_cells(max_cols, max_rows);
+        let max_rows = body.height.saturating_sub(7);
+        let aspect = self.cover_aspect(track.video_id.as_deref());
+        let (cover_w, cover_h) = kitty::fit_cells(max_cols, max_rows, aspect);
         let can_draw = self.covers_enabled && cover_w >= 8 && cover_h >= 1;
 
         // The words, built before anything is placed: the card is centred as a
@@ -3545,7 +3557,7 @@ impl App {
 
         // A cover column only where there is a terminal to draw into and room
         // to do it — below this the list is worth more than the picture.
-        const COVER_COLS: u16 = 20;
+        const COVER_COLS: u16 = 24;
         let show_cover = self.covers_enabled && body.width > COVER_COLS + 30 && body.height >= 12;
         let (list_area, column) = if show_cover {
             let [list, gap, cover] = body.layout(&Layout::horizontal([
@@ -3558,10 +3570,12 @@ impl App {
         } else {
             (body, None)
         };
-        // Square in pixels rather than in some assumed ratio of cells, and
-        // centred in its column since it may be narrower than one.
+        // The picture's own shape, and centred in its column since it will
+        // usually be narrower than one. Eight rows are held back for the
+        // details underneath, which are the reason the column exists.
+        let aspect = self.cover_aspect(search.selected().map(|hit| hit.video_id.as_str()));
         let cover_area = column.and_then(|column| {
-            let (w, h) = kitty::square_cells(COVER_COLS, (COVER_COLS / 2).min(column.height));
+            let (w, h) = kitty::fit_cells(COVER_COLS, column.height.saturating_sub(8), aspect);
             (w > 0 && h > 0).then(|| Rect {
                 x: column.x + column.width.saturating_sub(w) / 2,
                 width: w,
@@ -4576,14 +4590,14 @@ mod tests {
 
         #[test]
         fn the_drawn_size_follows_the_terminals_own_cells() {
-            // An ordinary display: a 24×12 card of 10×20 cells is 240px square.
-            assert_eq!(App::cover_draw_px_for((10, 20)), 240);
+            // An ordinary display: 32 columns of 10px cells is 320px across.
+            assert_eq!(App::cover_draw_px_for((10, 20)), 320);
             // A HiDPI one, where the same card is physically the same size but
             // more than twice the pixels — the case a fixed 10×20 got wrong.
-            assert_eq!(App::cover_draw_px_for((20, 44)), 528);
+            assert_eq!(App::cover_draw_px_for((20, 44)), 704);
             // Cells are not always twice as tall as wide, and the axis that
             // needs the most pixels is the one that decides.
-            assert_eq!(App::cover_draw_px_for((16, 24)), 384);
+            assert_eq!(App::cover_draw_px_for((16, 24)), 512);
         }
     }
 
