@@ -416,9 +416,15 @@ mod tests {
             assert_eq!(ResultKind::from_video_type(video), Some(ResultKind::Video));
         }
         // Neither, and not to be guessed at.
-        assert_eq!(ResultKind::from_video_type("MUSIC_VIDEO_TYPE_PODCAST_EPISODE"), None);
+        assert_eq!(
+            ResultKind::from_video_type("MUSIC_VIDEO_TYPE_PODCAST_EPISODE"),
+            None
+        );
         assert_eq!(ResultKind::from_video_type(""), None);
-        assert_eq!(ResultKind::from_video_type("MUSIC_VIDEO_TYPE_SOMETHING_NEW"), None);
+        assert_eq!(
+            ResultKind::from_video_type("MUSIC_VIDEO_TYPE_SOMETHING_NEW"),
+            None
+        );
     }
 
     #[test]
@@ -480,7 +486,11 @@ mod tests {
     #[test]
     fn a_video_rows_view_count_is_not_mistaken_for_an_album() {
         let found = parse(
-            &row("MUSIC_VIDEO_TYPE_UGC", "typing", "some channel • 1.2M views • 3:14"),
+            &row(
+                "MUSIC_VIDEO_TYPE_UGC",
+                "typing",
+                "some channel • 1.2M views • 3:14",
+            ),
             20,
         );
         let hit = &found[0];
@@ -512,7 +522,10 @@ mod tests {
 
     #[test]
     fn the_result_count_is_bounded() {
-        let many = json!(vec![row("MUSIC_VIDEO_TYPE_ATV", "x", "y • z • 1:00"); 50]);
+        let many = json!(vec![
+            row("MUSIC_VIDEO_TYPE_ATV", "x", "y • z • 1:00");
+            50
+        ]);
         assert_eq!(parse(&many, 20).len(), 20);
     }
 
@@ -548,7 +561,10 @@ mod tests {
             assert!(!hit.title.is_empty(), "{hit:?}");
         }
         // Songs carry a duration; that is what the lyrics matcher needs.
-        let songs: Vec<_> = found.iter().filter(|h| h.kind == ResultKind::Song).collect();
+        let songs: Vec<_> = found
+            .iter()
+            .filter(|h| h.kind == ResultKind::Song)
+            .collect();
         assert!(
             songs.iter().all(|h| h.duration_seconds.is_some()),
             "a song came back with no duration"
@@ -560,7 +576,11 @@ mod tests {
     #[test]
     fn a_result_converts_to_a_playable_track() {
         let found = parse(
-            &row("MUSIC_VIDEO_TYPE_ATV", "typing", "ariiol, Kaai Yuki • AREEL • 3:12"),
+            &row(
+                "MUSIC_VIDEO_TYPE_ATV",
+                "typing",
+                "ariiol, Kaai Yuki • AREEL • 3:12",
+            ),
             20,
         );
         let track = found[0].to_track();

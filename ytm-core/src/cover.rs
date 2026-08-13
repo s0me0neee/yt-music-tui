@@ -181,7 +181,10 @@ mod tests {
     #[test]
     fn a_bigger_copy_is_asked_for_by_rewriting_the_size() {
         assert_eq!(
-            at_size("https://yt3.googleusercontent.com/abc=w120-h120-l90-rj", 480),
+            at_size(
+                "https://yt3.googleusercontent.com/abc=w120-h120-l90-rj",
+                480
+            ),
             "https://yt3.googleusercontent.com/abc=w480-h480-l90-rj"
         );
         // The quality and format instructions are not ours to change.
@@ -285,7 +288,12 @@ mod tests {
     async fn live_a_cover_comes_back_bigger_than_advertised() {
         let url = "https://yt3.googleusercontent.com/WS2ZqBCuEsGugI4SFV43J_vtlgl0VHhXImpnOf_63h58UeU3H4HRhVDPuv96zuXE5Io8P3FnfbDmLcJuSQ=w120-h120-l90-rj";
         let cover = fetch(&at_size(url, WANT_PX)).await.expect("fetched");
-        eprintln!("{}x{}, {} bytes", cover.width, cover.height, cover.rgb.len());
+        eprintln!(
+            "{}x{}, {} bytes",
+            cover.width,
+            cover.height,
+            cover.rgb.len()
+        );
         // The row advertised 120px; asking for more is the whole point.
         assert!(cover.width > 120, "got {}px", cover.width);
         assert_eq!(

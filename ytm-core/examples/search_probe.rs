@@ -70,7 +70,9 @@ fn row_text(item: &Value) -> Vec<String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let query = std::env::args().nth(1).unwrap_or_else(|| "echo".to_string());
+    let query = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "echo".to_string());
     let session = Session::new()?;
     let yt = session.build_client()?;
 
@@ -126,7 +128,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for item in items {
             let video_type = first_str(item, "musicVideoType").unwrap_or_else(|| "—".to_string());
             let video_id = first_str(item, "videoId").unwrap_or_else(|| "—".to_string());
-            let short = video_type.trim_start_matches("MUSIC_VIDEO_TYPE_").to_string();
+            let short = video_type
+                .trim_start_matches("MUSIC_VIDEO_TYPE_")
+                .to_string();
             *totals.entry(short.clone()).or_default() += 1;
             let text = row_text(item);
             println!("   [{short:<21}] {video_id:<12} {}", text.join("  ·  "));

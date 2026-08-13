@@ -72,7 +72,11 @@ fn displayed_category(item: &Value) -> Option<String> {
     // `flexColumns` is an *array* of columns; iterate its elements, not it.
     let mut arrays = Vec::new();
     find_all(item, "flexColumns", &mut arrays);
-    let columns: Vec<&Value> = arrays.iter().filter_map(|a| a.as_array()).flatten().collect();
+    let columns: Vec<&Value> = arrays
+        .iter()
+        .filter_map(|a| a.as_array())
+        .flatten()
+        .collect();
     let texts: Vec<String> = columns
         .iter()
         .filter_map(|c| {
@@ -185,7 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut untyped = 0;
     let mut rows = 0;
 
-    for (label, filter) in [("songs", Some(SONGS_FILTER)), ("videos", Some(VIDEOS_FILTER))] {
+    for (label, filter) in [
+        ("songs", Some(SONGS_FILTER)),
+        ("videos", Some(VIDEOS_FILTER)),
+    ] {
         println!("\n═══ {label} filter ═══");
         for query in QUERIES {
             let r = scan(&yt, query, filter).await?;
@@ -222,9 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n═══ displayed category vs parsed type (unfiltered) ═══");
     let mut crosstab: BTreeMap<(String, String), usize> = BTreeMap::new();
     for query in QUERIES {
-        let response = yt
-            .send_request("search", json!({ "query": query }))
-            .await?;
+        let response = yt.send_request("search", json!({ "query": query })).await?;
         let mut items = Vec::new();
         find_all(&response, "musicResponsiveListItemRenderer", &mut items);
         for item in items {
@@ -255,7 +260,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\n═══ verdict ═══");
-    println!("  songs filter: {rows} playable rows across {} queries", QUERIES.len());
+    println!(
+        "  songs filter: {rows} playable rows across {} queries",
+        QUERIES.len()
+    );
     for (kind, n) in &totals {
         println!("    {kind:<24} {n}");
     }

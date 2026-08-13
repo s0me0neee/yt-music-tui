@@ -7,9 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::library::Library;
 use crate::player::TrackRef;
-use crate::session::{
-    lyrics_path, queue_path, settings_path, translations_path, write_private,
-};
+use crate::session::{lyrics_path, queue_path, settings_path, translations_path, write_private};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueEntry {

@@ -106,7 +106,11 @@ impl Canvas {
         }
         // Same picture, same place: the terminal already has it, and resending
         // a megabyte thirty times a second is how a TUI starts to flicker.
-        if self.shown.as_ref().is_some_and(|(s, r)| s == id && *r == area) {
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|(s, r)| s == id && *r == area)
+        {
             return;
         }
         // A different picture, or the same one somewhere else — either way the
@@ -223,7 +227,12 @@ mod tests {
         let mut canvas = Canvas::default();
         let area = Rect::new(1, 1, 10, 5);
         canvas.shown = Some(("abc".to_string(), area));
-        assert!(canvas.shown.as_ref().is_some_and(|(s, r)| s == "abc" && *r == area));
+        assert!(
+            canvas
+                .shown
+                .as_ref()
+                .is_some_and(|(s, r)| s == "abc" && *r == area)
+        );
 
         // A move counts as a change, not just a different id.
         let moved = Rect::new(2, 1, 10, 5);

@@ -437,7 +437,10 @@ mod tests {
         assert_eq!(lib.len(), 2, "the search playlist was created");
         assert!(lib.is_search_playlist(pl));
         assert!(!lib.is_search_playlist(0));
-        assert_eq!(lib.track(pl, song).unwrap().video_id.as_deref(), Some("zzz"));
+        assert_eq!(
+            lib.track(pl, song).unwrap().video_id.as_deref(),
+            Some("zzz")
+        );
         // Born finished: nothing will ever be fetched for it, and an unloaded
         // playlist would leave a restored queue waiting for ever.
         assert!(lib.is_loaded(pl));
