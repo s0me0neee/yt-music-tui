@@ -25,7 +25,12 @@ hotpath = "0.23.1"
 # Profiling — zero overhead unless one of these is enabled.
 #   cargo run --features hotpath            # wall-clock timing
 #   cargo run --features hotpath,hotpath-alloc   # + allocations
+#
+# Each one turns the feature on in `ytm-core` as well as here. Without that the
+# core's own `#[hotpath::measure]` attributes stay inert, and they are on the
+# functions actually worth timing: the yt-dlp resolve, the playlist fetches,
+# the cookie extraction. A profile of the TUI alone shows none of them.
 [features]
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+hotpath = ["hotpath/hotpath", "ytm-core/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "ytm-core/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "ytm-core/hotpath-cpu"]

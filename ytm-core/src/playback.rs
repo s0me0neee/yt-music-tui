@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Format, Mpv};
@@ -181,6 +181,69 @@ const LOAD_FAILED: &[libmpv2::MpvError] = &[
     -17, // MPV_ERROR_UNKNOWN_FORMAT
 ];
 
+// ── the resolved-URL cache ────────────────────────────────────────────────────
+
+/// How long a resolved CDN URL is worth keeping.
+///
+/// YouTube's expire in a few hours, and a stale one costs a failed load plus a
+/// re-resolve — the exact work the cache exists to avoid. An hour is well
+/// inside the window and long enough to cover any listening session.
+const URL_TTL: Duration = Duration::from_secs(3600);
+
+/// How many to hold. Prefetch warms two per j/k keystroke, so without a bound
+/// this grows for as long as the app runs, keeping URLs that expired hours ago.
+const MAX_CACHED_URLS: usize = 64;
+
+/// Resolved CDN URLs, bounded in both size and age.
+#[derive(Default)]
+struct UrlCache {
+    entries: HashMap<String, (Instant, String)>,
+}
+
+impl UrlCache {
+    /// The URL for `id`, if one was resolved recently enough to still work.
+    fn get(&mut self, id: &str) -> Option<String> {
+        let (at, url) = self.entries.get(id)?;
+        if at.elapsed() < URL_TTL {
+            return Some(url.clone());
+        }
+        log::debug!("[audio] cached URL for {id} has aged out");
+        self.entries.remove(id);
+        None
+    }
+
+    /// Whether a *usable* URL is held — the check `Prefetch` makes before
+    /// spending a yt-dlp run.
+    fn has(&mut self, id: &str) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn insert(&mut self, id: String, url: String) {
+        self.entries.insert(id, (Instant::now(), url));
+        if self.entries.len() <= MAX_CACHED_URLS {
+            return;
+        }
+        // Age out whatever has expired first; only if that isn't enough does
+        // the oldest survivor go, which is the least likely to be played next.
+        self.entries.retain(|_, (at, _)| at.elapsed() < URL_TTL);
+        while self.entries.len() > MAX_CACHED_URLS {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(id, (at, _))| (*at, (*id).clone()))
+                .map(|(id, _)| id.clone())
+            else {
+                return;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.entries.remove(id);
+    }
+}
+
 /// Starts a yt-dlp resolve for `id` on its own thread, unless one is already
 /// running. `what` only names the thread, for debuggers and panic messages.
 fn spawn_resolve(
@@ -271,7 +334,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
 
     // ── background URL resolution ─────────────────────────────────────────────
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
-    let mut url_cache: HashMap<String, String> = HashMap::new();
+    let mut url_cache = UrlCache::default();
     let mut fetching: HashSet<String> = HashSet::new();
     let mut pending_resolve: Option<String> = None;
     // Track of the song mpv is loading, so a load failure can be retried once.
@@ -340,7 +403,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                             s.song_ended = false;
                         }
 
-                        if let Some(cached) = url_cache.get(&id).cloned() {
+                        if let Some(cached) = url_cache.get(&id) {
                             log::info!("[audio] Play {id}: cache HIT — instant CDN URL");
                             load_url(&mpv, &cached);
                         } else {
@@ -354,7 +417,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                     }
 
                     Cmd::Prefetch(id) => {
-                        if url_cache.contains_key(&id) || fetching.contains(&id) {
+                        if url_cache.has(&id) || fetching.contains(&id) {
                             continue;
                         }
                         if fetching.len() >= MAX_PREFETCH {
@@ -469,5 +532,70 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
         }
 
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_of(n: usize) -> UrlCache {
+        let mut cache = UrlCache::default();
+        for i in 0..n {
+            cache.insert(format!("id{i}"), format!("https://cdn/{i}"));
+        }
+        cache
+    }
+
+    #[test]
+    fn a_resolved_url_comes_back() {
+        let mut cache = cache_of(1);
+        assert_eq!(cache.get("id0").as_deref(), Some("https://cdn/0"));
+        assert!(cache.get("nothing").is_none());
+        assert!(cache.has("id0"));
+    }
+
+    #[test]
+    fn the_cache_stops_growing() {
+        // j/k warms two URLs a keystroke, so an afternoon of browsing used to
+        // leave thousands here — most of them expired hours earlier.
+        let cache = cache_of(MAX_CACHED_URLS + 50);
+        assert_eq!(cache.entries.len(), MAX_CACHED_URLS);
+    }
+
+    #[test]
+    fn the_oldest_goes_first() {
+        let mut cache = cache_of(MAX_CACHED_URLS);
+        cache.insert("newest".to_string(), "https://cdn/new".to_string());
+        assert_eq!(cache.entries.len(), MAX_CACHED_URLS);
+        assert!(cache.has("newest"), "just resolved, and evicted anyway");
+        assert!(!cache.has("id0"), "the oldest should have gone");
+    }
+
+    #[test]
+    fn a_url_past_its_life_is_not_offered() {
+        // A YouTube CDN URL expires on its own; handing an expired one to mpv
+        // costs a failed load and a re-resolve, which is the work the cache is
+        // supposed to save.
+        let mut cache = UrlCache::default();
+        cache.entries.insert(
+            "stale".to_string(),
+            (
+                Instant::now() - URL_TTL - Duration::from_secs(1),
+                "https://cdn/stale".to_string(),
+            ),
+        );
+        assert!(cache.get("stale").is_none());
+        assert!(!cache.has("stale"));
+        // And it is dropped rather than asked about again.
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn a_url_that_failed_to_play_is_forgotten() {
+        let mut cache = cache_of(2);
+        cache.remove("id0");
+        assert!(!cache.has("id0"));
+        assert!(cache.has("id1"));
     }
 }

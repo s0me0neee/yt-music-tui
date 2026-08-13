@@ -72,15 +72,18 @@ fn main() -> anyhow::Result<()> {
     let yt = Arc::new(yt);
 
     // Spawn per-playlist song fetches in the background so the TUI starts
-    // immediately rather than waiting for all network calls to complete.
-    let songs_rx = library::spawn_library_fetch(rt.handle(), Arc::clone(&yt), &playlists);
+    // immediately rather than waiting for all network calls to complete. The
+    // fetcher outlives them: `r` on a playlist whose fetch failed asks again.
+    let (fetcher, songs_rx) =
+        library::LibraryFetcher::new(rt.handle(), Arc::clone(&yt), &playlists);
 
     let saved_queue = persistence::load_queue();
     let lib = library::Library::new(playlists);
     // Read after `Session::new` has ensured the file exists.
     let config = ytm_core::Config::load();
 
-    let result = app::App::new(lib, saved_queue, songs_rx, rt.handle().clone(), config).run();
+    let result =
+        app::App::new(lib, saved_queue, songs_rx, fetcher, rt.handle().clone(), config).run();
 
     // Wait for cookie refresh before exiting so browser.json is never partial.
     let _ = cookie_refresh.join();

@@ -93,7 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tracks: HashMap<String, ytm_core::Track> = HashMap::new();
     for pl in &playlists {
-        for t in library::get_songs(&yt, &pl.playlist_id).await {
+        // A playlist that couldn't be fetched contributes nothing rather
+        // than looking like one with no tracks in it.
+        for t in library::get_songs(&yt, &pl.playlist_id)
+            .await
+            .unwrap_or_default()
+        {
             if let Some(id) = t.video_id.clone() {
                 tracks.entry(id).or_insert(t);
             }

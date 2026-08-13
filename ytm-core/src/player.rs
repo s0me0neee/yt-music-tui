@@ -29,6 +29,21 @@ fn should_step_back(elapsed: f64, loading: bool) -> bool {
     loading || elapsed < RESTART_WINDOW_SECS
 }
 
+/// `current`, put back into the relative order `saved` had it in.
+///
+/// Split out from [`Player::restore_order`] because constructing a [`Player`]
+/// boots libmpv, which a unit test has no business doing.
+fn reorder_to(saved: &[TrackRef], mut current: Vec<TrackRef>) -> Vec<TrackRef> {
+    let mut out = Vec::with_capacity(current.len());
+    for entry in saved {
+        if let Some(i) = current.iter().position(|e| e == entry) {
+            out.push(current.remove(i));
+        }
+    }
+    out.extend(current); // queued while shuffled — no old place to return to
+    out
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayMode {
     Cycle,
@@ -77,6 +92,10 @@ pub enum RemoveOutcome {
 pub struct Player {
     audio: AudioEngine,
     queue: Vec<TrackRef>,
+    /// The order the queue was in before Shuffle rearranged it, so leaving
+    /// Shuffle can put it back. `None` whenever the queue is already in the
+    /// order the user built.
+    unshuffled: Option<Vec<TrackRef>>,
     queue_pos: Option<usize>,
     mode: PlayMode,
     playing: Option<TrackRef>,
@@ -87,6 +106,10 @@ pub struct Player {
     volume: u8,
     muted: bool,
     pre_mute_vol: u8,
+    /// Bumped on every change to the queue's contents or order. A UI that
+    /// derives something from the queue — the filtered view, say — can tell
+    /// whether its answer still holds without walking the queue to find out.
+    revision: u64,
 }
 
 impl Default for Player {
@@ -102,6 +125,7 @@ impl Player {
         Self {
             audio,
             queue: Vec::new(),
+            unshuffled: None,
             queue_pos: None,
             mode: PlayMode::Cycle,
             playing: None,
@@ -109,6 +133,7 @@ impl Player {
             volume: 80,
             muted: false,
             pre_mute_vol: 80,
+            revision: 0,
         }
     }
 
@@ -124,6 +149,11 @@ impl Player {
 
     pub fn queue_position(&self) -> Option<usize> {
         self.queue_pos
+    }
+
+    /// Changes whenever [`Player::queue`] would return something different.
+    pub fn queue_revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn playing(&self) -> Option<TrackRef> {
@@ -376,6 +406,7 @@ impl Player {
         song_idx: usize,
     ) -> AppendOutcome {
         self.queue.push((pl_idx, song_idx));
+        self.revision += 1;
         let queue_len = self.queue.len();
         log::info!("append_to_queue: pl={pl_idx} song={song_idx} queue_len={queue_len}");
 
@@ -402,6 +433,7 @@ impl Player {
         let was_playing = self.queue_pos == Some(q_pos);
 
         self.queue.remove(q_pos);
+        self.revision += 1;
         log::info!(
             "remove_from_queue: removed q_pos={q_pos} remaining={}",
             self.queue.len()
@@ -443,6 +475,10 @@ impl Player {
     /// play/pause keypress) to actually begin playback.
     pub fn restore(&mut self, library: &Library, queue: Vec<TrackRef>, position: Option<usize>) {
         self.queue = queue;
+        self.revision += 1;
+        // Saved as it was last seen, shuffled or not — that order is the one to
+        // keep, and there is no earlier one to return to.
+        self.unshuffled = None;
         self.queue_pos = position;
         self.playback_started = false;
 
@@ -476,7 +512,12 @@ impl Player {
     fn build_queue(&mut self, library: &Library, pl_idx: usize, start_song: usize) {
         let n = library.songs(pl_idx).len();
         self.queue = (0..n).map(|i| (pl_idx, i)).collect();
+        self.revision += 1;
+        // Whatever order the last queue was in has just been thrown away with
+        // it; this playlist's own is the one to come back to.
+        self.unshuffled = None;
         if matches!(self.mode, PlayMode::Shuffle) {
+            self.unshuffled = Some(self.queue.clone());
             self.queue.shuffle(&mut rand::thread_rng());
         }
         self.queue_pos = self
@@ -530,13 +571,17 @@ impl Player {
     }
 
     /// Called after `self.mode` is updated. Reorders the live queue so that
-    /// Shuffle gives a random order and Cycle/Single give the original index
-    /// order. `queue_pos` is re-pinned to the currently playing song so
-    /// playback state stays consistent.
+    /// Shuffle gives a random order and Cycle/Single give back the order the
+    /// queue had before it. `queue_pos` is re-pinned to the currently playing
+    /// song so playback state stays consistent.
     fn sync_queue_to_mode(&mut self, old_mode: PlayMode) {
+        self.revision += 1;
         match (old_mode, self.mode) {
-            (_, PlayMode::Shuffle) => self.queue.shuffle(&mut rand::thread_rng()),
-            (PlayMode::Shuffle, _) => self.queue.sort_unstable(),
+            (_, PlayMode::Shuffle) => {
+                self.unshuffled = Some(self.queue.clone());
+                self.queue.shuffle(&mut rand::thread_rng());
+            }
+            (PlayMode::Shuffle, _) => self.restore_order(),
             _ => {} // Single <-> Cycle switch doesn't need a reorder
         }
         if let Some((song_pl, song)) = self.playing {
@@ -545,6 +590,26 @@ impl Player {
                 .iter()
                 .position(|&(p, s)| p == song_pl && s == song);
         }
+    }
+
+    /// Puts the queue back the way it was before Shuffle.
+    ///
+    /// Sorting instead — which is what this used to do — quietly rewrote a
+    /// queue built by hand with `a` into playlist-and-track-index order, so
+    /// pressing `t` round the cycle destroyed an order the user had chosen
+    /// deliberately. It also cannot be right across playlists, where the index
+    /// pairs say nothing about the order anything was added in.
+    ///
+    /// The queue can be *edited* while shuffled, so the saved order is a
+    /// guide rather than a replacement: entries still present come back in
+    /// their old relative order, and anything appended since follows in the
+    /// order it was appended. Positions are matched one for one, so a track
+    /// queued twice keeps both of its places.
+    fn restore_order(&mut self) {
+        let Some(saved) = self.unshuffled.take() else {
+            return;
+        };
+        self.queue = reorder_to(&saved, std::mem::take(&mut self.queue));
     }
 }
 
@@ -584,5 +649,49 @@ mod tests {
     #[test]
     fn a_track_still_loading_counts_as_the_start() {
         assert!(should_step_back(203.0, true));
+    }
+
+    // ── leaving shuffle ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_hand_built_queue_comes_back_in_the_order_it_was_built() {
+        // What sorting got wrong: these were appended with `a`, deliberately,
+        // and across playlists — so no ordering of the index pairs is the
+        // user's ordering. Here the sorted answer would be (0,1) first.
+        let built = vec![(2, 7), (0, 1), (1, 4)];
+        let shuffled = vec![(1, 4), (2, 7), (0, 1)];
+        assert_eq!(reorder_to(&built, shuffled), built);
+    }
+
+    #[test]
+    fn a_track_queued_while_shuffled_goes_to_the_end() {
+        // It has no old place to return to, and dropping it would lose a track
+        // the user just queued.
+        let built = vec![(0, 1), (0, 2)];
+        let shuffled = vec![(0, 2), (0, 1), (3, 9)];
+        assert_eq!(reorder_to(&built, shuffled), [(0, 1), (0, 2), (3, 9)]);
+    }
+
+    #[test]
+    fn a_track_removed_while_shuffled_stays_removed() {
+        let built = vec![(0, 1), (0, 2), (0, 3)];
+        let shuffled = vec![(0, 3), (0, 1)];
+        assert_eq!(reorder_to(&built, shuffled), [(0, 1), (0, 3)]);
+    }
+
+    #[test]
+    fn a_track_queued_twice_keeps_both_of_its_places() {
+        // Matched one position for one, so the duplicate isn't collapsed and
+        // the second copy isn't left dangling on the end.
+        let built = vec![(0, 1), (0, 2), (0, 1)];
+        let shuffled = vec![(0, 1), (0, 1), (0, 2)];
+        assert_eq!(reorder_to(&built, shuffled), built);
+    }
+
+    #[test]
+    fn a_queue_that_never_shuffled_is_left_exactly_as_it_is() {
+        let built = vec![(2, 7), (0, 1)];
+        assert_eq!(reorder_to(&built, built.clone()), built);
+        assert!(reorder_to(&[], vec![]).is_empty());
     }
 }

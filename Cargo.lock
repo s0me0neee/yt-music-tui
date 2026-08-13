@@ -1154,33 +1154,6 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hotpath"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "467479f30ae7262ad93eff1f6653a58ecfca4b44dd9ff82ef4b469ba1ad00017"
-dependencies = [
- "arc-swap",
- "cfg-if",
- "crossbeam-channel",
- "flate2",
- "futures-util",
- "hdrhistogram",
- "hotpath-macros 0.19.1",
- "hotpath-meta 0.19.1",
- "libc",
- "object",
- "pin-project-lite",
- "prettytable-rs",
- "quanta",
- "regex",
- "rustc-demangle",
- "serde",
- "serde_json",
- "tiny_http",
- "tokio",
-]
-
-[[package]]
-name = "hotpath"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be80823867e0c9820c9237c38b21f9f4aa1ebb0db1f98ff25ac0b1d2c088a470"
@@ -1191,8 +1164,8 @@ dependencies = [
  "flate2",
  "futures-util",
  "hdrhistogram",
- "hotpath-macros 0.23.1",
- "hotpath-meta 0.23.1",
+ "hotpath-macros",
+ "hotpath-meta",
  "libc",
  "object",
  "pin-project-lite",
@@ -1204,17 +1177,6 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "tokio",
-]
-
-[[package]]
-name = "hotpath-macros"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7edb8da2a00454786fbb75ab24c4f72380afeb9b5136776caa7737df9895bfa7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -1230,24 +1192,9 @@ dependencies = [
 
 [[package]]
 name = "hotpath-macros-meta"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e804ccbbd13922ff16b752ab72043d15ea38411a03a82917b8ea5b36b6b45655"
-
-[[package]]
-name = "hotpath-macros-meta"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "feede71fa226b0b5d523e58e7b0a1462935c0b8a00584a6669f45d564086209d"
-
-[[package]]
-name = "hotpath-meta"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f76b1b9a176e5677878243b0c9052d2e0a62405359bd6990bbd85b59cafa2aa"
-dependencies = [
- "hotpath-macros-meta 0.19.1",
-]
 
 [[package]]
 name = "hotpath-meta"
@@ -1255,7 +1202,7 @@ version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "424fe0a13105d3731f65237785f5b95c3e4b8bfae4a039d932f56192cd74afc0"
 dependencies = [
- "hotpath-macros-meta 0.23.1",
+ "hotpath-macros-meta",
 ]
 
 [[package]]
@@ -4109,7 +4056,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ctrlc",
- "hotpath 0.23.1",
+ "hotpath",
  "log",
  "ratatui",
  "simplelog",
@@ -4124,7 +4071,7 @@ name = "ytm-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
- "hotpath 0.19.1",
+ "hotpath",
  "inquire",
  "libmpv2",
  "log",

@@ -16,7 +16,7 @@ use ratatui::{
 };
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
-use ytm_core::library::SongBatch;
+use ytm_core::library::{LibraryFetcher, SongBatch};
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
 use ytm_core::{
@@ -659,10 +659,20 @@ pub struct App {
     reauth_requested: bool,
     // background song loading
     songs_rx: std::sync::mpsc::Receiver<SongBatch>,
+    /// Kept so `r` can ask again for a playlist whose fetch failed.
+    fetcher: LibraryFetcher,
     pending_queue_restore: Option<QueueState>,
     // filter
     filter: String,
     filter_mode: bool,
+    /// The last answer [`App::filtered_songs`] gave, against the playlist,
+    /// query and song count it was computed for. Rebuilt only when one of
+    /// those changes — it is asked for on every frame, and lowercasing a few
+    /// thousand titles thirty times a second is not free.
+    songs_filter: Option<(usize, String, usize, Vec<usize>)>,
+    /// The same for the queue, keyed by [`Player::queue_revision`] since a
+    /// queue can be reordered without changing length.
+    queue_filter: Option<(u64, String, Vec<usize>)>,
     // hit-test areas for mouse events (updated each frame)
     playlists_area: Rect,
     songs_area: Rect,
@@ -715,6 +725,7 @@ impl App {
         library: Library,
         saved_queue: Option<QueueState>,
         songs_rx: std::sync::mpsc::Receiver<SongBatch>,
+        fetcher: LibraryFetcher,
         rt: tokio::runtime::Handle,
         config: ytm_core::Config,
     ) -> Self {
@@ -747,9 +758,12 @@ impl App {
             notification: None,
             reauth_requested: false,
             songs_rx,
+            fetcher,
             pending_queue_restore: saved_queue,
             filter: String::new(),
             filter_mode: false,
+            songs_filter: None,
+            queue_filter: None,
             playlists_area: Rect::default(),
             songs_area: Rect::default(),
             lyrics_mode: false,
@@ -776,11 +790,36 @@ impl App {
         }
     }
 
+    /// `r` on a playlist whose fetch failed. The result comes back on the same
+    /// channel as the first attempt's, so nothing else needs to change.
+    fn retry_playlist(&mut self) {
+        let Some(pl) = self.list_state.selected() else {
+            return;
+        };
+        if !self.library.has_failed(pl) {
+            return;
+        }
+        let Some(id) = self.library.playlist(pl).map(|p| p.playlist_id.clone()) else {
+            return;
+        };
+        self.library.mark_retrying(pl);
+        self.fetcher.fetch(pl, &id);
+        self.notify("Retrying…");
+    }
+
     /// Drain all pending song-batch messages from the background loader.
     /// Called each event-loop tick so the UI stays up-to-date without blocking.
     fn drain_song_channel(&mut self) {
+        let mut arrived = false;
         while let Ok((idx, songs)) = self.songs_rx.try_recv() {
             self.library.apply_song_batch(idx, songs);
+            arrived = true;
+        }
+        // The queue filter matches on track titles, which a batch can turn
+        // from unknown into known. Its own key — the queue's revision — can't
+        // see that, since the queue itself didn't change.
+        if arrived {
+            self.queue_filter = None;
         }
         if self.pending_queue_restore.is_some() {
             self.try_restore_queue();
@@ -1529,8 +1568,12 @@ impl App {
                                 }
                                 Panel::Songs if self.show_queue => {
                                     if let Some(display_idx) = self.queue_view_state.selected() {
-                                        let filtered = self.filtered_queue_positions();
-                                        if let Some(&q_pos) = filtered.get(display_idx) {
+                                        // Copied out, so the cached filter is
+                                        // no longer borrowed when the player
+                                        // takes `&mut self`.
+                                        let q_pos =
+                                            self.filtered_queue_positions().get(display_idx).copied();
+                                        if let Some(q_pos) = q_pos {
                                             self.player.jump_to(&self.library, q_pos);
                                         }
                                     }
@@ -1539,8 +1582,9 @@ impl App {
                                     if let (Some(pl), Some(display_idx)) =
                                         (self.list_state.selected(), self.songs_state.selected())
                                     {
-                                        let filtered = self.filtered_songs(pl);
-                                        if let Some(&song) = filtered.get(display_idx) {
+                                        let song =
+                                            self.filtered_songs(pl).get(display_idx).copied();
+                                        if let Some(song) = song {
                                             self.player.play(&self.library, pl, song);
                                             self.sync_queue_view();
                                         }
@@ -1578,8 +1622,8 @@ impl App {
                                 if let (Some(pl), Some(display_idx)) =
                                     (self.list_state.selected(), self.songs_state.selected())
                                 {
-                                    let filtered = self.filtered_songs(pl);
-                                    if let Some(&song) = filtered.get(display_idx) {
+                                    let song = self.filtered_songs(pl).get(display_idx).copied();
+                                    if let Some(song) = song {
                                         self.do_append_to_queue(pl, song);
                                     }
                                 }
@@ -1588,8 +1632,9 @@ impl App {
                                 if self.active_panel == Panel::Songs && self.show_queue =>
                             {
                                 if let Some(display_idx) = self.queue_view_state.selected() {
-                                    let filtered = self.filtered_queue_positions();
-                                    if let Some(&q_pos) = filtered.get(display_idx) {
+                                    let q_pos =
+                                        self.filtered_queue_positions().get(display_idx).copied();
+                                    if let Some(q_pos) = q_pos {
                                         self.do_remove_from_queue(q_pos);
                                     }
                                 }
@@ -1631,6 +1676,19 @@ impl App {
                                 Panel::Songs => self.active_panel = Panel::Playlists,
                                 Panel::Playlists => break Ok(()),
                             },
+                            // Ahead of the re-auth binding below: a single
+                            // playlist that failed is not an expired session,
+                            // and quitting to re-authenticate would be a
+                            // remarkable answer to one that can just be asked
+                            // for again.
+                            KeyCode::Char('r')
+                                if self
+                                    .list_state
+                                    .selected()
+                                    .is_some_and(|pl| self.library.has_failed(pl)) =>
+                            {
+                                self.retry_playlist();
+                            }
                             KeyCode::Char('r') if self.library.is_empty() => {
                                 self.reauth_requested = true;
                                 break Ok(());
@@ -1868,67 +1926,109 @@ impl App {
         self.reset_lyrics_view();
     }
 
-    /// Original song indices in the selected playlist that match the current
-    /// filter. Returns all indices when the filter is empty.
-    #[hotpath::measure]
-    fn filtered_songs(&self, pl: usize) -> Vec<usize> {
-        let songs = self.library.songs(pl);
-        if self.filter.is_empty() {
-            return (0..songs.len()).collect();
-        }
-        let q = self.filter.to_lowercase();
-        songs
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| {
-                let title = t.title.as_deref().unwrap_or("").to_lowercase();
-                let artists = t.artist_names().to_lowercase();
-                title.contains(&q) || artists.contains(&q)
-            })
-            .map(|(i, _)| i)
-            .collect()
+    /// Whether `track` matches the already-lowercased query `q`.
+    fn matches_filter(track: Option<&Track>, q: &str) -> bool {
+        let Some(track) = track else {
+            return false;
+        };
+        track
+            .title
+            .as_deref()
+            .is_some_and(|t| t.to_lowercase().contains(q))
+            || track.artist_names().to_lowercase().contains(q)
     }
 
-    /// Queue positions whose songs match the current filter.
-    /// Returns all positions when the filter is empty.
-    fn filtered_queue_positions(&self) -> Vec<usize> {
-        let queue = self.player.queue();
-        if self.filter.is_empty() {
-            return (0..queue.len()).collect();
+    /// Original song indices in the selected playlist that match the current
+    /// filter. All of them when the filter is empty.
+    ///
+    /// Memoised because it is called once per frame *and* once per keystroke,
+    /// while its answer can only change when the playlist, the query or the
+    /// playlist's length does. Recomputing it lowercases every title and
+    /// artist in the playlist, which for a few thousand tracks at lyric-mode
+    /// frame rates is thousands of allocations a second for an answer that
+    /// never changed.
+    #[hotpath::measure]
+    fn filtered_songs(&mut self, pl: usize) -> &[usize] {
+        let len = self.library.songs(pl).len();
+        let fresh = self
+            .songs_filter
+            .as_ref()
+            .is_some_and(|(p, q, n, _)| *p == pl && *n == len && q == &self.filter);
+
+        if !fresh {
+            let list = if self.filter.is_empty() {
+                (0..len).collect()
+            } else {
+                let q = self.filter.to_lowercase();
+                self.library
+                    .songs(pl)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| Self::matches_filter(Some(t), &q))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            self.songs_filter = Some((pl, self.filter.clone(), len, list));
         }
-        let q = self.filter.to_lowercase();
-        queue
-            .iter()
-            .enumerate()
-            .filter(|&(_, &(pl, song_idx))| {
-                let track = self.library.track(pl, song_idx);
-                let title = track
-                    .and_then(|t| t.title.as_deref())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let artists = track
-                    .map(|t| t.artist_names().to_lowercase())
-                    .unwrap_or_default();
-                title.contains(&q) || artists.contains(&q)
-            })
-            .map(|(i, _)| i)
-            .collect()
+        self.songs_filter.as_ref().map_or(&[], |(_, _, _, list)| {
+            let slice: &[usize] = list;
+            slice
+        })
+    }
+
+    /// Queue positions whose songs match the current filter. All of them when
+    /// the filter is empty. Memoised like [`App::filtered_songs`], against the
+    /// queue's revision rather than its length — shuffling reorders it without
+    /// changing how long it is.
+    fn filtered_queue_positions(&mut self) -> &[usize] {
+        let revision = self.player.queue_revision();
+        let fresh = self
+            .queue_filter
+            .as_ref()
+            .is_some_and(|(r, q, _)| *r == revision && q == &self.filter);
+
+        if !fresh {
+            let list = if self.filter.is_empty() {
+                (0..self.player.queue().len()).collect()
+            } else {
+                let q = self.filter.to_lowercase();
+                self.player
+                    .queue()
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &(pl, song_idx))| {
+                        Self::matches_filter(self.library.track(pl, song_idx), &q)
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            self.queue_filter = Some((revision, self.filter.clone(), list));
+        }
+        self.queue_filter.as_ref().map_or(&[], |(_, _, list)| {
+            let slice: &[usize] = list;
+            slice
+        })
     }
 
     /// Prefetch whichever song is currently highlighted in the Songs panel (plus the
     /// one after it). Called on every j/k movement so the CDN URL is warm by the
     /// time the user presses Enter.
-    fn prefetch_selected(&self) {
+    fn prefetch_selected(&mut self) {
         let Some(pl) = self.list_state.selected() else {
             return;
         };
-        let songs = self.library.songs(pl);
-        let filtered = self.filtered_songs(pl);
         let base = self.songs_state.selected().unwrap_or(0);
-        for display_idx in [base, base + 1] {
-            if let Some(&real_idx) = filtered.get(display_idx)
-                && let Some(id) = songs.get(real_idx).and_then(|t| t.video_id.as_deref())
-            {
+        // Resolved to real indices first: the borrow of the cached filter has
+        // to end before `self.library` and `self.player` are read below.
+        let filtered = self.filtered_songs(pl);
+        let wanted: Vec<usize> = [base, base + 1]
+            .iter()
+            .filter_map(|&i| filtered.get(i).copied())
+            .collect();
+
+        let songs = self.library.songs(pl);
+        for real_idx in wanted {
+            if let Some(id) = songs.get(real_idx).and_then(|t| t.video_id.as_deref()) {
                 self.player.prefetch(id);
             }
         }
@@ -2223,10 +2323,15 @@ impl App {
                             theme::PRIMARY
                         },
                     )),
-                    Cell::from(
+                    // A playlist that failed to load would otherwise sit here
+                    // reading "0", which is a lie about the playlist rather
+                    // than a fact about the network.
+                    Cell::from(if self.library.has_failed(i) {
+                        Line::styled("!", theme::ERROR).alignment(Alignment::Right)
+                    } else {
                         Line::styled(self.library.songs(i).len().to_string(), theme::DIM)
-                            .alignment(Alignment::Right),
-                    ),
+                            .alignment(Alignment::Right)
+                    }),
                 ])
             })
             .collect();
@@ -2707,6 +2812,13 @@ impl App {
         let focused = self.active_panel == Panel::Songs;
         let current_pl = self.list_state.selected();
 
+        // Refreshed first, on its own, so the `&mut self` it needs is over
+        // before the panel starts reading `self` to draw itself. Everything
+        // below reads the cache back through the field.
+        if let Some(pl) = current_pl {
+            self.filtered_songs(pl);
+        }
+
         // The playlist's own name and stats become this section's header —
         // the old bordered "Info" and "Track" boxes duplicated the list below
         // and cost five rows to say it.
@@ -2716,9 +2828,10 @@ impl App {
             .to_string();
 
         let all_songs = current_pl.map_or(&[][..], |i| self.library.songs(i));
-        let filtered = current_pl
-            .map(|pl| self.filtered_songs(pl))
-            .unwrap_or_default();
+        let filtered: &[usize] = match (current_pl, &self.songs_filter) {
+            (Some(_), Some((_, _, _, list))) => list,
+            _ => &[],
+        };
 
         let status = if self.filter.is_empty() {
             entry.map(|e| {
@@ -2739,6 +2852,26 @@ impl App {
         };
 
         let body = section(frame, area, &label, status, focused);
+
+        // Before the loading throbber: a failed playlist is also "not loaded",
+        // and spinning at the user for ever is the one thing it must not do.
+        if current_pl.is_some_and(|i| self.library.has_failed(i)) {
+            centered_message(
+                frame,
+                body,
+                vec![
+                    Line::styled("Couldn't load this playlist", theme::ERROR),
+                    Line::from(""),
+                    Line::styled(
+                        "YouTube didn't answer after three tries.",
+                        theme::ERROR_BODY,
+                    ),
+                    Line::from(""),
+                    Line::from(hint("r", "try again")),
+                ],
+            );
+            return;
+        }
 
         if current_pl.is_some_and(|i| !self.library.is_loaded(i)) {
             frame.render_stateful_widget(
@@ -2795,7 +2928,13 @@ impl App {
         let focused = self.active_panel == Panel::Songs;
         let queue_pos = self.player.queue_position();
         let queue = self.player.queue().to_vec();
-        let filtered = self.filtered_queue_positions();
+        // As in `render_songs`: refresh under `&mut self`, then read the cache
+        // back through the field so the rest of the draw can borrow `self`.
+        self.filtered_queue_positions();
+        let filtered: &[usize] = self
+            .queue_filter
+            .as_ref()
+            .map_or(&[], |(_, _, list)| list.as_slice());
 
         let status = if self.filter.is_empty() {
             let pos = queue_pos.map_or(0, |p| p + 1);
@@ -3007,6 +3146,58 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The filter's matching rule, which memoising moved but must not change.
+    /// `App` itself can't be built in a test — it boots libmpv.
+    mod filtering {
+        use super::*;
+
+        fn track(title: Option<&str>, artists: &[&str]) -> Track {
+            Track {
+                video_id: Some("aaa".to_string()),
+                title: title.map(str::to_string),
+                artists: artists
+                    .iter()
+                    .map(|name| ytm_core::library::Artist {
+                        name: (*name).to_string(),
+                        id: None,
+                    })
+                    .collect(),
+                album: None,
+                duration: None,
+                duration_seconds: None,
+            }
+        }
+
+        #[test]
+        fn a_query_matches_the_title() {
+            let t = track(Some("Bohemian Rhapsody"), &["Queen"]);
+            assert!(App::matches_filter(Some(&t), "rhapsody"));
+            assert!(App::matches_filter(Some(&t), "bohemian"));
+            assert!(!App::matches_filter(Some(&t), "waltz"));
+        }
+
+        #[test]
+        fn a_query_matches_any_credited_artist() {
+            let t = track(Some("Sway"), &["Anna Yvette", "Nevve"]);
+            assert!(App::matches_filter(Some(&t), "nevve"));
+            assert!(App::matches_filter(Some(&t), "yvette"));
+        }
+
+        #[test]
+        fn a_track_with_no_title_is_matched_on_its_artist_alone() {
+            let t = track(None, &["Feint"]);
+            assert!(App::matches_filter(Some(&t), "feint"));
+            assert!(!App::matches_filter(Some(&t), "sway"));
+        }
+
+        #[test]
+        fn a_queue_entry_whose_playlist_has_not_loaded_matches_nothing() {
+            // `library.track()` is `None` until the batch arrives, and a
+            // filter must not claim a hit it can't see.
+            assert!(!App::matches_filter(None, "anything"));
+        }
+    }
 
     fn rows(n: usize) -> Vec<LyricRow> {
         (0..n)

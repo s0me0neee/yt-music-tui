@@ -49,7 +49,12 @@ automatic renewal lets `main.rs` carry on instead of asking for a restart.
 Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
 `lyrics.json`, `translations.json`, `config.toml`, `app.log`). Everything but `config.toml`
 is written by the app; `config.toml` is the hand-edited one, read once at startup by
-`config.rs`.
+`config.rs`. The directory is `0700` and the files in it `0600`, re-applied by
+`ensure_config_dir` on every startup rather than only at creation — `browser.json` holds the
+cookies that *are* the signed-in session, and the default umask would leave them readable by
+every account on the machine. Everything the app writes goes through `session::write_private`,
+which writes a private temporary and renames it over the target, so a `Ctrl+C` or a crash
+mid-write leaves the previous contents rather than half a file.
 
 ## Architecture
 
@@ -74,14 +79,23 @@ tui/        the ratatui frontend — single `ytm` binary
 ### `ytm-core/`
 
 - **`session.rs`** — `Session`: cookie extraction via yt-dlp, `browser.json` I/O, config paths.
-- **`library.rs`** — `Library`, `Track`, `Playlist`. `spawn_library_fetch` streams each
-  playlist's tracks back over an `mpsc` channel as they arrive.
+- **`library.rs`** — `Library`, `Track`, `Playlist`. `LibraryFetcher` streams each
+  playlist's tracks back over an `mpsc` channel as they arrive, and is kept afterwards so
+  `fetch` can ask again for one that failed. `get_songs` returns `Option`: a fetch that gave
+  up after three attempts is `None`, which leaves the playlist *unloaded* and flagged rather
+  than loaded-and-empty. The distinction is load-bearing in two places — the panel says
+  "couldn't load this playlist" and offers `r` instead of showing an empty list, and
+  `try_restore` keeps waiting instead of deciding the saved queue's tracks are gone.
 - **`playback.rs`** — `AudioEngine` owns an in-process **libmpv** instance (`libmpv2`) on its
   own thread, plus an `Arc<Mutex<AudioState>>` snapshot. `AudioState::elapsed` is the live
   playback position, fed by an mpv `time-pos` property observer. `audio-client-name` is set
   to `ytm` so PipeWire/PulseAudio lists the app under its own name in the system mixer
   rather than as "mpv".
-- **`player.rs`** — `Player`: queue, play modes, volume/mute, song-end advance.
+- **`player.rs`** — `Player`: queue, play modes, volume/mute, song-end advance. Leaving
+  Shuffle restores the order the queue had before it (`unshuffled` + `reorder_to`), rather
+  than sorting: a queue built by hand with `a` has an order the user chose, and across
+  playlists the `(playlist, song)` pairs say nothing about it. Entries added while shuffled
+  keep their place at the end, removed ones stay removed.
 - **`lyrics.rs`** — policy over `lrclib`. `LyricsService::best_for` layers `/get` (exact, has
   duration, returns one) over `/search` (returns many, ignores duration), preferring synced
   over plain; `rank` does duration-proximity scoring client-side. `spawn_best`/`spawn_choices`
@@ -139,7 +153,8 @@ tui/        the ratatui frontend — single `ytm` binary
   answered as `Playlist`: this player always wraps. No session bus (ssh, headless) ⇒ `new`
   returns `None` with a log line and nothing else changes. Linux-only; other targets get a
   same-shaped stub so `app.rs` needs no `cfg`.
-- **`persistence.rs`** — `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
+- **`persistence.rs`** — all through `write_private` (above), since these are written on the
+  way out, when an interrupted write is most likely. `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID), `translations.json` (**AI** translations, keyed by lrclib
   record id, so one is paid for once). Only the AI ones: the free endpoint costs nothing but
   a wait, so `i` asks again each session and its translation can improve, while `I` reuses
@@ -203,7 +218,16 @@ tui/        the ratatui frontend — single `ytm` binary
     style (`SELECTED` vs `SELECTED_BLUR`), since there is no border to tint.
   - **Filter**: `/` opens inline filter mode; `Enter` confirms (keeps filter), `Esc` clears.
   - **Queue**: `a` appends, `d` removes, `o` toggles queue/songs view, `p`/`n` skip.
-  - **Prefetch**: j/k in Songs warms the CDN URL for the selected + next song.
+  - **Prefetch**: j/k in Songs warms the CDN URL for the selected + next song. The resolved
+    URLs are held by `playback.rs`'s `UrlCache`, bounded at 64 entries and an hour: YouTube's
+    own expiry is a few hours, and handing mpv a stale URL costs a failed load and a
+    re-resolve — the work the cache exists to save.
+  - **Filtering**: `filtered_songs` / `filtered_queue_positions` are memoised, keyed by
+    (playlist, query, length) and (queue revision, query). Both are asked for once per frame
+    *and* once per keystroke, and recomputing means lowercasing every title and artist in the
+    list — at lyric-mode frame rates that is thousands of allocations a second for an answer
+    that hasn't changed. `Player::queue_revision` is what makes the queue's key exact, since
+    shuffling reorders it without changing its length.
   - **Lyrics**: `y` replaces the right column with a synced-lyrics panel that auto-centres the
     active line; `c` opens a modal to pick a different lrclib record; `r` retries a failed
     fetch. Results are cached per video ID and never re-fetched, so toggling is free.
@@ -258,7 +282,7 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `c` | (in lyrics mode) Choose a different lrclib record |
 | `i` | (in lyrics mode) Toggle the translation under each line, from the free endpoint |
 | `I` | (in lyrics mode) The same, translated by the AI model instead — only where `lyrics.ai-translation` set it up |
-| `r` | (in lyrics mode) Redo the translation on screen, or retry a failed lyrics fetch when there are no words yet |
+| `r` | (in lyrics mode) Redo the translation on screen, or retry a failed lyrics fetch when there are no words yet. On a playlist whose fetch failed, fetches it again |
 | `?` | Full keymap overlay (any key closes it) |
 | `q` / `Ctrl+C` | Quit |
 
@@ -281,7 +305,7 @@ key event. The `ctrlc` handler in `main.rs` only covers SIGTERM/SIGHUP.
 main.rs
   └─ Session::build_client()
   └─ library::get_playlists()  ──► App::new(library, saved_queue, songs_rx, rt_handle)
-  └─ library::spawn_library_fetch()   └─ App::run()
+  └─ library::LibraryFetcher::new()   └─ App::run()
        (tokio tasks → mpsc)                └─ event_loop
                                                 ├─ drain_song_channel / drain_lyrics
                                                 │  / drain_translations / drain_media
