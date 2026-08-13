@@ -349,6 +349,26 @@ impl Library {
         (pl_idx, entry.songs.len() - 1)
     }
 
+    /// Empties the search playlist, keeping the playlist itself.
+    ///
+    /// Only the tracks go: removing the entry would shift every index after
+    /// it, and a [`crate::player::TrackRef`] is a position. The caller has to
+    /// have established that nothing points into it — see the note on
+    /// `App::prune_search_history`, which is the one caller.
+    pub fn clear_search_playlist(&mut self) {
+        let Some(idx) = self.find_playlist_index(Self::SEARCH_PLAYLIST_ID) else {
+            return;
+        };
+        if let Some(entry) = self.entries.get_mut(idx) {
+            log::info!(
+                "library: dropping {} unreferenced search tracks",
+                entry.songs.len()
+            );
+            entry.songs.clear();
+            entry.total_duration_secs = 0;
+        }
+    }
+
     /// Whether `idx` is the search playlist rather than one of the user's.
     #[must_use]
     pub fn is_search_playlist(&self, idx: usize) -> bool {

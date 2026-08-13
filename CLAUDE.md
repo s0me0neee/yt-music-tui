@@ -54,6 +54,9 @@ process, and the TUI appears once, populated, with nothing pressed. `session::ca
 (a browser on record and the setting on) is what makes that self-starting: without it the
 fallback is a set of prompts, which only a keypress should open. Only the first start may
 renew on its own, so a library that really is empty is reported once, with `r` to ask again.
+First-run setup goes the same way: the prompts finish and the TUI opens, rather than ending
+with an instruction to start the app again. It counts as that one renewal, since cookies
+seconds old are not a session worth fetching afresh.
 Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
 `lyrics.json`, `translations.json`, `config.toml`, `app.log`). Everything but `config.toml`
 is written by the app; `config.toml` is the hand-edited one, read once at startup by
@@ -98,7 +101,12 @@ tui/        the ratatui frontend — single `ytm` binary
   own thread, plus an `Arc<Mutex<AudioState>>` snapshot. `AudioState::elapsed` is the live
   playback position, fed by an mpv `time-pos` property observer. `audio-client-name` is set
   to `ytm` so PipeWire/PulseAudio lists the app under its own name in the system mixer
-  rather than as "mpv".
+  rather than as "mpv". `pending_resolve` is the song a yt-dlp resolve is running for, and
+  it is cleared only where that resolve is answered — never on an mpv event, which belongs
+  to whatever mpv currently has open rather than to what the user just pressed. Clearing it
+  on the `duration` property change meant a track started while the previous one was still
+  settling resolved, cached its URL and was never loaded: audio carried on with the old song
+  under the new song's title.
 - **`player.rs`** — `Player`: queue, play modes, volume/mute, song-end advance. Leaving
   Shuffle restores the order the queue had before it (`unshuffled` + `reorder_to`), rather
   than sorting: a queue built by hand with `a` has an order the user chose, and across
@@ -181,7 +189,12 @@ tui/        the ratatui frontend — single `ytm` binary
   of music exists on YouTube *only* as a video, and playback is unaffected either way — mpv
   is given `bestaudio` and never fetches a video stream. `place_search_result` files a hit
   into a synthetic `__search__` playlist so the queue, player, lyrics and prefetch can all
-  address it as the `(playlist, song)` pair they already expect.
+  address it as the `(playlist, song)` pair they already expect. Nothing ever took one out
+  again, so `App::prune_search_history` empties it once it passes `MAX_SEARCH_TRACKS` — but
+  only while no queue entry and nothing playing points there. Dropping any *one* of them is
+  not possible: a `TrackRef` is a position, so removing a track renumbers the rest and the
+  queue quietly changes meaning. `clear_search_playlist` empties the tracks and keeps the
+  playlist, for the same reason.
 - **`cover.rs`** — fetches a thumbnail and decodes it to RGB. `at_size` rewrites the CDN's
   own resize parameters (`=w120-h120-l90-rj`) to ask for a bigger copy than the 120px a
   search row advertises, and the size asked for is the *terminal's*: `spawn_fetch` takes the
@@ -191,10 +204,20 @@ tui/        the ratatui frontend — single `ytm` binary
   memory is what can be shown, and the 2× is there because `Cover::scaled` box-averages: 2×2
   source pixels per output pixel is what makes an edge land smoothly rather than being point
   sampled. `scaled` runs again at draw time, down to the rectangle the panel actually got.
+  How big what comes back may be is not the CDN's to decide: the body is read in chunks
+  against `MAX_BYTES` rather than with `bytes()`, and `decode` reads the JPEG *header* first
+  so a claimed size past `MAX_DECODE_PX` is refused before `width × height × 3` is allocated
+  for it. One `reqwest::Client` is shared by every fetch — covers arrive in runs, all to the
+  same host, and a client apiece was a TLS handshake apiece.
 - **`persistence.rs`** — all through `write_private` (above), since these are written on the
   way out, when an interrupted write is most likely. `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID), `translations.json` (**AI** translations, keyed by lrclib
-  record id, so one is paid for once). Only the AI ones: the free endpoint costs nothing but
+  record id, so one is paid for once). A queue's saved *position* is an index into the
+  queue, so both halves of the round trip move it with the entries rather than carrying the
+  number across: `build_queue_state` drops an entry with no video id and `try_restore` drops
+  one whose playlist is gone — the synthetic search playlist, every time — and
+  `follow_position` applies the same rule `Player::remap_refs` does, or the queue comes back
+  playing a song it wasn't on. Only the AI ones: the free endpoint costs nothing but
   a wait, so `i` asks again each session and its translation can improve, while `I` reuses
   what it bought. The entry records the language — a changed `translate-to` is a miss — and
   which model answered, and nothing is written when that model is *empty*: an `I` request
@@ -258,6 +281,11 @@ tui/        the ratatui frontend — single `ytm` binary
     style (`SELECTED` vs `SELECTED_BLUR`), since there is no border to tint.
   - **Filter**: `/` opens inline filter mode; `Enter` confirms (keeps filter), `Esc` clears.
   - **Queue**: `a` appends, `d` removes, `o` toggles queue/songs view, `p`/`n` skip.
+  - **The cursor** moves through `select_next_bounded` / `select_prev_bounded` rather than
+    ratatui's own, which count rows without knowing how many there are: holding `j` at the
+    bottom of a list used to walk off the end and take as many `k` presses to come back.
+    They also pull a selection left past the end — by a refetch that shortened the list —
+    back into it, and select nothing at all in an empty one.
   - **Prefetch**: j/k in Songs warms the CDN URL for the selected + next song. The resolved
     URLs are held by `playback.rs`'s `UrlCache`, bounded at 64 entries and an hour: YouTube's
     own expiry is a few hours, and handing mpv a stale URL costs a failed load and a
@@ -270,7 +298,9 @@ tui/        the ratatui frontend — single `ytm` binary
     shuffling reorders it without changing its length.
   - **Lyrics**: `y` replaces the right column with a synced-lyrics panel that auto-centres the
     active line; `c` opens a modal to pick a different lrclib record; `r` retries a failed
-    fetch. Results are cached per video ID and never re-fetched, so toggling is free.
+    fetch. Results are cached per video ID and never re-fetched, so toggling is free —
+    `MAX_LYRICS` of them, oldest first, since nothing else ever took one out and a session
+    left running all day held every track it had played.
     The picker collapses records carrying identical lyrics — two thirds of what lrclib
     returns for a popular track — and its left column marks `IN USE` (what the panel is
     showing) and `AUTO` (the record automatic matching resolved to). The record on screen

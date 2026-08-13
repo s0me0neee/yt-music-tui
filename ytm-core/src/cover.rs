@@ -70,6 +70,18 @@ pub fn at_size(url: &str, px: u32) -> String {
     format!("{base}={}", rewritten.join("-"))
 }
 
+/// The most a cover response may weigh, and the largest image it may claim to
+/// be.
+///
+/// Nothing about a decorative thumbnail justifies either number being reached:
+/// the largest copy this asks for is [`MAX_PX`], which arrives around 300 KB.
+/// The limits are there because the size of what comes back is decided at the
+/// far end — the reply is read into memory whole, and the decoder allocates
+/// `width × height × 3` on the strength of a header. Both are checked before
+/// the allocation rather than after it.
+const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DECODE_PX: u32 = 2048;
+
 /// Decodes JPEG bytes to RGB.
 ///
 /// Greyscale is expanded here rather than left to the caller: a terminal
@@ -77,9 +89,21 @@ pub fn at_size(url: &str, px: u32) -> String {
 /// nobody should have to special-case it downstream.
 pub fn decode(bytes: &[u8]) -> Result<Cover, String> {
     let mut decoder = jpeg_decoder::Decoder::new(bytes);
-    let pixels = decoder.decode().map_err(|e| e.to_string())?;
+    // The header on its own, so the dimensions can be refused before any
+    // pixels are allocated for them.
+    decoder.read_info().map_err(|e| e.to_string())?;
     let info = decoder.info().ok_or("no image header")?;
     let (width, height) = (u32::from(info.width), u32::from(info.height));
+    if width == 0 || height == 0 {
+        return Err(format!("{width}x{height} is not an image"));
+    }
+    if width.max(height) > MAX_DECODE_PX {
+        return Err(format!(
+            "{width}x{height} is past the {MAX_DECODE_PX}px a cover may be"
+        ));
+    }
+
+    let pixels = decoder.decode().map_err(|e| e.to_string())?;
 
     let rgb = match info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => pixels,
@@ -185,16 +209,47 @@ pub fn spawn_fetch(
     });
 }
 
+/// The one client every cover fetch shares.
+///
+/// Built per request before, which meant a fresh connection pool and a fresh
+/// TLS handshake for each one — and covers arrive in runs, every row the
+/// selection passes over, all to the same host. Held for the process, since
+/// that is exactly how long the CDN connection is worth keeping.
+fn client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(TIMEOUT)
+                .build()
+                .inspect_err(|e| log::warn!("cover: no HTTP client ({e}) — covers are off"))
+                .ok()
+        })
+        .as_ref()
+}
+
 async fn fetch(url: &str) -> Result<Cover, String> {
-    let client = reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let client = client().ok_or("no HTTP client")?;
+    let mut response = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("{}", response.status()));
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    // Read in chunks against a ceiling rather than with `bytes()`, which takes
+    // whatever the far end sends. A header claiming more than the cap is
+    // refused without reading it at all.
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_BYTES as u64)
+    {
+        return Err(format!("cover is larger than {MAX_BYTES} bytes"));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len() + chunk.len() > MAX_BYTES {
+            return Err(format!("cover is larger than {MAX_BYTES} bytes"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     decode(&bytes)
 }
 
@@ -296,6 +351,38 @@ mod tests {
         let tiny = source.scaled(1, 1);
         assert_eq!((tiny.width, tiny.height), (1, 1));
         assert_eq!(tiny.rgb.len(), 3);
+    }
+
+    /// A JPEG header and nothing behind it, claiming to be `w`×`h`.
+    fn header(w: u16, h: u16) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        out.extend_from_slice(&h.to_be_bytes());
+        out.extend_from_slice(&w.to_be_bytes());
+        // Three components, each with its sampling factors and table ids.
+        out.extend_from_slice(&[0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    #[test]
+    fn an_image_too_large_to_be_a_cover_is_refused_before_it_is_decoded() {
+        // The header is all that is read to decide this — the point is that
+        // `width × height × 3` is never allocated on the strength of a number
+        // that came from the network.
+        let err = decode(&header(5000, 5000)).expect_err("should be refused");
+        assert!(err.contains("2048px"), "{err}");
+        // The size actually asked for is well inside it, so nothing real is
+        // caught by this: what fails here is the missing image data, later.
+        let err = decode(&header(1080, 1080)).expect_err("no pixels behind it");
+        assert!(!err.contains("2048px"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_sized_image_is_not_an_image() {
+        // The decoder gets there first — a zero height is JPEG's "defined
+        // later", which it refuses outright — so this only pins that nothing
+        // downstream is ever handed a zero to divide by.
+        assert!(decode(&header(0, 0)).is_err());
     }
 
     #[test]

@@ -475,11 +475,19 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                     match (name, change) {
                         ("time-pos", PropertyData::Double(v)) => s.elapsed = v,
                         ("pause", PropertyData::Flag(b)) => s.paused = b,
+                        // Deliberately *not* clearing `pending_resolve`: this
+                        // event belongs to whatever mpv has open, which during
+                        // a track change is still the previous song. Clearing
+                        // it here threw away the load the user is waiting for,
+                        // so the new track's URL resolved, was cached, and was
+                        // never handed to mpv — audio carrying on with the old
+                        // song while the UI showed the new one. A resolve for a
+                        // song since superseded is already ignored below, by
+                        // the id it is compared against.
                         ("duration", PropertyData::Double(v)) => {
                             log::info!("[audio] duration: {v:.1}s");
                             s.total = v;
                             s.loading = false;
-                            pending_resolve = None;
                         }
                         ("eof-reached", PropertyData::Flag(true)) => {
                             log::info!("[audio] eof-reached → song_ended");

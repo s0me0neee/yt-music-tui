@@ -198,11 +198,23 @@ pub struct Ai {
     pub provider: Provider,
 }
 
-fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())
+/// The one client every request shares.
+///
+/// A song is one request, so the saving is small — but a fresh client per call
+/// also builds a fresh TLS configuration each time, and there is no reason for
+/// a second one to exist.
+fn client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(TIMEOUT)
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// One `{index, source, text}` per line, indices contiguous from zero.

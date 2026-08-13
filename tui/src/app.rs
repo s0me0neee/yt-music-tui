@@ -254,6 +254,32 @@ fn fit_hints(items: &[(&str, &str)], width: usize) -> Vec<Span<'static>> {
     spans
 }
 
+/// Moves the selection down one row, stopping at the last of `len`.
+///
+/// `TableState::select_next` knows nothing about how many rows there are, so
+/// at the bottom of a list it keeps counting rows that aren't there: hold `j`
+/// for a second and it takes a second of `k` to get back on screen. An empty
+/// list selects nothing at all, rather than a row zero it hasn't got.
+fn select_next_bounded(state: &mut TableState, len: usize) {
+    let Some(last) = len.checked_sub(1) else {
+        state.select(None);
+        return;
+    };
+    state.select(Some(state.selected().map_or(0, |i| (i + 1).min(last))));
+}
+
+/// The same upwards. `select_previous` already stops at zero, but a selection
+/// left past the end — by a refetch that shortened the list — has to be pulled
+/// back into it before it can move.
+fn select_prev_bounded(state: &mut TableState, len: usize) {
+    let Some(last) = len.checked_sub(1) else {
+        state.select(None);
+        return;
+    };
+    let current = state.selected().unwrap_or(0).min(last);
+    state.select(Some(current.saturating_sub(1)));
+}
+
 /// Where each of `before`'s tracks ended up in `now`, matched by video id, or
 /// `None` when every one of them is exactly where it was.
 ///
@@ -589,6 +615,17 @@ struct LyricRow {
 /// the AI backend charges for every one that has to be fetched again.
 const MAX_TRANSLATIONS: usize = 64;
 
+/// Records kept before the oldest is dropped. A few kilobytes of text each,
+/// and nothing ever evicted them — a session left running all day held the
+/// lyrics of every track it had played. Generous, because the entry is also
+/// what stops a `Missing` or `Failed` result being re-fetched once a tick, and
+/// getting one back costs a walk up the lrclib ladder.
+const MAX_LYRICS: usize = 256;
+
+/// Tracks the synthetic search playlist holds before it is emptied — and only
+/// then when nothing points into it. See [`App::prune_search_history`].
+const MAX_SEARCH_TRACKS: usize = 128;
+
 /// Which translator the lyrics panel is showing. `i` picks [`Self::Free`] and
 /// `I` picks [`Self::Ai`]; each key turns its own off again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,6 +923,9 @@ pub struct App {
     lyrics_tx: std::sync::mpsc::Sender<LyricsMsg>,
     lyrics_rx: std::sync::mpsc::Receiver<LyricsMsg>,
     lyrics_cache: std::collections::HashMap<String, LyricsEntry>,
+    /// Insertion order for [`Self::lyrics_cache`], oldest first, so it can be
+    /// bounded without holding every track a long session played.
+    lyrics_order: Vec<String>,
     /// Wrapped rows cached per `(video_id, width)` so we re-wrap only when the
     /// track or the panel width actually changes.
     lyrics_rows: Option<(String, u16, Vec<LyricRow>)>,
@@ -1016,6 +1056,7 @@ impl App {
             lyrics_tx,
             lyrics_rx,
             lyrics_cache: std::collections::HashMap::new(),
+            lyrics_order: Vec::new(),
             lyrics_rows: None,
             lyrics_scroll: 0,
             lyrics_following: true,
@@ -1267,12 +1308,14 @@ impl App {
             KeyCode::Char('a') => self.open_add_picker(),
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(s) = self.search.as_mut() {
-                    s.state.select_next();
+                    let n = s.results.len();
+                    select_next_bounded(&mut s.state, n);
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(s) = self.search.as_mut() {
-                    s.state.select_previous();
+                    let n = s.results.len();
+                    select_prev_bounded(&mut s.state, n);
                 }
             }
             KeyCode::Char(' ') => self.player.play_pause(&self.library),
@@ -1575,6 +1618,55 @@ impl App {
     /// never plays still gets its lyrics looked up.
     const DURATION_WAIT: Duration = Duration::from_secs(4);
 
+    /// Empties the search playlist once it has grown past
+    /// [`MAX_SEARCH_TRACKS`] — but only while nothing points into it.
+    ///
+    /// Every track played from search is filed there and nothing ever took one
+    /// out again, so a long session searching around accumulated all of them.
+    /// Dropping any *one* of them is not possible: a `TrackRef` is a position,
+    /// so removing a track renumbers the ones after it and the queue would
+    /// quietly change what it means. Emptying the lot when no reference points
+    /// there at all has no such problem, and that state comes round often —
+    /// playing anything from the library is enough.
+    fn prune_search_history(&mut self) {
+        let Some(pl) = self
+            .library
+            .find_playlist_index(Library::SEARCH_PLAYLIST_ID)
+        else {
+            return;
+        };
+        if self.library.songs(pl).len() <= MAX_SEARCH_TRACKS {
+            return;
+        }
+        let referenced = self.player.playing().is_some_and(|(p, _)| p == pl)
+            || self.player.queue().iter().any(|&(p, _)| p == pl);
+        if referenced {
+            return;
+        }
+        self.library.clear_search_playlist();
+        // Both filters are keyed by a length this just changed to zero, but the
+        // songs one also names the playlist — and a stale answer here indexes
+        // tracks that are gone.
+        self.songs_filter = None;
+        self.queue_filter = None;
+    }
+
+    /// Stores one track's lyrics state, dropping the oldest once the cache is
+    /// full.
+    ///
+    /// Whatever is playing was just put in, so it is the last thing eviction
+    /// would reach — and an evicted entry costs a re-fetch the next time that
+    /// track comes round, not a wrong answer.
+    fn remember_lyrics(&mut self, video_id: String, entry: LyricsEntry) {
+        self.lyrics_order.retain(|id| id != &video_id);
+        while self.lyrics_order.len() >= MAX_LYRICS {
+            let oldest = self.lyrics_order.remove(0);
+            self.lyrics_cache.remove(&oldest);
+        }
+        self.lyrics_order.push(video_id.clone());
+        self.lyrics_cache.insert(video_id, entry);
+    }
+
     /// Starts a lyrics fetch for `video_id` unless one is already cached or in
     /// flight. The single `Occupied` arm is what makes repeated `y` toggles and
     /// skip-away-and-back free.
@@ -1626,8 +1718,7 @@ impl App {
             query.duration = Some(total);
         }
 
-        self.lyrics_cache
-            .insert(video_id.to_string(), LyricsEntry::Loading);
+        self.remember_lyrics(video_id.to_string(), LyricsEntry::Loading);
         log::info!("lyrics: fetching for {video_id} ({})", query.title);
         lyrics::spawn_best(
             &self.lyrics_handle,
@@ -1659,7 +1750,7 @@ impl App {
                             LyricsEntry::Failed(e)
                         }
                     };
-                    self.lyrics_cache.insert(video_id.clone(), entry);
+                    self.remember_lyrics(video_id.clone(), entry);
                     if self.current_video_id().as_deref() == Some(video_id.as_str()) {
                         self.reset_lyrics_view();
                     }
@@ -2217,6 +2308,7 @@ impl App {
             self.drain_search();
             self.drain_covers();
             self.ensure_cover();
+            self.prune_search_history();
             // Kicked off from here rather than on each key: this one lookup
             // covers entering lyrics mode, p/n, auto-advance and Enter alike.
             if self.lyrics_mode
@@ -2289,7 +2381,8 @@ impl App {
                             // ── navigation ────────────────────────────────────────────
                             KeyCode::Char('j') => match self.active_panel {
                                 Panel::Playlists => {
-                                    self.list_state.select_next();
+                                    let n = self.library.len();
+                                    select_next_bounded(&mut self.list_state, n);
                                     self.songs_state = TableState::default();
                                     self.clear_filter();
                                 }
@@ -2297,25 +2390,30 @@ impl App {
                                 // scroll those rather than a cursor nobody sees.
                                 Panel::Songs if self.lyrics_mode => self.scroll_lyrics(1),
                                 Panel::Songs if self.show_queue => {
-                                    self.queue_view_state.select_next();
+                                    let n = self.queue_rows();
+                                    select_next_bounded(&mut self.queue_view_state, n);
                                 }
                                 Panel::Songs => {
-                                    self.songs_state.select_next();
+                                    let n = self.songs_rows();
+                                    select_next_bounded(&mut self.songs_state, n);
                                     self.prefetch_selected();
                                 }
                             },
                             KeyCode::Char('k') => match self.active_panel {
                                 Panel::Playlists => {
-                                    self.list_state.select_previous();
+                                    let n = self.library.len();
+                                    select_prev_bounded(&mut self.list_state, n);
                                     self.songs_state = TableState::default();
                                     self.clear_filter();
                                 }
                                 Panel::Songs if self.lyrics_mode => self.scroll_lyrics(-1),
                                 Panel::Songs if self.show_queue => {
-                                    self.queue_view_state.select_previous();
+                                    let n = self.queue_rows();
+                                    select_prev_bounded(&mut self.queue_view_state, n);
                                 }
                                 Panel::Songs => {
-                                    self.songs_state.select_previous();
+                                    let n = self.songs_rows();
+                                    select_prev_bounded(&mut self.songs_state, n);
                                     self.prefetch_selected();
                                 }
                             },
@@ -2486,7 +2584,8 @@ impl App {
         match me.kind {
             MouseEventKind::ScrollDown => {
                 if self.playlists_area.contains(pos) {
-                    self.list_state.select_next();
+                    let n = self.library.len();
+                    select_next_bounded(&mut self.list_state, n);
                     self.songs_state = TableState::default();
                     self.filter.clear();
                     self.filter_mode = false;
@@ -2494,16 +2593,19 @@ impl App {
                     if self.lyrics_mode {
                         self.scroll_lyrics(1);
                     } else if self.show_queue {
-                        self.queue_view_state.select_next();
+                        let n = self.queue_rows();
+                        select_next_bounded(&mut self.queue_view_state, n);
                     } else {
-                        self.songs_state.select_next();
+                        let n = self.songs_rows();
+                        select_next_bounded(&mut self.songs_state, n);
                         self.prefetch_selected();
                     }
                 }
             }
             MouseEventKind::ScrollUp => {
                 if self.playlists_area.contains(pos) {
-                    self.list_state.select_previous();
+                    let n = self.library.len();
+                    select_prev_bounded(&mut self.list_state, n);
                     self.songs_state = TableState::default();
                     self.filter.clear();
                     self.filter_mode = false;
@@ -2511,9 +2613,11 @@ impl App {
                     if self.lyrics_mode {
                         self.scroll_lyrics(-1);
                     } else if self.show_queue {
-                        self.queue_view_state.select_previous();
+                        let n = self.queue_rows();
+                        select_prev_bounded(&mut self.queue_view_state, n);
                     } else {
-                        self.songs_state.select_previous();
+                        let n = self.songs_rows();
+                        select_prev_bounded(&mut self.songs_state, n);
                         self.prefetch_selected();
                     }
                 }
@@ -2647,12 +2751,15 @@ impl App {
             KeyCode::Esc | KeyCode::Char('c') => self.lyrics_picker = None,
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(p) = self.lyrics_picker.as_mut() {
-                    p.state.select_next();
+                    // The pinned "Automatic" row, then one per candidate.
+                    let n = p.items.len() + 1;
+                    select_next_bounded(&mut p.state, n);
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(p) = self.lyrics_picker.as_mut() {
-                    p.state.select_previous();
+                    let n = p.items.len() + 1;
+                    select_prev_bounded(&mut p.state, n);
                 }
             }
             KeyCode::Enter => self.commit_lyrics_choice(),
@@ -2693,8 +2800,7 @@ impl App {
             };
             self.lyrics_overrides.set(&video_id, chosen.id);
             self.lyrics_dirty = true;
-            self.lyrics_cache
-                .insert(video_id, LyricsEntry::Ready(Box::new(chosen)));
+            self.remember_lyrics(video_id, LyricsEntry::Ready(Box::new(chosen)));
             self.notify("Lyrics source updated");
         }
 
@@ -2784,6 +2890,20 @@ impl App {
             let slice: &[usize] = list;
             slice
         })
+    }
+
+    /// How many rows each list is showing — what bounds its cursor. Both take
+    /// `&mut self` because both read a memoised filter that may need rebuilding
+    /// first; that is the same work the next frame would have done anyway.
+    fn songs_rows(&mut self) -> usize {
+        match self.list_state.selected() {
+            Some(pl) => self.filtered_songs(pl).len(),
+            None => 0,
+        }
+    }
+
+    fn queue_rows(&mut self) -> usize {
+        self.filtered_queue_positions().len()
     }
 
     /// Prefetch whichever song is currently highlighted in the Songs panel (plus the
@@ -4435,6 +4555,68 @@ mod tests {
             // Cells are not always twice as tall as wide, and the axis that
             // needs the most pixels is the one that decides.
             assert_eq!(App::cover_draw_px_for((16, 24)), 384);
+        }
+    }
+
+    /// The list cursor, which ratatui's own `select_next` lets walk off the
+    /// end of the list.
+    mod selection {
+        use super::*;
+
+        fn at(row: Option<usize>) -> TableState {
+            let mut state = TableState::default();
+            state.select(row);
+            state
+        }
+
+        #[test]
+        fn the_cursor_stops_at_the_last_row() {
+            // Holding `j` at the bottom used to keep counting rows that were
+            // not there, and every one of them had to be pressed back.
+            let mut state = at(Some(2));
+            for _ in 0..20 {
+                select_next_bounded(&mut state, 3);
+            }
+            assert_eq!(state.selected(), Some(2));
+            select_prev_bounded(&mut state, 3);
+            assert_eq!(state.selected(), Some(1), "one press comes back one row");
+        }
+
+        #[test]
+        fn the_cursor_stops_at_the_first_row() {
+            let mut state = at(Some(1));
+            select_prev_bounded(&mut state, 3);
+            select_prev_bounded(&mut state, 3);
+            select_prev_bounded(&mut state, 3);
+            assert_eq!(state.selected(), Some(0));
+        }
+
+        #[test]
+        fn a_selection_left_past_the_end_is_pulled_back_into_the_list() {
+            // What a refetch that shortened the playlist leaves behind.
+            let mut state = at(Some(40));
+            select_prev_bounded(&mut state, 3);
+            assert_eq!(state.selected(), Some(1));
+
+            let mut state = at(Some(40));
+            select_next_bounded(&mut state, 3);
+            assert_eq!(state.selected(), Some(2));
+        }
+
+        #[test]
+        fn an_empty_list_selects_nothing() {
+            let mut state = at(Some(0));
+            select_next_bounded(&mut state, 0);
+            assert_eq!(state.selected(), None);
+            select_prev_bounded(&mut state, 0);
+            assert_eq!(state.selected(), None);
+        }
+
+        #[test]
+        fn an_unselected_list_starts_at_the_top() {
+            let mut state = at(None);
+            select_next_bounded(&mut state, 3);
+            assert_eq!(state.selected(), Some(0));
         }
     }
 

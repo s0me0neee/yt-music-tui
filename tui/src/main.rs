@@ -23,12 +23,6 @@ fn main() -> anyhow::Result<()> {
 
     let session = Session::new()?;
 
-    if !session.is_set_up() {
-        session.run_setup()?;
-        eprintln!("\nSetup complete. Run again to start the TUI.");
-        return Ok(());
-    }
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -40,6 +34,18 @@ fn main() -> anyhow::Result<()> {
     // not have us renewing it once a run forever, so after one attempt an empty
     // library is reported and `r` is what asks for another.
     let mut renewed = false;
+
+    // Setting up leaves a working session, so there is nothing to run again
+    // for: the prompts finish and the TUI opens, the same way a renewal
+    // mid-session carries straight on rather than ending with an instruction.
+    // It counts as the one renewal — the cookies are seconds old, so an empty
+    // library after it is an empty library, not a session to fetch again.
+    if !session.is_set_up() {
+        session.run_setup()?;
+        eprintln!("\nSetup complete.\n");
+        renewed = true;
+    }
+
     loop {
         match start(&session, &rt, !renewed)? {
             app::Exit::Quit => return Ok(()),
