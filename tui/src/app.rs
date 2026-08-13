@@ -1940,70 +1940,106 @@ impl App {
 
     // ── help / notification bar ───────────────────────────────────────────────
 
-    /// The hints for the current context, most useful first — `fit_hints` drops
-    /// from the end when the terminal is too narrow, so the order is the
-    /// priority order.
-    fn hints(&self) -> &'static [(&'static str, &'static str)] {
-        if self.lyrics_picker.is_some() {
-            &[
-                ("j/k", "select"),
-                ("↵", "use"),
-                ("Esc", "cancel"),
+    /// The keys that work everywhere the picker isn't, in the order they are
+    /// worth dropping. Appended to each context's own so the bar can name every
+    /// binding that context has; `fit_hints` decides how much of it fits.
+    const TAIL: &'static [(&'static str, &'static str)] = &[
+        ("←/→", "seek"),
+        ("↑/↓", "volume"),
+        ("m", "mute"),
+        ("t", "mode"),
+        ("h/l", "panel"),
+        ("q", "quit"),
+    ];
+
+    /// The picker is modal — only these keys reach it, so it gets no tail.
+    fn picker_hints() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("j/k", "select"),
+            ("↵", "use"),
+            ("Esc", "cancel"),
+            ("c", "close"),
+            ("spc", "pause"),
+            ("←/→", "seek"),
+            ("q", "quit"),
+        ]
+    }
+
+    /// `ai` is [`Lyrics::ai_available`]: `I` is named only where it does
+    /// something, since the paid path shouldn't look like a key you can press.
+    fn lyrics_hints(ai: bool) -> Vec<(&'static str, &'static str)> {
+        let mut keys = vec![("y", "close"), ("c", "source"), ("i", "translate")];
+        if ai {
+            keys.push(("I", "ai"));
+        }
+        keys.extend_from_slice(&[
+            ("r", "redo"),
+            // Early enough to survive 80 columns: it is the way to everything
+            // below it. `the_way_to_the_full_keymap_survives_a_narrow_terminal`
+            // is what says how early that is.
+            ("?", "keys"),
+            ("j/k", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("Esc", "re-centre"),
+            ("spc", "pause"),
+            ("p/n", "skip"),
+            ("o", "queue"),
+        ]);
+        keys.extend_from_slice(Self::TAIL);
+        keys
+    }
+
+    fn browse_hints(panel: Panel, queue: bool) -> Vec<(&'static str, &'static str)> {
+        let mut keys = match (panel, queue) {
+            (Panel::Playlists, _) => vec![
+                ("j/k", "nav"),
+                ("l/↵", "open"),
                 ("spc", "pause"),
-            ]
+                ("p/n", "skip"),
+                ("o", "queue"),
+                ("?", "keys"),
+                ("y", "lyrics"),
+            ],
+            (Panel::Songs, false) => vec![
+                ("↵", "play"),
+                ("spc", "pause"),
+                ("/", "filter"),
+                ("a", "+queue"),
+                ("o", "queue"),
+                ("?", "keys"),
+                ("y", "lyrics"),
+                ("p/n", "skip"),
+                ("j/k", "nav"),
+                ("Esc", "back"),
+            ],
+            (Panel::Songs, true) => vec![
+                ("↵", "play"),
+                ("spc", "pause"),
+                ("d", "remove"),
+                ("o", "songs"),
+                ("y", "lyrics"),
+                ("?", "keys"),
+                ("p/n", "skip"),
+                ("j/k", "nav"),
+                ("/", "filter"),
+                ("Esc", "back"),
+            ],
+        };
+        keys.extend_from_slice(Self::TAIL);
+        keys
+    }
+
+    /// Every hint for the current context, most useful first — `fit_hints` drops
+    /// from the end when the terminal is too narrow, so the order is the
+    /// priority order. `?` sits ahead of the tail because it is the way to the
+    /// rest of them on a terminal too narrow to show any.
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.lyrics_picker.is_some() {
+            Self::picker_hints()
         } else if self.lyrics_mode {
-            // `I` is only offered where it does something.
-            if self.config.lyrics.ai_available() {
-                &[
-                    ("y", "close"),
-                    ("c", "source"),
-                    ("i", "translate"),
-                    ("I", "ai"),
-                    ("spc", "pause"),
-                    ("p/n", "skip"),
-                    ("j/k", "scroll"),
-                    ("?", "keys"),
-                ]
-            } else {
-                &[
-                    ("y", "close"),
-                    ("c", "source"),
-                    ("i", "translate"),
-                    ("spc", "pause"),
-                    ("p/n", "skip"),
-                    ("j/k", "scroll"),
-                    ("?", "keys"),
-                ]
-            }
+            Self::lyrics_hints(self.config.lyrics.ai_available())
         } else {
-            match (self.active_panel, self.show_queue) {
-                (Panel::Playlists, _) => &[
-                    ("j/k", "nav"),
-                    ("l/↵", "open"),
-                    ("spc", "pause"),
-                    ("?", "keys"),
-                    ("q", "quit"),
-                ],
-                (Panel::Songs, false) => &[
-                    ("↵", "play"),
-                    ("spc", "pause"),
-                    ("/", "filter"),
-                    ("a", "+queue"),
-                    ("o", "queue"),
-                    ("y", "lyrics"),
-                    ("p/n", "skip"),
-                    ("?", "keys"),
-                ],
-                (Panel::Songs, true) => &[
-                    ("↵", "play"),
-                    ("spc", "pause"),
-                    ("d", "remove"),
-                    ("o", "songs"),
-                    ("y", "lyrics"),
-                    ("p/n", "skip"),
-                    ("?", "keys"),
-                ],
-            }
+            Self::browse_hints(self.active_panel, self.show_queue)
         }
     }
 
@@ -2024,43 +2060,48 @@ impl App {
                 Span::styled(msg.clone(), theme::SUCCESS),
             ])
         } else {
-            Line::from(fit_hints(self.hints(), area.width as usize))
+            Line::from(fit_hints(&self.hints(), area.width as usize))
         };
 
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    /// Full keymap overlay, opened with `?`. The one-line help bar can only
-    /// carry a handful of hints; everything lives here.
+    /// Full keymap overlay, opened with `?`. Every one of these is in some
+    /// context's hint bar too — `the_keymap_and_the_hint_bar_agree` checks it —
+    /// but only here are they all visible at once, and described rather than
+    /// abbreviated. A blank pair is a spacer.
+    const KEYMAP: &'static [(&'static str, &'static str)] = &[
+        ("j / k", "Move down / up · scroll lyrics"),
+        ("PgUp / PgDn", "Scroll lyrics by five"),
+        ("h / l", "Switch panel"),
+        ("↵", "Open playlist · play song"),
+        ("/", "Filter by title or artist"),
+        ("Esc", "Clear filter · back · close"),
+        ("", ""),
+        ("space", "Pause / resume"),
+        ("p", "Restart track · again for previous"),
+        ("n", "Next in queue"),
+        ("← / →", "Seek ∓5s"),
+        ("↑ / ↓", "Volume ±5"),
+        ("m", "Mute / unmute"),
+        ("t", "Cycle play mode"),
+        ("", ""),
+        ("a", "Add selected song to queue"),
+        ("d", "Remove selected queue entry"),
+        ("o", "Toggle queue / songs"),
+        ("", ""),
+        ("y", "Toggle lyrics"),
+        ("c", "Choose lyrics source (in lyrics)"),
+        ("i", "Toggle translation (in lyrics)"),
+        ("I", "Translate with the AI model instead"),
+        ("r", "Redo (translation or lyrics)"),
+        ("", ""),
+        ("?", "Close this help"),
+        ("q  ·  Ctrl+C", "Quit"),
+    ];
+
     fn render_keymap(&self, frame: &mut Frame, screen: Rect) {
-        const KEYS: &[(&str, &str)] = &[
-            ("j / k", "Move down / up"),
-            ("h / l", "Switch panel"),
-            ("↵", "Open playlist · play song"),
-            ("/", "Filter by title or artist"),
-            ("Esc", "Clear filter · back · close"),
-            ("", ""),
-            ("space", "Pause / resume"),
-            ("p", "Restart track · again for previous"),
-            ("n", "Next in queue"),
-            ("← / →", "Seek ∓5s"),
-            ("↑ / ↓", "Volume ±5"),
-            ("m", "Mute / unmute"),
-            ("t", "Cycle play mode"),
-            ("", ""),
-            ("a", "Add selected song to queue"),
-            ("d", "Remove selected queue entry"),
-            ("o", "Toggle queue / songs"),
-            ("", ""),
-            ("y", "Toggle lyrics"),
-            ("c", "Choose lyrics source (in lyrics)"),
-            ("i", "Toggle translation (in lyrics)"),
-            ("I", "Translate with the AI model instead"),
-            ("r", "Redo (translation or lyrics)"),
-            ("", ""),
-            ("?", "Close this help"),
-            ("q  ·  Ctrl+C", "Quit"),
-        ];
+        const KEYS: &[(&str, &str)] = App::KEYMAP;
 
         let width = 46u16.min(screen.width.saturating_sub(4));
         let height = (KEYS.len() as u16 + 4).min(screen.height.saturating_sub(2));
@@ -3429,6 +3470,90 @@ mod tests {
         }
 
         assert!(fit_hints(&items, 0).is_empty());
+    }
+
+    /// Every hint list there is, including the one `I` only appears in.
+    fn all_hints() -> Vec<(&'static str, &'static str)> {
+        let mut all = App::picker_hints();
+        all.extend(App::lyrics_hints(true));
+        all.extend(App::lyrics_hints(false));
+        for queue in [false, true] {
+            all.extend(App::browse_hints(Panel::Songs, queue));
+            all.extend(App::browse_hints(Panel::Playlists, queue));
+        }
+        all
+    }
+
+    /// `"j / k"` and `"q · Ctrl+C"` name two keys each; `"l/↵"` names two ways
+    /// into one action.
+    fn keys_named(label: &str) -> Vec<String> {
+        // The filter key is a slash, so it is a label and not a separator.
+        if label.trim() == "/" {
+            return vec!["/".to_string()];
+        }
+        label
+            .split(['/', '·'])
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_keymap_and_the_hint_bar_agree() {
+        // A binding in the overlay but in no hint bar is one nobody finds
+        // without opening the overlay — which is the thing the bar is for.
+        let named: std::collections::HashSet<String> = all_hints()
+            .iter()
+            .flat_map(|(k, _)| keys_named(k))
+            .collect();
+        for (label, desc) in App::KEYMAP {
+            if label.is_empty() {
+                continue; // spacer
+            }
+            let keys = keys_named(label);
+            assert!(
+                keys.iter()
+                    // The bar abbreviates the space bar, and Ctrl+C is the
+                    // signal-free spelling of `q` rather than a key of its own.
+                    .any(|k| named.contains(k)
+                        || (k == "space" && named.contains("spc"))
+                        || k == "Ctrl+C"),
+                "{label:?} ({desc}) is in the keymap but in no hint bar"
+            );
+        }
+    }
+
+    #[test]
+    fn no_hint_bar_names_a_key_twice() {
+        for context in [
+            App::picker_hints(),
+            App::lyrics_hints(true),
+            App::browse_hints(Panel::Songs, false),
+            App::browse_hints(Panel::Songs, true),
+            App::browse_hints(Panel::Playlists, false),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for (key, _) in &context {
+                assert!(seen.insert(*key), "{key:?} twice in {context:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_way_to_the_full_keymap_survives_a_narrow_terminal() {
+        // The lists are long now, and `fit_hints` drops from the end. `?` has
+        // to land inside 80 columns or a narrow terminal shows no way to the
+        // rest of the bindings.
+        for context in [
+            App::lyrics_hints(true),
+            App::browse_hints(Panel::Songs, false),
+            App::browse_hints(Panel::Songs, true),
+            App::browse_hints(Panel::Playlists, false),
+        ] {
+            let shown = fit_hints(&context, 80);
+            let text: String = shown.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.contains('?'), "no `?` in 80 columns: {text:?}");
+        }
     }
 
     #[test]

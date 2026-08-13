@@ -240,6 +240,7 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate down / up (scroll lyrics in lyrics mode) |
+| `PgUp` / `PgDn` | (in lyrics mode) Scroll lyrics five lines |
 | `h` / `l` | Switch panels (Playlists ↔ Songs) |
 | `Enter` | Open playlist / play song / play from queue |
 | `/` | Enter filter mode (songs or queue panel) |
@@ -261,9 +262,15 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `?` | Full keymap overlay (any key closes it) |
 | `q` / `Ctrl+C` | Quit |
 
-The one-row help bar shows only as many hints as fit, dropping whole hints from
-the end (`fit_hints`) — the full list needs ~143 columns, so `?` is where the
-complete keymap lives.
+Each context's hint list names *every* key that works in it, and `fit_hints` drops
+whole hints from the end until what is left fits the terminal — so order is
+priority order, and a wider terminal is simply a longer bar. `?` sits sixth in
+every list rather than last, because it is the way to the bindings below it and
+must survive 80 columns; `the_way_to_the_full_keymap_survives_a_narrow_terminal`
+is the test that says so. `App::KEYMAP` is the `?` overlay, and
+`the_keymap_and_the_hint_bar_agree` fails if it grows a binding no hint bar names.
+`Self::TAIL` is the set that works everywhere (seek, volume, mute, mode, panel,
+quit), appended to every context except the modal picker.
 
 Note: raw mode clears `ISIG`, so `Ctrl+C` never becomes a signal — `app.rs` matches it as a
 key event. The `ctrlc` handler in `main.rs` only covers SIGTERM/SIGHUP.
