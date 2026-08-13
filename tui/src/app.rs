@@ -747,6 +747,15 @@ fn kind_marker(kind: ResultKind) -> (&'static str, Style) {
 
 // ── app ───────────────────────────────────────────────────────────────────────
 
+/// Why [`App::run`] returned, for the caller to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    /// The user quit. Nothing left to do.
+    Quit,
+    /// The session needs renewing and the app wants starting again after it.
+    Reauth,
+}
+
 pub struct App {
     library: Library,
     list_state: TableState,
@@ -760,6 +769,11 @@ pub struct App {
     queue_view_state: TableState,
     notification: Option<(String, Instant)>,
     reauth_requested: bool,
+    /// Whether an empty library may renew the session by itself: a browser on
+    /// record, the setting left on, and no renewal tried yet this run. Off, an
+    /// empty library is reported and `r` is the way out, since the fallback is
+    /// a set of prompts and those are not something to start unasked.
+    auto_reauth: bool,
     // background song loading
     songs_rx: std::sync::mpsc::Receiver<SongBatch>,
     /// Kept so `r` can ask again for a playlist whose fetch failed.
@@ -858,6 +872,7 @@ impl App {
         fetcher: LibraryFetcher,
         rt: tokio::runtime::Handle,
         config: ytm_core::Config,
+        auto_reauth: bool,
     ) -> Self {
         let yt = fetcher.client();
         let n = library.len();
@@ -895,6 +910,7 @@ impl App {
             queue_view_state: TableState::default(),
             notification: None,
             reauth_requested: false,
+            auto_reauth,
             songs_rx,
             fetcher,
             pending_queue_restore: saved_queue,
@@ -1912,8 +1928,21 @@ impl App {
         }
     }
 
-    pub fn run(mut self) -> anyhow::Result<()> {
+    pub fn run(mut self) -> anyhow::Result<Exit> {
         use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+
+        // An expired session looks, from here, like an account with no
+        // playlists. Where the renewal is silent the caller does it and starts
+        // us again, so there is nothing worth drawing first — the TUI never
+        // appears, rather than appearing empty for the time yt-dlp takes.
+        // Returning before `init` also leaves the saved queue alone: it has
+        // not been restored yet, and saving it back now would be saving
+        // nothing over it.
+        if self.auto_reauth && self.library.is_empty() {
+            log::info!("no playlists and a browser on record — renewing without asking");
+            return Ok(Exit::Reauth);
+        }
+
         let mut terminal = ratatui::init();
         ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
         let result = self.event_loop(&mut terminal);
@@ -1943,13 +1972,14 @@ impl App {
         }
 
         result?;
-        if self.reauth_requested {
-            std::fs::remove_file(ytm_core::session::browser_json_path()).ok();
-            let session = ytm_core::Session::new()?;
-            session.run_setup()?;
-            eprintln!("\nSetup complete. Run the app again to start.");
-        }
-        Ok(())
+        // The renewal itself belongs to `main.rs`: it is what builds a session
+        // from it and starts everything again, so the app comes back rather
+        // than ending with something for the user to run.
+        Ok(if self.reauth_requested {
+            Exit::Reauth
+        } else {
+            Exit::Quit
+        })
     }
 
     // ── event loop ────────────────────────────────────────────────────────────

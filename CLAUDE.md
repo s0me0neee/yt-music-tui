@@ -44,8 +44,16 @@ On first run (`browser.json` absent), the app runs an interactive setup that she
 `yt-dlp --cookies-from-browser` to extract YouTube cookies from a local browser profile.
 The browser that worked is written to `config.toml` as `auth.cookie-browser`, so a later
 expiry renews itself by re-running yt-dlp rather than prompting — set `auth.auto-reauth =
-false` to always be asked. `Session::reauth` reports which happened via `Reauth`, and an
-automatic renewal lets `main.rs` carry on instead of asking for a restart.
+false` to always be asked. `Session::reauth` returns with a working session either way —
+silently from the browser on record, or through the prompts — so every caller carries
+straight on and nothing ever ends with "run the app again"; `Reauth` says which happened,
+for the log and the wording. `main.rs` is a loop around one `start()`: an expired session
+reaches the TUI as an account with no playlists, so `App::run` returns `Exit::Reauth`
+*before* `ratatui::init` — the renewal happens, everything is built again in the same
+process, and the TUI appears once, populated, with nothing pressed. `session::can_auto_reauth`
+(a browser on record and the setting on) is what makes that self-starting: without it the
+fallback is a set of prompts, which only a keypress should open. Only the first start may
+renew on its own, so a library that really is empty is reported once, with `r` to ask again.
 Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
 `lyrics.json`, `translations.json`, `config.toml`, `app.log`). Everything but `config.toml`
 is written by the app; `config.toml` is the hand-edited one, read once at startup by

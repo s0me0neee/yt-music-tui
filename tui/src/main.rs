@@ -5,7 +5,7 @@ use simplelog::{Config, LevelFilter, WriteLogger};
 use std::fs::File;
 use std::sync::Arc;
 
-use ytm_core::{Reauth, Session, library, persistence, session, shutdown};
+use ytm_core::{Session, library, persistence, session, shutdown};
 
 #[hotpath::main]
 fn main() -> anyhow::Result<()> {
@@ -29,6 +29,35 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    // Expired cookies are renewed and everything built again from the top, in
+    // this same process: `reauth` returns with a working session either way, so
+    // there is never an app to run again by hand. Only the *first* start may
+    // renew on its own, though — an account whose library really is empty must
+    // not have us renewing it once a run forever, so after one attempt an empty
+    // library is reported and `r` is what asks for another.
+    let mut renewed = false;
+    loop {
+        match start(&session, &rt, !renewed)? {
+            app::Exit::Quit => return Ok(()),
+            app::Exit::Reauth => {
+                session.reauth()?;
+                renewed = true;
+            }
+        }
+    }
+}
+
+/// One full start: client, playlists, background fetches, TUI. Returns when the
+/// TUI does, saying whether it wants the session renewed and another go.
+fn start(
+    session: &Session,
+    rt: &tokio::runtime::Runtime,
+    auto_reauth: bool,
+) -> anyhow::Result<app::Exit> {
     // Build the API client immediately with cached cookies, then kick off a
     // background refresh so yt-dlp's 2-5 s run doesn't block startup.
     let mut yt = match session.build_client() {
@@ -36,11 +65,7 @@ fn main() -> anyhow::Result<()> {
         Err(e) => {
             log::error!("build_client failed: {e:#}");
             eprintln!("\nFailed to load session: {e}");
-            // A silent renewal leaves us able to carry straight on; being
-            // walked through setup does not, since the app has to restart.
-            if session.reauth()? == Reauth::Interactive {
-                return Ok(());
-            }
+            session.reauth()?;
             session.build_client()?
         }
     };
@@ -54,16 +79,10 @@ fn main() -> anyhow::Result<()> {
         })
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
     let playlists = match rt.block_on(library::get_playlists(&yt)) {
         Ok(p) => p,
         Err(ytm_core::Error::SessionExpired) => {
-            if session.reauth()? == Reauth::Interactive {
-                return Ok(());
-            }
+            session.reauth()?;
             yt = session.build_client()?;
             rt.block_on(library::get_playlists(&yt))?
         }
@@ -83,8 +102,18 @@ fn main() -> anyhow::Result<()> {
     // Read after `Session::new` has ensured the file exists.
     let config = ytm_core::Config::load();
 
-    let result =
-        app::App::new(lib, saved_queue, songs_rx, fetcher, rt.handle().clone(), config).run();
+    // Renewing on our own is only ever the silent path — the fallback is a set
+    // of prompts, and those belong to a keypress that asked for them.
+    let result = app::App::new(
+        lib,
+        saved_queue,
+        songs_rx,
+        fetcher,
+        rt.handle().clone(),
+        config,
+        auto_reauth && session::can_auto_reauth(),
+    )
+    .run();
 
     // Wait for cookie refresh before exiting so browser.json is never partial.
     let _ = cookie_refresh.join();

@@ -245,12 +245,22 @@ pub fn configured_browser() -> Option<Browser> {
         .and_then(|raw| Browser::parse(raw.trim()))
 }
 
-/// What [`Session::reauth`] did, so a caller can tell "carry on" from "restart".
+/// Whether [`Session::reauth`] would renew silently — a browser on record and
+/// the setting left on. Asked *before* re-authenticating, by a caller deciding
+/// whether it can do so on its own: an automatic renewal is a yt-dlp run and a
+/// couple of lines on stderr, while the interactive fallback is a conversation,
+/// and only the first is something to start without being asked to.
+pub fn can_auto_reauth() -> bool {
+    configured_browser().is_some() && crate::config::Config::load().auth.auto_reauth
+}
+
+/// What [`Session::reauth`] did, so a caller can tell a silent renewal from one
+/// the user was walked through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reauth {
     /// Renewed with yt-dlp and no questions. The session is usable now.
     Automatic,
-    /// The user was taken through setup and the app should restart.
+    /// The user was taken through setup. The session is usable now too.
     Interactive,
 }
 
@@ -377,16 +387,17 @@ impl Session {
         Ok(())
     }
 
-    /// Drops the current session (`browser.json` + the browser marker file)
-    /// and re-runs the interactive setup flow.
+    /// Renews the session: silently from the browser on record where
+    /// [`can_auto_reauth`] says so, otherwise by dropping the current session
+    /// (`browser.json` + the browser marker file) and re-running interactive
+    /// setup. Either way it returns with a usable session or an error, so the
+    /// caller can carry straight on.
     pub fn reauth(&self) -> Result<Reauth> {
         // A session almost always expires for the dull reason — the cookies
         // rotated — and the fix is the same yt-dlp run that set it up. Asking
         // which method to use, then which browser, to arrive back where we
         // started is a conversation with no content.
-        if let Some(browser) = configured_browser()
-            && crate::config::Config::load().auth.auto_reauth
-        {
+        if let Some(browser) = configured_browser().filter(|_| can_auto_reauth()) {
             eprintln!("\nSession expired — renewing from {browser} via yt-dlp…");
             match self.setup_with_browser(browser) {
                 Ok(()) => {
@@ -405,7 +416,7 @@ impl Session {
 
         self.clear()?;
         self.run_setup()?;
-        eprintln!("\nSetup complete. Restart the app to continue.\n");
+        eprintln!("\nSetup complete.\n");
         Ok(Reauth::Interactive)
     }
 
