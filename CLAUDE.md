@@ -280,6 +280,11 @@ tui/        the ratatui frontend — single `ytm` binary
     modal listing the user's own playlists to add it to, `/` returns to the query line.
     Liked Music is special-cased: its id is literally `LM` and it is the like button rather
     than a playlist items can be added to.
+    `search_has_focus` is the one predicate deciding whether the panel owns the keyboard, and
+    the key dispatch, the hint bar and the header colour all read it, so they cannot disagree.
+    Typing a query and the add modal take every key regardless of focus — `h` mid-word must
+    type an `h` — but once there are results to move through, `h`/`l` are the ordinary panel
+    keys and focus returns to the playlists, exactly as in lyrics mode.
   - **Cover art** (`kitty.rs`) draws the highlighted result's cover with the kitty graphics
     protocol. It works *around* ratatui rather than through it: the frame is drawn with that
     rectangle left empty, then the image is placed over it afterwards, because the terminal

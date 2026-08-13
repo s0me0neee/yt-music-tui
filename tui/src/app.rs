@@ -898,6 +898,18 @@ impl App {
 
     // ── search ────────────────────────────────────────────────────────────────
 
+    /// Whether the search panel currently owns the keyboard.
+    ///
+    /// Typing a query and the add popup take every key regardless of which
+    /// panel has focus — otherwise `h` would leave mid-word. Past that it is
+    /// the ordinary `h`/`l` business, so moving focus to the playlists gives
+    /// the normal bindings back, exactly as it does in lyrics mode.
+    fn search_has_focus(&self) -> bool {
+        self.search.as_ref().is_some_and(|s| {
+            s.typing || s.add.is_some() || self.active_panel == Panel::Songs
+        })
+    }
+
     /// `s` — opens the search panel, or closes it if it is already open.
     fn toggle_search(&mut self) {
         if self.search.take().is_some() {
@@ -1087,6 +1099,10 @@ impl App {
                 }
             }
             KeyCode::Char('s') => self.toggle_search(),
+            // Panel movement, as everywhere else: the search panel keeps its
+            // results, focus goes to the playlists, `l` comes back.
+            KeyCode::Char('h') => self.active_panel = Panel::Playlists,
+            KeyCode::Char('l') => self.active_panel = Panel::Songs,
             KeyCode::Enter => self.play_search_result(),
             KeyCode::Char('a') => self.open_add_picker(),
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1963,8 +1979,14 @@ impl App {
                                 }
                             }
 
-                            // ── so does the search panel ──────────────────────────────
-                            _ if self.search.is_some() => {
+                            // ── so does the search panel, while it has focus ──────────
+                            // Not unconditionally: with focus moved to the
+                            // playlists the ordinary bindings apply, so `h`
+                            // leaves and `j`/`k` walk the playlists — the same
+                            // way lyrics mode behaves. Typing a query and the
+                            // add popup still take every key, or `h` would
+                            // leave mid-word.
+                            _ if self.search_has_focus() => {
                                 if self.handle_search_key(key.code) {
                                     break Ok(());
                                 }
@@ -2570,6 +2592,7 @@ impl App {
             ("Esc", "back"),
             ("?", "keys"),
             ("j/k", "select"),
+            ("h/l", "panel"),
             ("spc", "pause"),
             ("p/n", "skip"),
             ("←/→", "seek"),
@@ -2630,8 +2653,8 @@ impl App {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.lyrics_picker.is_some() {
             Self::picker_hints()
-        } else if let Some(search) = self.search.as_ref() {
-            Self::search_hints(search.typing)
+        } else if self.search_has_focus() {
+            Self::search_hints(self.search.as_ref().is_some_and(|s| s.typing))
         } else if self.lyrics_mode {
             Self::lyrics_hints(self.config.lyrics.ai_available())
         } else {
@@ -2862,10 +2885,10 @@ impl App {
     /// The search panel: query line, results, and a cover for the highlighted
     /// row where the terminal can draw one.
     fn render_search(&mut self, frame: &mut Frame, area: Rect) {
-        // Always drawn as focused: the panel takes every key while it is open,
-        // whichever panel the cursor was in before, so a dimmed header would
-        // be telling the user the opposite of what is true.
-        let focused = true;
+        // While a query is being typed the panel owns the keyboard whatever
+        // `active_panel` says, so it is focused by definition; once there are
+        // results to move through, focus is the ordinary `h`/`l` business.
+        let focused = self.search_has_focus();
         let Some(search) = self.search.as_ref() else {
             return;
         };
