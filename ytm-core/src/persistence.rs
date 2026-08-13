@@ -217,6 +217,24 @@ pub fn load_translations() -> Translations {
         .unwrap_or_default()
 }
 
+/// Where `position` points once only the entries at `kept` (original indices,
+/// ascending) are left, out of `len` survivors.
+///
+/// The same rule `player::remap_queue` follows, and for the same
+/// reason: a position is a place in the queue, so every entry dropped from
+/// *before* it takes it back one, and the entry it pointed at being dropped
+/// leaves it on whatever moved up into that place. Carrying the number across
+/// unchanged is what made a queue with one unresolvable entry — a track played
+/// from search, whose playlist is synthetic and never comes back — resume on
+/// the wrong song.
+fn follow_position(position: Option<usize>, kept: &[usize], len: usize) -> Option<usize> {
+    let p = position?;
+    if len == 0 {
+        return None;
+    }
+    Some(kept.iter().take_while(|&&i| i < p).count().min(len - 1))
+}
+
 /// Serialises a live queue into a [`QueueState`] ready for [`save_queue`].
 /// Returns `None` if the queue is empty or none of its entries resolve to a
 /// (non-empty) video ID.
@@ -228,14 +246,17 @@ pub fn build_queue_state(
     if queue.is_empty() {
         return None;
     }
+    let mut kept: Vec<usize> = Vec::with_capacity(queue.len());
     let entries: Vec<QueueEntry> = queue
         .iter()
-        .filter_map(|&(pl_idx, song_idx)| {
+        .enumerate()
+        .filter_map(|(i, &(pl_idx, song_idx))| {
             let video_id = library.track(pl_idx, song_idx)?.video_id.clone()?;
             if video_id.is_empty() {
                 return None;
             }
             let playlist_id = library.playlist(pl_idx).map(|p| p.playlist_id.clone());
+            kept.push(i);
             Some(QueueEntry {
                 playlist_id,
                 video_id,
@@ -245,6 +266,7 @@ pub fn build_queue_state(
     if entries.is_empty() {
         return None;
     }
+    let position = follow_position(position, &kept, entries.len());
     Some(QueueState { entries, position })
 }
 
@@ -286,13 +308,16 @@ pub fn try_restore(library: &Library, saved: &QueueState) -> RestoreOutcome {
         }
     }
 
+    let mut kept: Vec<usize> = Vec::with_capacity(saved.entries.len());
     let queue: Vec<TrackRef> = saved
         .entries
         .iter()
-        .filter_map(|entry| {
+        .enumerate()
+        .filter_map(|(i, entry)| {
             let pl_id = entry.playlist_id.as_deref()?;
             let pl_idx = library.find_playlist_index(pl_id)?;
             let song_idx = library.find_song_index(pl_idx, &entry.video_id)?;
+            kept.push(i);
             Some((pl_idx, song_idx))
         })
         .collect();
@@ -301,7 +326,10 @@ pub fn try_restore(library: &Library, saved: &QueueState) -> RestoreOutcome {
         return RestoreOutcome::Abandoned;
     }
 
-    let position = saved.position.filter(|&p| p < queue.len()).or(Some(0));
+    // Followed across the entries that didn't resolve rather than clamped: a
+    // saved position is an index into the queue as saved, and dropping the
+    // entries before it moves the song it names up by exactly as many.
+    let position = follow_position(saved.position, &kept, queue.len()).or(Some(0));
     RestoreOutcome::Ready { queue, position }
 }
 
@@ -416,9 +444,72 @@ mod tests {
             panic!("the resolvable entry should have survived");
         };
         assert_eq!(queue, [(0, 1)], "only the track that still exists");
-        // The saved position pointed past the shortened queue, so it falls
-        // back to the start rather than dangling.
+        // Entry 1 was the one playing, and the entry before it dropped out —
+        // so it is now entry 0, and that is what resumes.
         assert_eq!(position, Some(0));
+    }
+
+    #[test]
+    fn the_position_follows_the_song_it_named_rather_than_its_number() {
+        // Three saved entries, playing the third; the first is a search track
+        // whose synthetic playlist is gone. Clamping the number instead of
+        // following it resumed on `aaa` — the wrong song, every launch.
+        let mut lib = library();
+        lib.apply_song_batch(0, Some(vec![track("aaa"), track("bbb")]));
+        let saved = QueueState {
+            entries: vec![
+                QueueEntry {
+                    playlist_id: Some("__search__".to_string()),
+                    video_id: "zzz".to_string(),
+                },
+                QueueEntry {
+                    playlist_id: Some("PL1".to_string()),
+                    video_id: "aaa".to_string(),
+                },
+                QueueEntry {
+                    playlist_id: Some("PL1".to_string()),
+                    video_id: "bbb".to_string(),
+                },
+            ],
+            position: Some(2),
+        };
+        let RestoreOutcome::Ready { queue, position } = try_restore(&lib, &saved) else {
+            panic!("the resolvable entries should have survived");
+        };
+        assert_eq!(queue, [(0, 0), (0, 1)]);
+        assert_eq!(position, Some(1), "still `bbb`");
+    }
+
+    #[test]
+    fn a_saved_queue_records_the_position_of_what_is_playing() {
+        // The other half of the same rule: a queue entry with no video id
+        // can't be written out, and the position has to move with the rest.
+        let mut lib = library();
+        lib.apply_song_batch(
+            0,
+            Some(vec![
+                Track {
+                    video_id: None,
+                    ..track("gone")
+                },
+                track("aaa"),
+                track("bbb"),
+            ]),
+        );
+        let state =
+            build_queue_state(&lib, &[(0, 0), (0, 1), (0, 2)], Some(2)).expect("something to save");
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.position, Some(1), "still `bbb`");
+    }
+
+    #[test]
+    fn a_position_on_a_dropped_entry_lands_on_what_replaced_it() {
+        assert_eq!(follow_position(Some(1), &[0, 2], 2), Some(1));
+        assert_eq!(follow_position(Some(0), &[1, 2], 2), Some(0));
+        // Past the end of what is left, it lands on the last entry.
+        assert_eq!(follow_position(Some(5), &[0, 1], 2), Some(1));
+        assert_eq!(follow_position(Some(1), &[], 0), None);
+        assert_eq!(follow_position(None, &[0], 1), None);
     }
 
     // ── translations ─────────────────────────────────────────────────────────

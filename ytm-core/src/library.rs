@@ -264,16 +264,24 @@ impl Library {
     /// `None` is a failed fetch. It leaves the playlist *unloaded* and flags
     /// it, so the UI can offer a retry and a saved queue that references it
     /// keeps waiting rather than being abandoned.
+    ///
+    /// Unless the playlist is already loaded, in which case the failure is
+    /// only a *re*fetch's — the copy on screen is still a good one, and the
+    /// tracks in it are still playable. Flagging it there would replace a
+    /// working playlist with "couldn't load this playlist" because a request
+    /// made after adding a track happened to time out.
     pub fn apply_song_batch(&mut self, idx: usize, songs: Option<Vec<Track>>) {
         let Some(entry) = self.entries.get_mut(idx) else {
             return;
         };
         let Some(songs) = songs else {
-            log::warn!(
-                "library: {:?} could not be fetched",
-                entry.playlist.title.as_str()
-            );
-            entry.failed = true;
+            let title = entry.playlist.title.as_str();
+            if entry.loaded {
+                log::warn!("library: {title:?} could not be fetched again — keeping what we have");
+            } else {
+                log::warn!("library: {title:?} could not be fetched");
+                entry.failed = true;
+            }
             return;
         };
         entry.total_duration_secs = songs
@@ -427,6 +435,19 @@ mod tests {
         lib.apply_song_batch(0, Some(vec![track("aaa")]));
         assert!(lib.is_loaded(0));
         assert!(!lib.has_failed(0));
+    }
+
+    #[test]
+    fn a_refetch_that_fails_leaves_the_playlist_it_already_had() {
+        // The refetch after `a` is the one that does this, and a playlist the
+        // user is looking at must not turn into an error panel because a
+        // second request timed out.
+        let mut lib = library();
+        lib.apply_song_batch(0, Some(vec![track("aaa")]));
+        lib.apply_song_batch(0, None);
+        assert!(lib.is_loaded(0));
+        assert!(!lib.has_failed(0));
+        assert_eq!(lib.songs(0).len(), 1);
     }
 
     #[test]

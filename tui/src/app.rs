@@ -270,7 +270,15 @@ fn moved_indices(before: &[Option<String>], now: &[Track]) -> Option<Vec<Option<
         .collect();
     let moved: Vec<Option<usize>> = before
         .iter()
-        .map(|id| id.as_deref().and_then(|id| places.get(id).copied()))
+        .enumerate()
+        .map(|(i, id)| match id.as_deref() {
+            Some(id) => places.get(id).copied(),
+            // A track with no video id is unplayable and unmatchable, so it is
+            // left exactly where it was rather than counted as having moved —
+            // otherwise one such track means every refetch of that playlist
+            // reads as a reorder and drops it out of the queue.
+            None => Some(i),
+        })
         .collect();
     moved
         .iter()
@@ -929,6 +937,10 @@ pub struct App {
     /// Fetches in flight, so a cover is asked for once however many times the
     /// selection passes over its row.
     cover_pending: std::collections::HashSet<String>,
+    /// Fetches that failed. Without this the next tick asks again — and the
+    /// tick after that — so a thumbnail URL that 404s becomes a request every
+    /// 200 ms for as long as its row stays highlighted.
+    cover_failed: std::collections::HashSet<String>,
     cover_tx: std::sync::mpsc::Sender<CoverMsg>,
     cover_rx: std::sync::mpsc::Receiver<CoverMsg>,
     /// What is on the terminal, and where. Only touched after a frame is
@@ -1026,6 +1038,7 @@ impl App {
             covers: std::collections::HashMap::new(),
             cover_order: Vec::new(),
             cover_pending: std::collections::HashSet::new(),
+            cover_failed: std::collections::HashSet::new(),
             cover_tx,
             cover_rx,
             canvas: kitty::Canvas::default(),
@@ -1359,7 +1372,10 @@ impl App {
         let Some((id, url)) = self.wanted_cover() else {
             return;
         };
-        if self.covers.contains_key(&id) || !self.cover_pending.insert(id.clone()) {
+        if self.covers.contains_key(&id)
+            || self.cover_failed.contains(&id)
+            || !self.cover_pending.insert(id.clone())
+        {
             return;
         }
         ytm_core::cover::spawn_fetch(
@@ -1392,7 +1408,17 @@ impl App {
     fn drain_covers(&mut self) {
         while let Ok(CoverMsg { video_id, result }) = self.cover_rx.try_recv() {
             self.cover_pending.remove(&video_id);
-            let Ok(cover) = result else { continue };
+            let cover = match result {
+                Ok(cover) => cover,
+                Err(e) => {
+                    // Remembered, not retried: the URL came from the track and
+                    // will not change, so asking again every tick would only
+                    // repeat the same failure at the frame rate.
+                    log::debug!("cover: {video_id} failed ({e}) — not asking again");
+                    self.cover_failed.insert(video_id);
+                    continue;
+                }
+            };
             self.cover_order.retain(|id| id != &video_id);
             while self.cover_order.len() >= MAX_COVERS {
                 let oldest = self.cover_order.remove(0);
@@ -2935,9 +2961,12 @@ impl App {
                 Span::styled(format!("/{}", self.filter), theme::WARN),
                 Span::styled("█", theme::WARN),
             ];
+            // Saturating: a filter query can be longer than the terminal is
+            // wide, and the room left for hints is then none rather than a
+            // subtraction that underflows.
             spans.extend(fit_hints(
                 &[("↵", "confirm"), ("Esc", "cancel")],
-                area.width as usize - width_of(&self.filter) - 2,
+                (area.width as usize).saturating_sub(width_of(&self.filter) + 2),
             ));
             Line::from(spans)
         } else if let Some((msg, _)) = &self.notification {
@@ -4453,6 +4482,16 @@ mod tests {
             // whatever took its place.
             let out = moved_indices(&ids(&["a", "b", "c"]), &songs(&["c", "a"]));
             assert_eq!(out, Some(vec![Some(1), None, Some(0)]));
+        }
+
+        #[test]
+        fn a_track_with_no_video_id_is_not_a_reorder() {
+            // Unplayable and unmatchable, so it counts as staying put. Read as
+            // "gone" it would make every refetch of a playlist holding one look
+            // like a reorder, and drop it from the queue each time.
+            let before = vec![Some("a".to_string()), None, Some("b".to_string())];
+            let now = songs(&["a", "x", "b"]);
+            assert_eq!(moved_indices(&before, &now), None);
         }
 
         #[test]
