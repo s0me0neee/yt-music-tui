@@ -275,8 +275,13 @@ pub fn try_restore(library: &Library, saved: &QueueState) -> RestoreOutcome {
         let Some(pl_id) = entry.playlist_id.as_deref() else {
             continue;
         };
+        // A playlist that isn't there is one entry's problem, not the queue's.
+        // Abandoning the lot was survivable while every entry came from the
+        // library; it stopped being so once a queue could also hold tracks
+        // played from search, whose synthetic playlist never resolves — one
+        // such entry would have thrown away a queue built over weeks.
         let Some(pl_idx) = library.find_playlist_index(pl_id) else {
-            return RestoreOutcome::Abandoned;
+            continue;
         };
         if !library.is_loaded(pl_idx) {
             return RestoreOutcome::Pending;
@@ -386,6 +391,35 @@ mod tests {
             try_restore(&lib, &saved()),
             RestoreOutcome::Abandoned
         ));
+    }
+
+    #[test]
+    fn one_unresolvable_entry_does_not_cost_the_rest_of_the_queue() {
+        // The entry from a search: its playlist is synthetic and exists only
+        // for the session it was played in. Dropping the whole queue over it
+        // would lose everything the user had lined up.
+        let mut lib = library();
+        lib.apply_song_batch(0, Some(vec![track("aaa"), track("bbb")]));
+        let saved = QueueState {
+            entries: vec![
+                QueueEntry {
+                    playlist_id: Some("__search__".to_string()),
+                    video_id: "zzz".to_string(),
+                },
+                QueueEntry {
+                    playlist_id: Some("PL1".to_string()),
+                    video_id: "bbb".to_string(),
+                },
+            ],
+            position: Some(1),
+        };
+        let RestoreOutcome::Ready { queue, position } = try_restore(&lib, &saved) else {
+            panic!("the resolvable entry should have survived");
+        };
+        assert_eq!(queue, [(0, 1)], "only the track that still exists");
+        // The saved position pointed past the shortened queue, so it falls
+        // back to the start rather than dangling.
+        assert_eq!(position, Some(0));
     }
 
     // ── translations ─────────────────────────────────────────────────────────

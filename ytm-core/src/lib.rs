@@ -3,6 +3,7 @@
 //! it can be driven by something else too (e.g. a headless daemon).
 
 pub mod config;
+pub mod cover;
 pub mod error;
 pub mod library;
 pub mod lyrics;
@@ -10,17 +11,20 @@ pub mod mpris;
 pub mod persistence;
 pub mod playback;
 pub mod player;
+pub mod search;
 pub mod session;
 pub mod shutdown;
 pub mod translate;
 
 pub use config::Config;
+pub use cover::{Cover, CoverMsg};
 pub use error::{Error, Result};
 pub use library::{Album, Artist, Library, Playlist, PlaylistEntry, Track};
 pub use lyrics::{LyricsKind, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 pub use mpris::{MediaCmd, MediaControls, NowPlaying, PlayState, TrackInfo};
 pub use playback::AudioState;
 pub use player::{AppendOutcome, PlayMode, Player, RemoveOutcome, TrackRef};
+pub use search::{ResultKind, SearchMsg, SearchResult};
 pub use session::{Browser, Reauth, Session};
 pub use translate::TranslateMsg;
 

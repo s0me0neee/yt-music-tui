@@ -52,6 +52,12 @@ pub const TEMPLATE: &str = "\
 # DeepSeek key becomes that provider's default.
 #ai-key-env = \"ANTHROPIC_API_KEY\"
 
+[ui]
+# Show cover art in the search panel, using the kitty graphics protocol. Only
+# ever attempted on a terminal known to speak it — kitty, Ghostty, WezTerm —
+# so the default is safe everywhere; set false to turn it off on one that does.
+#covers = true
+
 [auth]
 # Renew an expired session by re-running yt-dlp against the browser below,
 # instead of asking which method to use. Set false to always be asked.
@@ -99,13 +105,32 @@ const KNOWN: &[(&str, &[&str])] = &[
             "ai-key-env",
         ],
     ),
+    ("ui", &["covers"]),
     ("auth", &["auto-reauth", "cookie-browser"]),
 ];
 
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub lyrics: Lyrics,
+    pub ui: Ui,
     pub auth: Auth,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ui {
+    /// Show cover art in the search panel where the terminal can draw it.
+    ///
+    /// On by default because it is *asked for* rather than assumed: the
+    /// frontend only tries where it recognises the terminal, so a terminal that
+    /// would print the escape sequences as text never gets them. This setting
+    /// is for turning it off on one that could.
+    pub covers: bool,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Self { covers: true }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +328,7 @@ impl Config {
     /// rest of the file.
     fn from_table(table: &toml::Table) -> Self {
         let lyrics = table.get("lyrics").and_then(toml::Value::as_table);
+        let ui = table.get("ui").and_then(toml::Value::as_table);
         let auth = table.get("auth").and_then(toml::Value::as_table);
         let d = Self::default();
         Self {
@@ -312,6 +338,9 @@ impl Config {
                 ai_translation: field(lyrics, "ai-translation", d.lyrics.ai_translation),
                 ai_model: field(lyrics, "ai-model", d.lyrics.ai_model),
                 ai_key_env: field(lyrics, "ai-key-env", d.lyrics.ai_key_env),
+            },
+            ui: Ui {
+                covers: field(ui, "covers", d.ui.covers),
             },
             auth: Auth {
                 auto_reauth: field(auth, "auto-reauth", d.auth.auto_reauth),
@@ -697,6 +726,20 @@ mod tests {
         // Forward compatibility: a setting from a newer version, or a stray
         // key, must not cost the user the settings that are valid.
         let c = parse("[lyrics]\noffset = -0.4\nsomething_else = true\n");
+        assert_eq!(c.lyrics.offset, -0.4);
+    }
+
+    // ── ui ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn covers_are_on_unless_turned_off() {
+        assert!(Config::default().ui.covers);
+        assert!(parse("").ui.covers);
+        assert!(parse(TEMPLATE).ui.covers, "the template is all defaults");
+        assert!(!parse("[ui]\ncovers = false\n").ui.covers);
+        // A value of the wrong type costs the setting, not the file.
+        let c = parse("[ui]\ncovers = \"no\"\n[lyrics]\noffset = -0.4\n");
+        assert!(c.ui.covers);
         assert_eq!(c.lyrics.offset, -0.4);
     }
 

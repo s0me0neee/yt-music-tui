@@ -137,6 +137,14 @@ impl LibraryFetcher {
         (fetcher, rx)
     }
 
+    /// The authenticated client, for the calls that aren't playlist fetches —
+    /// search, and adding a track to a playlist. Handed out rather than
+    /// wrapped so `search.rs` can own its own policy.
+    #[must_use]
+    pub fn client(&self) -> Arc<YTMusicClient> {
+        Arc::clone(&self.yt)
+    }
+
     /// Re-runs one playlist's fetch. The result arrives on the same channel as
     /// the first attempt's, so nothing else has to know it was a retry.
     pub fn fetch(&self, idx: usize, playlist_id: &str) {
@@ -267,6 +275,60 @@ impl Library {
         }
     }
 
+    /// The playlist id of the synthetic entry holding tracks played from
+    /// search. Not a real playlist — YouTube has never heard of it — so it is
+    /// spelled distinctively enough that it can never collide with one.
+    pub const SEARCH_PLAYLIST_ID: &'static str = "__search__";
+
+    /// Files `track` under the search playlist and returns where it landed,
+    /// creating that playlist the first time something is played from search.
+    ///
+    /// Everything downstream of here — the queue, the player, the lyrics cache,
+    /// prefetch — addresses a track as `(playlist, song)`, so the cheapest way
+    /// to make a search result playable is to give it somewhere to live. A
+    /// track already filed keeps its place, so replaying one from a later
+    /// search doesn't accumulate copies.
+    pub fn place_search_result(&mut self, track: Track) -> (usize, usize) {
+        let pl_idx = match self.find_playlist_index(Self::SEARCH_PLAYLIST_ID) {
+            Some(idx) => idx,
+            None => {
+                self.entries.push(PlaylistEntry {
+                    playlist: Playlist {
+                        playlist_id: Self::SEARCH_PLAYLIST_ID.to_string(),
+                        title: "Search".to_string(),
+                        count: None,
+                    },
+                    songs: Vec::new(),
+                    // Nothing is ever fetched for it, so it is born finished.
+                    loaded: true,
+                    failed: false,
+                    total_duration_secs: 0,
+                });
+                self.entries.len() - 1
+            }
+        };
+
+        let entry = &mut self.entries[pl_idx];
+        if let Some(video_id) = track.video_id.as_deref()
+            && let Some(song_idx) = entry
+                .songs
+                .iter()
+                .position(|t| t.video_id.as_deref() == Some(video_id))
+        {
+            return (pl_idx, song_idx);
+        }
+        entry.total_duration_secs += u64::from(track.duration_seconds.unwrap_or(0));
+        entry.songs.push(track);
+        (pl_idx, entry.songs.len() - 1)
+    }
+
+    /// Whether `idx` is the search playlist rather than one of the user's.
+    #[must_use]
+    pub fn is_search_playlist(&self, idx: usize) -> bool {
+        self.playlist(idx)
+            .is_some_and(|p| p.playlist_id == Self::SEARCH_PLAYLIST_ID)
+    }
+
     pub fn find_playlist_index(&self, playlist_id: &str) -> Option<usize> {
         self.entries
             .iter()
@@ -345,6 +407,36 @@ mod tests {
         lib.apply_song_batch(0, Some(vec![track("aaa")]));
         assert!(lib.is_loaded(0));
         assert!(!lib.has_failed(0));
+    }
+
+    #[test]
+    fn a_search_result_gets_somewhere_to_live() {
+        let mut lib = library();
+        assert_eq!(lib.len(), 1);
+        let (pl, song) = lib.place_search_result(track("zzz"));
+        assert_eq!(lib.len(), 2, "the search playlist was created");
+        assert!(lib.is_search_playlist(pl));
+        assert!(!lib.is_search_playlist(0));
+        assert_eq!(lib.track(pl, song).unwrap().video_id.as_deref(), Some("zzz"));
+        // Born finished: nothing will ever be fetched for it, and an unloaded
+        // playlist would leave a restored queue waiting for ever.
+        assert!(lib.is_loaded(pl));
+        assert!(!lib.has_failed(pl));
+    }
+
+    #[test]
+    fn playing_the_same_search_result_twice_does_not_duplicate_it() {
+        let mut lib = library();
+        let first = lib.place_search_result(track("zzz"));
+        let again = lib.place_search_result(track("zzz"));
+        assert_eq!(first, again);
+        assert_eq!(lib.songs(first.0).len(), 1);
+
+        // A different track goes alongside it.
+        let other = lib.place_search_result(track("yyy"));
+        assert_eq!(other, (first.0, 1));
+        assert_eq!(lib.songs(first.0).len(), 2);
+        assert_eq!(lib.total_duration_secs(first.0), 200);
     }
 
     #[test]

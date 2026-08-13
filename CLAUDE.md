@@ -63,7 +63,7 @@ by something other than the ratatui frontend.
 
 ```
 lrclib/     lyrics.net API client + LRC format parser (no app knowledge)
-ytm-core/   session/auth, library, playback, queue, lyrics policy, persistence
+ytm-core/   session/auth, library, search, playback, queue, lyrics policy, persistence
 tui/        the ratatui frontend — single `ytm` binary
 ```
 
@@ -153,6 +153,27 @@ tui/        the ratatui frontend — single `ytm` binary
   answered as `Playlist`: this player always wraps. No session bus (ssh, headless) ⇒ `new`
   returns `None` with a log line and nothing else changes. Linux-only; other targets get a
   same-shaped stub so `app.rs` needs no `cfg`.
+- **`search.rs`** — YouTube Music search, built on `YTMusicClient::send_request` since
+  `ytmusicapi 0.4.2` has no search of its own: same cookies, same context, no second HTTP
+  stack. Parsing walks the response for result rows rather than pathing into it — YouTube
+  renames renderers without notice, and the shelf became `musicCardShelfRenderer` between one
+  probe and the next. Within a row the walk is unambiguous: over ~340 rows measured, none
+  carried two different `videoId`s or `musicVideoType`s, so "the first hit inside this row" is
+  always the row's own (`examples/search_verify.rs` is the check).
+  Songs *and* videos are fetched, deliberately, as two filtered requests rather than one
+  unfiltered one — an unfiltered search mixes in artists, playlists, podcasts and profiles,
+  15 of 32 rows on a measured query having no video id at all. `musicVideoType` reduces to
+  `ResultKind`: `ATV` is an *art track*, the label's catalogue audio wrapped in the album
+  cover, which is what the UI calls a Song and what carries a real album and release
+  duration; `OMV`/`UGC`/`OFFICIAL_SOURCE_MUSIC` are videos. Both are offered because plenty
+  of music exists on YouTube *only* as a video, and playback is unaffected either way — mpv
+  is given `bestaudio` and never fetches a video stream. `place_search_result` files a hit
+  into a synthetic `__search__` playlist so the queue, player, lyrics and prefetch can all
+  address it as the `(playlist, song)` pair they already expect.
+- **`cover.rs`** — fetches a thumbnail and decodes it to RGB. `at_size` rewrites the CDN's
+  own resize parameters (`=w120-h120-l90-rj`) to ask for a usable 480px instead of the 120px
+  a search row advertises; `Cover::scaled` box-averages down to the panel's size at draw
+  time, since going 480→160 by point sampling drops eight of every nine pixels.
 - **`persistence.rs`** — all through `write_private` (above), since these are written on the
   way out, when an interrupted write is most likely. `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID), `translations.json` (**AI** translations, keyed by lrclib
@@ -196,6 +217,8 @@ tui/        the ratatui frontend — single `ytm` binary
   checked against the endpoint's own list at startup and cleared if unknown, because an
   unknown code is answered with the input unchanged rather than an error. Empty (the
   default) means nothing is ever sent to a translation service.
+  `ui.covers` turns cover art off on a terminal that could draw it; it is never *attempted*
+  on one the frontend doesn't recognise, so the default is safe everywhere.
   `auth.auto-reauth` / `auth.cookie-browser` drive silent re-authentication.
   `remember_cookie_browser` writes back through `toml_edit`, so the user's comments and
   formatting survive — this is the one file the app both reads and writes.
@@ -250,6 +273,26 @@ tui/        the ratatui frontend — single `ytm` binary
     either way; only the AI ones outlive it, in `translations.json`. Pressing the same key
     twice is the retry after a failure; `r` throws the translation on screen away — memory
     and disk both — and fetches another, whichever translator made it.
+  - **Search**: `s` opens it — a query line, then results. Songs are listed before videos and
+    each row is marked `♪ song` or `▶ video` with its length, because the two are genuinely
+    different things and the choice should be deliberate. `↵` plays (through
+    `place_search_result`, so it queues and gets lyrics like any other track), `a` opens a
+    modal listing the user's own playlists to add it to, `/` returns to the query line.
+    Liked Music is special-cased: its id is literally `LM` and it is the like button rather
+    than a playlist items can be added to.
+  - **Cover art** (`kitty.rs`) draws the highlighted result's cover with the kitty graphics
+    protocol. It works *around* ratatui rather than through it: the frame is drawn with that
+    rectangle left empty, then the image is placed over it afterwards, because the terminal
+    composites images above the cell grid. That persistence is what the module is mostly
+    about — an image left behind hangs over whatever comes next, so `Canvas` tracks exactly
+    what is on screen and where, redraws only when one of those changes (resending a megabyte
+    per frame is how a TUI starts to flicker), and deletes on every exit path including
+    `Drop`. Support is detected from the environment rather than by querying the terminal:
+    crossterm owns stdin in raw mode, and a query a terminal ignores would hang startup — so
+    kitty, Ghostty and WezTerm get covers and everything else silently gets none, which is
+    the right direction to be wrong in when the failure mode is base64 sprayed across the
+    screen. `q=2` on every escape suppresses the terminal's reply, which crossterm would
+    otherwise read as keypresses.
   - **Wrapping** (`wrap_n_lines`) measures display *cells*, not `char`s: a CJK lyric is two
     cells per character and would otherwise run to twice the panel width and be clipped.
 
@@ -278,6 +321,7 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `a` | Append selected song to queue |
 | `d` | Remove selected queue entry |
 | `o` | Toggle queue / songs view |
+| `s` | Search YouTube Music (`↵` play, `a` add to a playlist, `/` edit query) |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |
 | `i` | (in lyrics mode) Toggle the translation under each line, from the free endpoint |
@@ -356,6 +400,14 @@ an optimisation: `deepseek-v4-flash` thinks by default, thinking is charged agai
 max_tokens`, 80 seconds to fail, then a silent fall through to the free path. Disabled, the
 same request is 3.7s and 541 tokens. Nothing on this path needs deliberation; alignment is a
 rule, not a judgement.
+
+`jpeg-decoder 0.3.2` decodes cover art, with `default-features = false` to drop rayon — a
+120px thumbnail decodes in well under a millisecond and does not want a thread pool, still
+less a second one beside tokio's. It is the only image dependency because it is the only
+format that arrives: YouTube's image CDN serves `…-rj`, where `rj` *is* "return JPEG". Base64
+for the kitty protocol is hand-written in `tui/src/kitty.rs` for the same reason
+`translate::percent_encode` is — a dozen lines of table lookup against a dependency to audit
+and pin.
 
 Key deps: `ratatui 0.30`, `ytmusicapi 0.4.2`, `libmpv2 6`, `reqwest 0.12`, `thiserror 1`,
 `mpris-server 0.10` (Linux only),

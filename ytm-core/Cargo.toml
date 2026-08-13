@@ -28,6 +28,12 @@ toml = { version = "0.8.23", default-features = false, features = ["parse"] }
 # Format-preserving edits: the app records the browser that worked back into
 # config.toml, which is hand-edited and full of comments worth keeping.
 toml_edit = "0.22.27"
+# Cover art. `default-features = false` drops rayon: a 120px thumbnail decodes
+# in well under a millisecond and does not want a thread pool, which would also
+# be a second one alongside tokio's. The only image format needed is JPEG —
+# YouTube's image CDN serves `…=w120-h120-l90-rj`, where `rj` *is* "return
+# JPEG" — so the `image` crate and its format zoo buy nothing here.
+jpeg-decoder = { version = "0.3.2", default-features = false }
 thiserror = "1"
 log = "0.4"
 rand = "0.8"

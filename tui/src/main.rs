@@ -1,4 +1,5 @@
 mod app;
+mod kitty;
 
 use simplelog::{Config, LevelFilter, WriteLogger};
 use std::fs::File;

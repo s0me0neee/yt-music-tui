@@ -17,12 +17,15 @@ use ratatui::{
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
 use ytm_core::library::{LibraryFetcher, SongBatch};
+use ytm_core::search::{self, ResultKind, SearchMsg, SearchResult};
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
 use ytm_core::{
-    AppendOutcome, AudioState, Library, MediaCmd, MediaControls, NowPlaying, PlayState, Player,
-    RemoveOutcome, Track, TrackInfo, TranslateMsg,
+    AppendOutcome, AudioState, Cover, CoverMsg, Library, MediaCmd, MediaControls, NowPlaying,
+    PlayState, Player, RemoveOutcome, Track, TrackInfo, TranslateMsg,
 };
+
+use crate::kitty;
 
 // ── theme ────────────────────────────────────────────────────────────────────
 
@@ -642,6 +645,64 @@ fn initial_picker_row(items: &[TrackLyrics], on_screen: Option<u64>, overridden:
         .map_or(0, |i| i + 1)
 }
 
+// ── search ────────────────────────────────────────────────────────────────────
+
+/// Covers held in memory before the oldest is dropped. Each is a few hundred
+/// kilobytes of decoded pixels, and only one is ever on screen.
+const MAX_COVERS: usize = 32;
+
+/// The search panel: a query line, a result list, and optionally the "add to"
+/// popup over the top of it.
+struct SearchState {
+    /// What the user has typed.
+    query: String,
+    /// Still editing the query, rather than moving through results. `Enter`
+    /// crosses from one to the other and `/`-style editing never resumes by
+    /// accident, so `j` means "down a result" and not "type a j".
+    typing: bool,
+    /// The query the results below actually belong to, so a stale response for
+    /// a query since retyped can be recognised and dropped.
+    ran: String,
+    results: Vec<SearchResult>,
+    state: TableState,
+    loading: bool,
+    error: Option<String>,
+    /// The `a` popup: which library to add the selected result to.
+    add: Option<TableState>,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            typing: true,
+            ran: String::new(),
+            results: Vec::new(),
+            state: TableState::default(),
+            loading: false,
+            error: None,
+            add: None,
+        }
+    }
+
+    fn selected(&self) -> Option<&SearchResult> {
+        self.results.get(self.state.selected()?)
+    }
+}
+
+/// The marker and colour for a result's kind.
+///
+/// A song is an art track — the label's own audio, with an album and the
+/// release duration — and is what you want when it exists. A video may be the
+/// only copy of a track that was never distributed as one, so it is offered
+/// rather than hidden, but marked clearly enough that the choice is deliberate.
+fn kind_marker(kind: ResultKind) -> (&'static str, Style) {
+    match kind {
+        ResultKind::Song => ("♪ song ", theme::ACCENT),
+        ResultKind::Video => ("▶ video", theme::WARN),
+    }
+}
+
 // ── app ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -718,6 +779,31 @@ pub struct App {
     /// MPRIS: the media keys and the desktop's player list. `None` when there
     /// is no session bus to serve on.
     media: Option<MediaControls>,
+    // search
+    /// The authenticated client, for the calls that aren't library fetches.
+    yt: std::sync::Arc<ytm_core::YTMusicClient>,
+    /// `None` until `s` opens the search panel.
+    search: Option<SearchState>,
+    search_tx: std::sync::mpsc::Sender<SearchMsg>,
+    search_rx: std::sync::mpsc::Receiver<SearchMsg>,
+    // cover art
+    /// Decoded covers by video id, bounded — each is a few hundred kilobytes
+    /// of pixels and a long search session would otherwise keep every one.
+    covers: std::collections::HashMap<String, Cover>,
+    /// Insertion order for [`Self::covers`], oldest first.
+    cover_order: Vec<String>,
+    /// Fetches in flight, so a cover is asked for once however many times the
+    /// selection passes over its row.
+    cover_pending: std::collections::HashSet<String>,
+    cover_tx: std::sync::mpsc::Sender<CoverMsg>,
+    cover_rx: std::sync::mpsc::Receiver<CoverMsg>,
+    /// What is on the terminal, and where. Only touched after a frame is
+    /// drawn — see [`Self::draw_cover`].
+    canvas: kitty::Canvas,
+    /// Whether this terminal can show a cover at all.
+    covers_enabled: bool,
+    /// The rectangle the last frame left empty for the cover, if any.
+    cover_area: Option<Rect>,
 }
 
 impl App {
@@ -729,6 +815,7 @@ impl App {
         rt: tokio::runtime::Handle,
         config: ytm_core::Config,
     ) -> Self {
+        let yt = fetcher.client();
         let n = library.len();
         let selected = (n > 0).then_some(0);
 
@@ -738,6 +825,13 @@ impl App {
 
         let (lyrics_tx, lyrics_rx) = std::sync::mpsc::channel();
         let (translate_tx, translate_rx) = std::sync::mpsc::channel();
+        let (search_tx, search_rx) = std::sync::mpsc::channel();
+        let (cover_tx, cover_rx) = std::sync::mpsc::channel();
+
+        // Decided once: it depends on the terminal the app was launched in,
+        // which cannot change under it.
+        let covers_enabled = config.ui.covers && kitty::supported();
+        log::info!("covers: {}", if covers_enabled { "on" } else { "off" });
 
         let media = MediaControls::new(&rt);
 
@@ -787,6 +881,355 @@ impl App {
             config,
             lyrics_dirty: false,
             media,
+            yt,
+            search: None,
+            search_tx,
+            search_rx,
+            covers: std::collections::HashMap::new(),
+            cover_order: Vec::new(),
+            cover_pending: std::collections::HashSet::new(),
+            cover_tx,
+            cover_rx,
+            canvas: kitty::Canvas::default(),
+            covers_enabled,
+            cover_area: None,
+        }
+    }
+
+    // ── search ────────────────────────────────────────────────────────────────
+
+    /// `s` — opens the search panel, or closes it if it is already open.
+    fn toggle_search(&mut self) {
+        if self.search.take().is_some() {
+            self.canvas.clear();
+            self.cover_area = None;
+            return;
+        }
+        // Lyrics take the same column, and two panels cannot both have it.
+        self.lyrics_mode = false;
+        self.lyrics_picker = None;
+        self.search = Some(SearchState::new());
+    }
+
+    /// Runs whatever is in the query line.
+    fn submit_search(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let query = search.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        search.typing = false;
+        search.loading = true;
+        search.error = None;
+        search.ran = query.clone();
+        search::spawn_search(
+            &self.lyrics_handle,
+            std::sync::Arc::clone(&self.yt),
+            query,
+            self.search_tx.clone(),
+        );
+    }
+
+    /// Plays the highlighted result.
+    ///
+    /// A search hit has no place in the library, and everything downstream
+    /// addresses a track by its position in one — so it is given a place first.
+    fn play_search_result(&mut self) {
+        let Some(hit) = self.search.as_ref().and_then(SearchState::selected).cloned() else {
+            return;
+        };
+        let (pl, song) = self.library.place_search_result(hit.to_track());
+        self.player.play(&self.library, pl, song);
+        self.sync_queue_view();
+        self.notify(format!("Playing: {}", hit.title));
+    }
+
+    /// `a` — opens the "add to" popup for the highlighted result.
+    fn open_add_picker(&mut self) {
+        if self.library.is_empty() {
+            self.notify("No playlists to add to");
+            return;
+        }
+        if let Some(search) = self.search.as_mut()
+            && search.selected().is_some()
+        {
+            let mut state = TableState::default();
+            state.select(Some(0));
+            search.add = Some(state);
+        }
+    }
+
+    /// The playlists offered by the `a` popup — the user's own, never the
+    /// synthetic one search results are filed under.
+    fn add_targets(&self) -> Vec<(usize, &str)> {
+        self.library
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.library.is_search_playlist(*i))
+            .map(|(i, e)| (i, e.playlist.title.as_str()))
+            .collect()
+    }
+
+    /// Sends the highlighted result to the highlighted playlist.
+    fn commit_add(&mut self) {
+        let targets: Vec<(String, String)> = self
+            .add_targets()
+            .into_iter()
+            .filter_map(|(i, title)| {
+                Some((
+                    self.library.playlist(i)?.playlist_id.clone(),
+                    title.to_string(),
+                ))
+            })
+            .collect();
+
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let Some(row) = search.add.as_ref().and_then(TableState::selected) else {
+            return;
+        };
+        let Some((playlist_id, title)) = targets.get(row).cloned() else {
+            return;
+        };
+        let Some(hit) = search.selected().cloned() else {
+            return;
+        };
+        search.add = None;
+
+        // Liked Music is not a playlist you can add items to — it is the
+        // like button, under a different name.
+        let playlist_id = if playlist_id.eq_ignore_ascii_case("LM") {
+            String::new()
+        } else {
+            playlist_id
+        };
+        self.notify(format!("Adding to {title}…"));
+        search::spawn_add(
+            &self.lyrics_handle,
+            std::sync::Arc::clone(&self.yt),
+            playlist_id,
+            hit.video_id,
+            hit.title,
+            title,
+            self.search_tx.clone(),
+        );
+    }
+
+    /// Keys while the search panel has focus. `true` means quit.
+    fn handle_search_key(&mut self, code: KeyCode) -> bool {
+        // The popup is modal within the panel.
+        if self.search.as_ref().is_some_and(|s| s.add.is_some()) {
+            let n = self.add_targets().len();
+            match code {
+                KeyCode::Esc | KeyCode::Char('a') => {
+                    if let Some(s) = self.search.as_mut() {
+                        s.add = None;
+                    }
+                }
+                KeyCode::Enter => self.commit_add(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(state) = self.search.as_mut().and_then(|s| s.add.as_mut()) {
+                        let next = state.selected().map_or(0, |i| (i + 1) % n.max(1));
+                        state.select(Some(next));
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(state) = self.search.as_mut().and_then(|s| s.add.as_mut()) {
+                        let prev = state
+                            .selected()
+                            .map_or(0, |i| if i == 0 { n.saturating_sub(1) } else { i - 1 });
+                        state.select(Some(prev));
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        let typing = self.search.as_ref().is_some_and(|s| s.typing);
+        if typing {
+            match code {
+                KeyCode::Esc => self.toggle_search(),
+                KeyCode::Enter => self.submit_search(),
+                KeyCode::Backspace => {
+                    if let Some(s) = self.search.as_mut() {
+                        s.query.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(s) = self.search.as_mut() {
+                        s.query.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        match code {
+            KeyCode::Char('q') => return true,
+            // Back to the query line, so a refinement doesn't need the panel
+            // closed and reopened. A second Esc closes it.
+            KeyCode::Esc => {
+                if let Some(s) = self.search.as_mut() {
+                    s.typing = true;
+                } else {
+                    self.toggle_search();
+                }
+            }
+            KeyCode::Char('/') => {
+                if let Some(s) = self.search.as_mut() {
+                    s.typing = true;
+                }
+            }
+            KeyCode::Char('s') => self.toggle_search(),
+            KeyCode::Enter => self.play_search_result(),
+            KeyCode::Char('a') => self.open_add_picker(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(s) = self.search.as_mut() {
+                    s.state.select_next();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(s) = self.search.as_mut() {
+                    s.state.select_previous();
+                }
+            }
+            KeyCode::Char(' ') => self.player.play_pause(&self.library),
+            KeyCode::Char('n') => {
+                self.player.next(&self.library);
+                self.sync_queue_view();
+            }
+            KeyCode::Char('p') => {
+                if self.player.restart_or_previous(&self.library) {
+                    self.sync_queue_view();
+                }
+            }
+            KeyCode::Left => self.player.seek(-5.0),
+            KeyCode::Right => self.player.seek(5.0),
+            KeyCode::Char('m') => self.player.toggle_mute(),
+            KeyCode::Char('?') => self.show_keymap = true,
+            _ => {}
+        }
+        false
+    }
+
+    /// Drain finished searches and adds.
+    fn drain_search(&mut self) {
+        while let Ok(msg) = self.search_rx.try_recv() {
+            match msg {
+                SearchMsg::Results { query, result } => {
+                    let Some(search) = self.search.as_mut() else {
+                        continue;
+                    };
+                    // The user has typed something else since; this answer is
+                    // to a question no longer being asked.
+                    if search.ran != query {
+                        continue;
+                    }
+                    search.loading = false;
+                    match result {
+                        Ok(results) => {
+                            search.state.select((!results.is_empty()).then_some(0));
+                            search.results = results;
+                            search.error = None;
+                        }
+                        Err(e) => {
+                            log::warn!("search: {query:?} failed: {e}");
+                            search.results.clear();
+                            search.error = Some(e);
+                        }
+                    }
+                }
+                SearchMsg::Added {
+                    title,
+                    where_to,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        log::info!("search: added {title:?} to {where_to:?}");
+                        self.notify(format!("Added {title} to {where_to}"));
+                    }
+                    Err(e) => {
+                        log::warn!("search: adding {title:?} to {where_to:?} failed: {e}");
+                        self.notify(format!("Couldn't add to {where_to}: {e}"));
+                    }
+                },
+            }
+        }
+    }
+
+    // ── cover art ─────────────────────────────────────────────────────────────
+
+    /// Starts a fetch for the highlighted result's cover, if it isn't held or
+    /// already coming.
+    fn ensure_cover(&mut self) {
+        if !self.covers_enabled {
+            return;
+        }
+        let Some((id, url)) = self.search.as_ref().and_then(|s| {
+            let hit = s.selected()?;
+            Some((hit.video_id.clone(), hit.thumbnail.clone()?))
+        }) else {
+            return;
+        };
+        if self.covers.contains_key(&id) || !self.cover_pending.insert(id.clone()) {
+            return;
+        }
+        ytm_core::cover::spawn_fetch(
+            &self.lyrics_handle,
+            id,
+            url,
+            self.cover_tx.clone(),
+        );
+    }
+
+    fn drain_covers(&mut self) {
+        while let Ok(CoverMsg { video_id, result }) = self.cover_rx.try_recv() {
+            self.cover_pending.remove(&video_id);
+            let Ok(cover) = result else { continue };
+            self.cover_order.retain(|id| id != &video_id);
+            while self.cover_order.len() >= MAX_COVERS {
+                let oldest = self.cover_order.remove(0);
+                self.covers.remove(&oldest);
+            }
+            self.cover_order.push(video_id.clone());
+            self.covers.insert(video_id, cover);
+        }
+    }
+
+    /// Puts the highlighted result's cover on screen.
+    ///
+    /// Called *after* the frame is drawn, because the image is composited over
+    /// the cell grid rather than into it — drawing it first would put ratatui's
+    /// own repaint of that rectangle on top of nothing, and the image under a
+    /// frame that has already been flushed.
+    fn draw_cover(&mut self) {
+        if !self.covers_enabled {
+            return;
+        }
+        let Some(area) = self.cover_area else {
+            self.canvas.clear();
+            return;
+        };
+        let Some(id) = self
+            .search
+            .as_ref()
+            .and_then(SearchState::selected)
+            .map(|h| h.video_id.clone())
+        else {
+            self.canvas.clear();
+            return;
+        };
+        match self.covers.get(&id) {
+            Some(cover) => self.canvas.show(&id, cover, area),
+            // Not arrived yet: leave the space blank rather than the previous
+            // track's art sitting under the wrong title.
+            None => self.canvas.clear(),
         }
     }
 
@@ -986,6 +1429,10 @@ impl App {
 
     fn toggle_lyrics_mode(&mut self) {
         self.lyrics_mode = !self.lyrics_mode;
+        if self.lyrics_mode && self.search.take().is_some() {
+            self.canvas.clear();
+            self.cover_area = None;
+        }
         self.lyrics_picker = None;
         self.reset_lyrics_view();
     }
@@ -1460,6 +1907,9 @@ impl App {
             self.drain_lyrics();
             self.drain_translations();
             self.drain_media();
+            self.drain_search();
+            self.drain_covers();
+            self.ensure_cover();
             // Kicked off from here rather than on each key: this one lookup
             // covers entering lyrics mode, p/n, auto-advance and Enter alike.
             if self.lyrics_mode
@@ -1481,6 +1931,9 @@ impl App {
                 self.notification = None;
             }
             term.draw(|frame| self.render(frame))?;
+            // After the frame: the terminal composites the image over the cell
+            // grid, so it has to be placed onto a grid that is already there.
+            self.draw_cover();
             if self.player.handle_song_end(&self.library) {
                 self.sync_queue_view();
             }
@@ -1506,6 +1959,13 @@ impl App {
                             // ── the picker owns all input while it is open ────────────
                             _ if self.lyrics_picker.is_some() => {
                                 if self.handle_picker_key(key.code) {
+                                    break Ok(());
+                                }
+                            }
+
+                            // ── so does the search panel ──────────────────────────────
+                            _ if self.search.is_some() => {
+                                if self.handle_search_key(key.code) {
                                     break Ok(());
                                 }
                             }
@@ -1653,6 +2113,7 @@ impl App {
                             // ── volume ────────────────────────────────────────────────
                             KeyCode::Up => self.player.adjust_volume(5),
                             KeyCode::Down => self.player.adjust_volume(-5),
+                            KeyCode::Char('s') => self.toggle_search(),
                             KeyCode::Char('?') => self.show_keymap = true,
                             // ── lyrics ────────────────────────────────────────────────
                             KeyCode::Char('y') => self.toggle_lyrics_mode(),
@@ -2089,6 +2550,36 @@ impl App {
         keys
     }
 
+    /// The search panel. Two contexts really — typing a query, and moving
+    /// through what came back — and the keys differ enough that showing both
+    /// at once would be a lie about half of them.
+    fn search_hints(typing: bool) -> Vec<(&'static str, &'static str)> {
+        if typing {
+            return vec![
+                ("↵", "search"),
+                ("Esc", "close"),
+                ("?", "keys"),
+                ("spc", "pause"),
+            ];
+        }
+        let mut keys = vec![
+            ("↵", "play"),
+            ("a", "add to…"),
+            ("/", "edit query"),
+            ("s", "close"),
+            ("Esc", "back"),
+            ("?", "keys"),
+            ("j/k", "select"),
+            ("spc", "pause"),
+            ("p/n", "skip"),
+            ("←/→", "seek"),
+            ("m", "mute"),
+            ("q", "quit"),
+        ];
+        keys.dedup();
+        keys
+    }
+
     fn browse_hints(panel: Panel, queue: bool) -> Vec<(&'static str, &'static str)> {
         let mut keys = match (panel, queue) {
             (Panel::Playlists, _) => vec![
@@ -2099,6 +2590,7 @@ impl App {
                 ("o", "queue"),
                 ("?", "keys"),
                 ("y", "lyrics"),
+                ("s", "search"),
             ],
             (Panel::Songs, false) => vec![
                 ("↵", "play"),
@@ -2108,6 +2600,7 @@ impl App {
                 ("o", "queue"),
                 ("?", "keys"),
                 ("y", "lyrics"),
+                ("s", "search"),
                 ("p/n", "skip"),
                 ("j/k", "nav"),
                 ("Esc", "back"),
@@ -2119,6 +2612,7 @@ impl App {
                 ("o", "songs"),
                 ("y", "lyrics"),
                 ("?", "keys"),
+                ("s", "search"),
                 ("p/n", "skip"),
                 ("j/k", "nav"),
                 ("/", "filter"),
@@ -2136,6 +2630,8 @@ impl App {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.lyrics_picker.is_some() {
             Self::picker_hints()
+        } else if let Some(search) = self.search.as_ref() {
+            Self::search_hints(search.typing)
         } else if self.lyrics_mode {
             Self::lyrics_hints(self.config.lyrics.ai_available())
         } else {
@@ -2189,6 +2685,9 @@ impl App {
         ("a", "Add selected song to queue"),
         ("d", "Remove selected queue entry"),
         ("o", "Toggle queue / songs"),
+        ("", ""),
+        ("s", "Search YouTube Music"),
+        ("a", "In search: add the result to a playlist"),
         ("", ""),
         ("y", "Toggle lyrics"),
         ("c", "Choose lyrics source (in lyrics)"),
@@ -2358,7 +2857,294 @@ impl App {
 
     // ── right panel ───────────────────────────────────────────────────────────
 
+    // ── search panel ──────────────────────────────────────────────────────────
+
+    /// The search panel: query line, results, and a cover for the highlighted
+    /// row where the terminal can draw one.
+    fn render_search(&mut self, frame: &mut Frame, area: Rect) {
+        // Always drawn as focused: the panel takes every key while it is open,
+        // whichever panel the cursor was in before, so a dimmed header would
+        // be telling the user the opposite of what is true.
+        let focused = true;
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+
+        // The header carries the query, so the results keep every row.
+        let mut query = vec![
+            Span::styled("/", theme::WARN),
+            Span::styled(search.query.clone(), theme::WARN),
+        ];
+        if search.typing {
+            query.push(Span::styled("█", theme::WARN));
+        }
+        if !search.results.is_empty() {
+            query.push(Span::styled(
+                format!("  {} results", search.results.len()),
+                theme::DIM,
+            ));
+        }
+        let body = section(frame, area, "Search", Some(Line::from(query)), focused);
+        if body.height == 0 || body.width == 0 {
+            self.cover_area = None;
+            return;
+        }
+
+        if search.loading {
+            self.cover_area = None;
+            frame.render_stateful_widget(
+                Throbber::default()
+                    .label(" Searching YouTube Music…")
+                    .throbber_style(theme::ACCENT),
+                body,
+                &mut self.throbber_state,
+            );
+            return;
+        }
+
+        if let Some(err) = &search.error {
+            self.cover_area = None;
+            centered_message(
+                frame,
+                body,
+                vec![
+                    Line::styled("Search failed", theme::ERROR),
+                    Line::from(""),
+                    Line::styled(
+                        truncate_line(err, body.width as usize),
+                        theme::ERROR_BODY,
+                    ),
+                    Line::from(""),
+                    Line::from(hint("↵", "try again")),
+                ],
+            );
+            return;
+        }
+
+        if search.results.is_empty() {
+            self.cover_area = None;
+            let msg = if search.ran.is_empty() {
+                vec![
+                    Line::styled("Type a query, then press ↵", theme::DIM),
+                    Line::from(""),
+                    Line::styled(
+                        "Songs and videos both — some tracks only exist as a video.",
+                        theme::DIM,
+                    ),
+                ]
+            } else {
+                vec![Line::styled(
+                    format!("Nothing found for /{}", search.ran),
+                    theme::WARN,
+                )]
+            };
+            centered_message(frame, body, msg);
+            return;
+        }
+
+        // A cover column only where there is a terminal to draw into and room
+        // to do it — below this the list is worth more than the picture.
+        const COVER_COLS: u16 = 20;
+        let show_cover = self.covers_enabled && body.width > COVER_COLS + 30 && body.height >= 12;
+        let (list_area, cover_area) = if show_cover {
+            let [list, gap, cover] = body.layout(&Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(2),
+                Constraint::Length(COVER_COLS),
+            ]));
+            let _ = gap;
+            // Square-ish: cells are about twice as tall as they are wide.
+            let side = Rect {
+                height: (COVER_COLS / 2).min(cover.height),
+                ..cover
+            };
+            (list, Some(side))
+        } else {
+            (body, None)
+        };
+        self.cover_area = cover_area;
+
+        // The details under the cover, which the image must not overlap.
+        if let (Some(cover), Some(hit)) = (cover_area, search.selected()) {
+            let below = Rect {
+                y: cover.y + cover.height + 1,
+                height: body.height.saturating_sub(cover.height + 1),
+                ..cover
+            };
+            if below.height > 0 {
+                let mut lines = vec![Line::styled(
+                    truncate_line(&hit.title, below.width as usize),
+                    theme::PRIMARY,
+                )];
+                for (text, style) in [
+                    (hit.artist.clone(), theme::META),
+                    (hit.album.clone(), theme::DIM),
+                ] {
+                    if !text.is_empty() {
+                        lines.push(Line::styled(
+                            truncate_line(&text, below.width as usize),
+                            style,
+                        ));
+                    }
+                }
+                let (marker, style) = kind_marker(hit.kind);
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled(marker.trim().to_string(), style),
+                    Span::styled(
+                        if hit.duration.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {}", hit.duration)
+                        },
+                        theme::DIM,
+                    ),
+                ]));
+                // Only when it isn't obvious from the marker: an art track is
+                // the catalogue audio, which is not what "video" promises.
+                if hit.kind == ResultKind::Video {
+                    lines.push(Line::styled("audio only", theme::DIM));
+                }
+                frame.render_widget(Paragraph::new(lines), below);
+            }
+        }
+
+        let rows: Vec<Row> = search
+            .results
+            .iter()
+            .map(|hit| {
+                let (marker, marker_style) = kind_marker(hit.kind);
+                let mut spans = vec![Span::styled(
+                    truncate_line(&hit.title, (list_area.width / 2) as usize),
+                    theme::PRIMARY,
+                )];
+                if !hit.artist.is_empty() {
+                    spans.push(Span::styled(SEP, theme::DIM));
+                    spans.push(Span::styled(hit.artist.clone(), theme::META));
+                }
+                if !hit.album.is_empty() {
+                    spans.push(Span::styled(SEP, theme::DIM));
+                    spans.push(Span::styled(hit.album.clone(), theme::DIM));
+                }
+                Row::new(vec![
+                    Cell::from(Line::styled(marker, marker_style)),
+                    Cell::from(Line::from(spans)),
+                    Cell::from(Line::styled(hit.duration.clone(), theme::DIM).right_aligned()),
+                ])
+            })
+            .collect();
+
+        let n = rows.len();
+        frame.render_stateful_widget(
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(7),
+                    Constraint::Fill(1),
+                    // Seven, not six: the video results routinely include an
+                    // hour-long upload, and `1:03:04` does not fit in six.
+                    Constraint::Length(7),
+                ],
+            )
+            .row_highlight_style(if focused {
+                theme::SELECTED
+            } else {
+                theme::SELECTED_BLUR
+            })
+            .highlight_symbol("▸ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .column_spacing(1),
+            list_body(list_area, n),
+            &mut self.search.as_mut().expect("checked above").state,
+        );
+        render_scrollbar(
+            frame,
+            list_area,
+            n,
+            self.search.as_ref().and_then(|s| s.state.selected()),
+        );
+    }
+
+    /// The `a` popup: which of the user's libraries to add the highlighted
+    /// result to.
+    fn render_add_picker(&mut self, frame: &mut Frame, area: Rect) {
+        let targets: Vec<String> = self
+            .add_targets()
+            .into_iter()
+            .map(|(_, title)| title.to_string())
+            .collect();
+        let counts: Vec<usize> = self
+            .add_targets()
+            .into_iter()
+            .map(|(i, _)| self.library.songs(i).len())
+            .collect();
+        let title = self
+            .search
+            .as_ref()
+            .and_then(SearchState::selected)
+            .map(|h| h.title.clone())
+            .unwrap_or_default();
+
+        let Some(state) = self.search.as_mut().and_then(|s| s.add.as_mut()) else {
+            return;
+        };
+
+        let modal = area.centered(
+            Constraint::Length(area.width.saturating_sub(4).clamp(30, 54)),
+            Constraint::Length((targets.len() as u16 + 4).clamp(6, area.height.saturating_sub(2))),
+        );
+        let block = Block::bordered()
+            .title(Line::from(vec![
+                Span::styled(" Add ", theme::HEADER),
+                Span::styled(truncate_line(&title, 28), theme::PRIMARY),
+                Span::styled(" to ", theme::HEADER),
+            ]))
+            .title_bottom(Line::from(fit_hints(
+                &[("j/k", "select"), ("↵", "add"), ("Esc", "cancel")],
+                modal.width.saturating_sub(4) as usize,
+            )))
+            .border_style(theme::RULE)
+            .padding(Padding::horizontal(1));
+
+        // Without this the search results bleed through the modal.
+        frame.render_widget(Clear, modal);
+
+        let rows: Vec<Row> = targets
+            .iter()
+            .zip(&counts)
+            .map(|(name, count)| {
+                Row::new(vec![
+                    Cell::from(Line::styled(name.clone(), theme::PRIMARY)),
+                    Cell::from(
+                        Line::styled(count.to_string(), theme::DIM).right_aligned(),
+                    ),
+                ])
+            })
+            .collect();
+
+        frame.render_stateful_widget(
+            Table::new(rows, [Constraint::Fill(1), Constraint::Length(5)])
+                .block(block)
+                .row_highlight_style(theme::SELECTED)
+                .highlight_symbol("▶ ")
+                .column_spacing(1),
+            modal,
+            state,
+        );
+    }
+
     fn render_right_panel(&mut self, frame: &mut Frame, area: Rect) {
+        // Search takes the whole right column, like lyrics do. The cover is
+        // drawn onto it afterwards, outside ratatui — see `draw_cover`.
+        if self.search.is_some() {
+            self.render_search(frame, area);
+            if self.search.as_ref().is_some_and(|s| s.add.is_some()) {
+                self.render_add_picker(frame, area);
+            }
+            return;
+        }
+        self.cover_area = None;
+
         // Lyrics take over the whole right column — Info, Track and the song
         // list all give way to it.
         if self.lyrics_mode {
@@ -3666,6 +4452,8 @@ mod tests {
     /// Every hint list there is, including the one `I` only appears in.
     fn all_hints() -> Vec<(&'static str, &'static str)> {
         let mut all = App::picker_hints();
+        all.extend(App::search_hints(true));
+        all.extend(App::search_hints(false));
         all.extend(App::lyrics_hints(true));
         all.extend(App::lyrics_hints(false));
         for queue in [false, true] {
@@ -3718,6 +4506,7 @@ mod tests {
     fn no_hint_bar_names_a_key_twice() {
         for context in [
             App::picker_hints(),
+            App::search_hints(false),
             App::lyrics_hints(true),
             App::browse_hints(Panel::Songs, false),
             App::browse_hints(Panel::Songs, true),
@@ -3736,6 +4525,7 @@ mod tests {
         // to land inside 80 columns or a narrow terminal shows no way to the
         // rest of the bindings.
         for context in [
+            App::search_hints(false),
             App::lyrics_hints(true),
             App::browse_hints(Panel::Songs, false),
             App::browse_hints(Panel::Songs, true),
