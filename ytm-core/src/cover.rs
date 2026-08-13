@@ -14,12 +14,27 @@ use std::time::Duration;
 /// Cover art is decoration; it must never hold up the thing it decorates.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What to ask the CDN for.
+/// The range a cover is fetched in, whatever the caller asks to draw at.
 ///
 /// Search rows advertise a 120px thumbnail, which is mush once a terminal
 /// scales it into a block of cells. The size is a *URL parameter* rather than
-/// part of the stored path, so a larger one can simply be asked for.
-const WANT_PX: u32 = 480;
+/// part of the stored path, so a larger one can simply be asked for: measured
+/// against the CDN, every size up to 1400 comes back at exactly that size and
+/// anything beyond is served as 1400. The ceiling here is well under that —
+/// past twice what any terminal can show, the extra pixels are decode time and
+/// memory spent on detail that the downscale immediately averages away.
+const MIN_PX: u32 = 480;
+const MAX_PX: u32 = 1080;
+
+/// What to ask the CDN for, to end up drawing at `draw_px`.
+///
+/// Twice the drawn size, because [`Cover::scaled`] averages boxes of source
+/// pixels: 2×2 per output pixel is what makes an edge land smoothly rather than
+/// being point-sampled. The floor keeps the common case — a 240px card on an
+/// ordinary display — asking for the 480 it always did.
+fn fetch_px(draw_px: u32) -> u32 {
+    draw_px.saturating_mul(2).clamp(MIN_PX, MAX_PX)
+}
 
 /// A decoded cover: `width * height` pixels, three bytes each.
 #[derive(Debug, Clone)]
@@ -88,9 +103,11 @@ impl Cover {
     /// art into aliased noise. Averaging costs one pass and looks like the
     /// picture.
     ///
-    /// Cheap enough to do at draw time, and worth doing there rather than at
-    /// fetch time: the target size is a property of the panel, which changes
-    /// when the terminal is resized, while the fetched image does not.
+    /// Called twice on the way to the screen, which is not a duplication: once
+    /// on arrival, down to the largest square any panel could use, so nothing
+    /// bigger is ever held; then again at draw time, down to the rectangle the
+    /// panel actually got. Only the second can be decided in advance — a panel's
+    /// size changes with the terminal, while what was fetched does not.
     #[must_use]
     pub fn scaled(&self, max_w: u32, max_h: u32) -> Cover {
         if max_w == 0 || max_h == 0 || self.width == 0 || self.height == 0 {
@@ -141,7 +158,13 @@ pub struct CoverMsg {
     pub result: Result<Cover, String>,
 }
 
-/// Fetches and decodes one cover in the background.
+/// Fetches and decodes one cover in the background, sized to be drawn at
+/// `draw_px` — the largest square, in pixels, the caller will ever put it in.
+///
+/// It comes back already scaled to that, rather than at the size fetched: the
+/// downscale is the same box-average the drawing would do anyway, and doing it
+/// here does it once, off the UI thread, and leaves the caller holding the
+/// pixels it can show instead of the four times as many it asked the CDN for.
 ///
 /// Failures are reported rather than retried: a cover that doesn't arrive
 /// costs a blank square, and the panel it decorates is still fully usable.
@@ -149,11 +172,12 @@ pub fn spawn_fetch(
     handle: &tokio::runtime::Handle,
     video_id: String,
     url: String,
+    draw_px: u32,
     tx: Sender<CoverMsg>,
 ) {
-    let url = at_size(&url, WANT_PX);
+    let url = at_size(&url, fetch_px(draw_px));
     handle.spawn(async move {
-        let result = fetch(&url).await;
+        let result = fetch(&url).await.map(|c| c.scaled(draw_px, draw_px));
         if let Err(e) = &result {
             log::debug!("cover: {video_id} failed ({e})");
         }
@@ -282,24 +306,41 @@ mod tests {
         assert!(decode(&[0xFF, 0xD8, 0xFF, 0xE0]).is_err());
     }
 
+    #[test]
+    fn what_is_fetched_is_twice_what_is_drawn_within_bounds() {
+        // Twice the drawn size, so the box-average has 2×2 to work with.
+        assert_eq!(fetch_px(300), 600);
+        assert_eq!(fetch_px(540), MAX_PX);
+        // An ordinary terminal draws a 240px card, and asks for the 480 it
+        // always did rather than dropping to a thumbnail's worth of pixels.
+        assert_eq!(fetch_px(240), MIN_PX);
+        assert_eq!(fetch_px(0), MIN_PX);
+        // A wildly big request is capped rather than fetching a poster.
+        assert_eq!(fetch_px(u32::MAX), MAX_PX);
+    }
+
     /// Hits Google's image CDN. `cargo test -p ytm-core cover -- --ignored`
     #[tokio::test]
     #[ignore = "network"]
-    async fn live_a_cover_comes_back_bigger_than_advertised() {
+    async fn live_a_cover_comes_back_at_the_size_asked_for() {
         let url = "https://yt3.googleusercontent.com/WS2ZqBCuEsGugI4SFV43J_vtlgl0VHhXImpnOf_63h58UeU3H4HRhVDPuv96zuXE5Io8P3FnfbDmLcJuSQ=w120-h120-l90-rj";
-        let cover = fetch(&at_size(url, WANT_PX)).await.expect("fetched");
-        eprintln!(
-            "{}x{}, {} bytes",
-            cover.width,
-            cover.height,
-            cover.rgb.len()
-        );
-        // The row advertised 120px; asking for more is the whole point.
-        assert!(cover.width > 120, "got {}px", cover.width);
-        assert_eq!(
-            cover.rgb.len(),
-            (cover.width * cover.height * 3) as usize,
-            "not three bytes a pixel"
-        );
+        // The row advertised 120px. Both ends of the range come back at exactly
+        // what was asked for, which is what `fetch_px` counts on — a CDN that
+        // quietly served the stored 120 would make every ceiling here fiction.
+        for px in [MIN_PX, MAX_PX] {
+            let cover = fetch(&at_size(url, px)).await.expect("fetched");
+            eprintln!(
+                "{px} → {}x{}, {} bytes",
+                cover.width,
+                cover.height,
+                cover.rgb.len()
+            );
+            assert_eq!(cover.width, px, "asked for {px}px");
+            assert_eq!(
+                cover.rgb.len(),
+                (cover.width * cover.height * 3) as usize,
+                "not three bytes a pixel"
+            );
+        }
     }
 }

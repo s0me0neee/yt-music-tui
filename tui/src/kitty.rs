@@ -31,14 +31,37 @@ use ytm_core::Cover;
 /// characters per chunk.
 const CHUNK: usize = 4096;
 
-/// Rough pixel size of one terminal cell, for choosing how far to downscale.
+/// Pixel size of one terminal cell where the terminal won't say.
+const FALLBACK_CELL: (u32, u32) = (10, 20);
+
+/// Pixel size of one terminal cell.
 ///
-/// The exact figure would come from `TIOCGWINSZ`'s pixel fields, which plenty
-/// of terminals leave zeroed. It only decides how much data is sent — the
-/// terminal is told the target in *cells* and does the final fit itself — so an
-/// estimate costs a little bandwidth and nothing else.
-const CELL_W: u32 = 10;
-const CELL_H: u32 = 20;
+/// This decides how many pixels an image is sent at, since the terminal is told
+/// its target in *cells* and does the final fit itself: send fewer than the
+/// rectangle physically holds and the terminal scales up, which is what a soft
+/// cover on a HiDPI display actually is.
+///
+/// It comes from `TIOCGWINSZ`'s pixel fields, via crossterm — an ioctl, not a
+/// query written to the terminal, so unlike the graphics-protocol handshake in
+/// the module header it cannot hang waiting for a reply that never comes. The
+/// three terminals that get this far all fill those fields in; a zero, a size
+/// no font could have, or no tty at all falls back to a common 10×20.
+#[must_use]
+pub fn cell_size() -> (u32, u32) {
+    let Ok(ws) = ratatui::crossterm::terminal::window_size() else {
+        return FALLBACK_CELL;
+    };
+    if ws.columns == 0 || ws.rows == 0 {
+        return FALLBACK_CELL;
+    }
+    let w = u32::from(ws.width) / u32::from(ws.columns);
+    let h = u32::from(ws.height) / u32::from(ws.rows);
+    if (4..=64).contains(&w) && (8..=128).contains(&h) {
+        (w, h)
+    } else {
+        FALLBACK_CELL
+    }
+}
 
 /// Whether this terminal speaks the kitty graphics protocol.
 ///
@@ -117,9 +140,10 @@ impl Canvas {
         // old one has to go first, or both are on screen at once.
         self.delete();
 
+        let (cell_w, cell_h) = cell_size();
         let scaled = cover.scaled(
-            u32::from(area.width) * CELL_W,
-            u32::from(area.height) * CELL_H,
+            u32::from(area.width) * cell_w,
+            u32::from(area.height) * cell_h,
         );
         if let Err(e) = self.transmit(&scaled, area) {
             log::debug!("[kitty] cover failed to draw: {e}");
@@ -237,6 +261,16 @@ mod tests {
         // A move counts as a change, not just a different id.
         let moved = Rect::new(2, 1, 10, 5);
         assert!(!canvas.shown.as_ref().is_some_and(|(_, r)| *r == moved));
+    }
+
+    #[test]
+    fn a_cell_is_always_a_plausible_size() {
+        // Under `cargo test` there is no tty to ask, so this is the fallback
+        // path — which is the one worth pinning: a zero here would ask the CDN
+        // for a zero-pixel cover and send the terminal an empty image.
+        let (w, h) = cell_size();
+        assert!((4..=64).contains(&w), "{w}px wide");
+        assert!((8..=128).contains(&h), "{h}px tall");
     }
 
     #[test]

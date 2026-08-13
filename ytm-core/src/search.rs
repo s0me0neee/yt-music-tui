@@ -353,10 +353,13 @@ pub enum SearchMsg {
         query: String,
         result: std::result::Result<Vec<SearchResult>, String>,
     },
-    /// An `a` that has landed. `where_to` is the playlist's display name.
+    /// An `a` that has landed. `where_to` is the playlist's display name, and
+    /// `playlist` its index in the library — the playlist now has a track the
+    /// app's copy of it does not, so the caller knows exactly what to refetch.
     Added {
         title: String,
         where_to: String,
+        playlist: usize,
         result: std::result::Result<(), String>,
     },
 }
@@ -373,18 +376,34 @@ pub fn spawn_search(
     });
 }
 
-/// `playlist_id` empty means Liked Music, which is its own endpoint rather
-/// than a playlist you can add items to.
+/// One `a`: a track, and the playlist it is going to.
+pub struct AddRequest {
+    /// Empty means Liked Music, which is its own endpoint rather than a
+    /// playlist you can add items to.
+    pub playlist_id: String,
+    /// Where that playlist sits in the library, carried through so the answer
+    /// says which one to fetch again.
+    pub playlist: usize,
+    pub video_id: String,
+    /// The track's title and the playlist's, for what the answer has to say.
+    pub title: String,
+    pub where_to: String,
+}
+
 pub fn spawn_add(
     handle: &tokio::runtime::Handle,
     yt: Arc<YTMusicClient>,
-    playlist_id: String,
-    video_id: String,
-    title: String,
-    where_to: String,
+    request: AddRequest,
     tx: Sender<SearchMsg>,
 ) {
     handle.spawn(async move {
+        let AddRequest {
+            playlist_id,
+            playlist,
+            video_id,
+            title,
+            where_to,
+        } = request;
         let result = if playlist_id.is_empty() {
             like(&yt, &video_id).await
         } else {
@@ -393,6 +412,7 @@ pub fn spawn_add(
         let _ = tx.send(SearchMsg::Added {
             title,
             where_to,
+            playlist,
             result: result.map_err(|e| e.to_string()),
         });
     });

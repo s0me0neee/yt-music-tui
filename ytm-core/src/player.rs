@@ -29,6 +29,39 @@ fn should_step_back(elapsed: f64, loading: bool) -> bool {
     loading || elapsed < RESTART_WINDOW_SECS
 }
 
+/// `queue` with every entry put through `f`, dropping the ones it has no
+/// answer for, and `pos` still pointing at the entry it pointed at.
+///
+/// Split out of [`Player::remap_refs`] for the same reason [`reorder_to`] is
+/// split out — constructing a [`Player`] boots libmpv — and the position
+/// arithmetic is the part worth testing: an entry dropped from *before* the
+/// current one shifts it back, and the current one being dropped leaves the
+/// position on whatever has moved up into its place.
+fn remap_queue(
+    queue: &[TrackRef],
+    pos: Option<usize>,
+    mut f: impl FnMut(TrackRef) -> Option<TrackRef>,
+) -> (Vec<TrackRef>, Option<usize>) {
+    let mut out = Vec::with_capacity(queue.len());
+    let mut pos = pos;
+    for (i, entry) in queue.iter().enumerate() {
+        if let Some(mapped) = f(*entry) {
+            out.push(mapped);
+        } else if let Some(p) = pos.as_mut()
+            && i < *p
+        {
+            *p -= 1;
+        }
+    }
+    let pos = match pos {
+        // An empty queue has no position, however far the old one had got.
+        Some(_) if out.is_empty() => None,
+        Some(p) => Some(p.min(out.len() - 1)),
+        None => None,
+    };
+    (out, pos)
+}
+
 /// `current`, put back into the relative order `saved` had it in.
 ///
 /// Split out from [`Player::restore_order`] because constructing a [`Player`]
@@ -467,6 +500,45 @@ impl Player {
         }
     }
 
+    /// Rewrites every reference this player holds through `f`, dropping the
+    /// queue entries it answers `None` for.
+    ///
+    /// A [`TrackRef`] is a *position*, not an identity, so anything that
+    /// re-orders a playlist under it silently changes what the queue means.
+    /// That happens for real: adding a track to Liked Music puts it at the
+    /// *top*, so refetching that playlist moves every song down one, and a
+    /// queue nobody touched would come back playing the track before the one
+    /// it was on. Following a track across the change needs video ids, which
+    /// belong to the library rather than here — so the caller answers "where
+    /// did this one go" and this applies the answer to the queue, to the order
+    /// Shuffle is holding for later, and to what is playing.
+    ///
+    /// `f` should be total for the playing reference; a caller that cannot
+    /// find that track anywhere can always file it under the search playlist.
+    /// Answering `None` for it leaves audio running with nothing on screen
+    /// claiming to be playing, which is why it is logged.
+    pub fn remap_refs(&mut self, mut f: impl FnMut(TrackRef) -> Option<TrackRef>) {
+        let dropped = self.queue.len();
+        let (queue, pos) = remap_queue(&self.queue, self.queue_pos, &mut f);
+        let dropped = dropped - queue.len();
+        self.queue = queue;
+        self.queue_pos = pos;
+        self.revision += 1;
+
+        if let Some(saved) = self.unshuffled.take() {
+            self.unshuffled = Some(saved.into_iter().filter_map(&mut f).collect());
+        }
+        if let Some(current) = self.playing {
+            self.playing = f(current);
+            if self.playing.is_none() {
+                log::warn!("remap_refs: the playing track is no longer anywhere in the library");
+            }
+        }
+        if dropped > 0 {
+            log::info!("remap_refs: {dropped} queue entries no longer exist");
+        }
+    }
+
     // ── persistence glue ─────────────────────────────────────────────────────
 
     /// Restores a previously-saved queue without starting audio: sets the
@@ -693,5 +765,63 @@ mod tests {
         let built = vec![(2, 7), (0, 1)];
         assert_eq!(reorder_to(&built, built.clone()), built);
         assert!(reorder_to(&[], vec![]).is_empty());
+    }
+
+    // ── following a queue across a playlist that came back reordered ──────
+
+    /// Liked Music, refetched after a like: the new track is at the top and
+    /// everything the queue points at has moved down one.
+    fn shifted_by_one(entry: TrackRef) -> Option<TrackRef> {
+        Some((entry.0, entry.1 + 1))
+    }
+
+    #[test]
+    fn a_shifted_playlist_keeps_the_queue_on_the_same_songs() {
+        let queue = vec![(0, 0), (0, 1), (0, 2)];
+        let (out, pos) = remap_queue(&queue, Some(1), shifted_by_one);
+        assert_eq!(out, [(0, 1), (0, 2), (0, 3)]);
+        // Still the second entry, which is still the same song.
+        assert_eq!(pos, Some(1));
+    }
+
+    #[test]
+    fn an_entry_dropped_before_the_current_one_takes_the_position_with_it() {
+        let queue = vec![(0, 0), (0, 1), (0, 2)];
+        let (out, pos) = remap_queue(&queue, Some(2), |e| (e.1 != 0).then_some(e));
+        assert_eq!(out, [(0, 1), (0, 2)]);
+        assert_eq!(
+            pos,
+            Some(1),
+            "the current entry moved up one, not the cursor"
+        );
+    }
+
+    #[test]
+    fn dropping_the_current_entry_leaves_the_position_on_what_replaces_it() {
+        let queue = vec![(0, 0), (0, 1), (0, 2)];
+        let (out, pos) = remap_queue(&queue, Some(1), |e| (e.1 != 1).then_some(e));
+        assert_eq!(out, [(0, 0), (0, 2)]);
+        assert_eq!(pos, Some(1));
+        // And off the end, it lands on the last entry rather than past it.
+        let (out, pos) = remap_queue(&queue, Some(2), |e| (e.1 == 0).then_some(e));
+        assert_eq!(out, [(0, 0)]);
+        assert_eq!(pos, Some(0));
+    }
+
+    #[test]
+    fn a_queue_that_loses_everything_has_no_position_left() {
+        let (out, pos) = remap_queue(&[(0, 0), (0, 1)], Some(1), |_| None);
+        assert!(out.is_empty());
+        assert_eq!(pos, None);
+    }
+
+    #[test]
+    fn other_playlists_are_not_touched_by_one_playlists_refetch() {
+        let queue = vec![(1, 4), (0, 0), (2, 9)];
+        let (out, pos) = remap_queue(&queue, Some(0), |e| {
+            if e.0 == 0 { shifted_by_one(e) } else { Some(e) }
+        });
+        assert_eq!(out, [(1, 4), (0, 1), (2, 9)]);
+        assert_eq!(pos, Some(0));
     }
 }

@@ -17,9 +17,9 @@ use ratatui::{
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
 use ytm_core::library::{LibraryFetcher, SongBatch};
-use ytm_core::search::{self, ResultKind, SearchMsg, SearchResult};
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
+use ytm_core::search::{self, ResultKind, SearchMsg, SearchResult};
 use ytm_core::{
     AppendOutcome, AudioState, Cover, CoverMsg, Library, MediaCmd, MediaControls, NowPlaying,
     PlayState, Player, RemoveOutcome, Track, TrackInfo, TranslateMsg,
@@ -252,6 +252,79 @@ fn fit_hints(items: &[(&str, &str)], width: usize) -> Vec<Span<'static>> {
         used += cost;
     }
     spans
+}
+
+/// Where each of `before`'s tracks ended up in `now`, matched by video id, or
+/// `None` when every one of them is exactly where it was.
+///
+/// The `None` is the common answer and the reason this is worth a function: a
+/// track added to an ordinary playlist is *appended*, so a refetch moves
+/// nothing and there is no reason to rebuild a queue. Adding to Liked Music
+/// puts it at the top, and then everything has moved. A track that has left the
+/// playlist gets `Some(None)` — its own entry, saying it is gone.
+fn moved_indices(before: &[Option<String>], now: &[Track]) -> Option<Vec<Option<usize>>> {
+    let places: std::collections::HashMap<&str, usize> = now
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| Some((t.video_id.as_deref()?, i)))
+        .collect();
+    let moved: Vec<Option<usize>> = before
+        .iter()
+        .map(|id| id.as_deref().and_then(|id| places.get(id).copied()))
+        .collect();
+    moved
+        .iter()
+        .enumerate()
+        .any(|(i, m)| *m != Some(i))
+        .then_some(moved)
+}
+
+/// Word-wraps `text` to `width` **display cells**, at most `max_lines` of them,
+/// marking a truncation with `…` as [`truncate_line`] does.
+///
+/// [`wrap_n_lines`] breaks at the exact cell the column runs out at, which is
+/// right for a lyric: the line is the unit, the panel is narrow, and a break
+/// inside a word reads as the continuation it is. A metadata card is read as
+/// prose instead — a title broken as `Everybody Wants To R / ule The World`
+/// reads as a bug — so this breaks between words where there are any. A run
+/// with none falls back to the cell-exact split, which is also the CJK path:
+/// there the whole title is one "word" and cells are the only unit there is.
+fn wrap_words(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        for piece in if width_of(word) > width {
+            wrap_n_lines(word, width, usize::MAX)
+        } else {
+            vec![word.to_string()]
+        } {
+            let space = usize::from(!line.is_empty());
+            if !line.is_empty() && width_of(&line) + space + width_of(&piece) > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&piece);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            while width_of(last) + 1 > width && last.pop().is_some() {}
+            last.push('…');
+        }
+    }
+    lines
 }
 
 /// Hard-wraps `text` to `width` **display cells**.
@@ -693,6 +766,11 @@ fn initial_picker_row(items: &[TrackLyrics], on_screen: Option<u64>, overridden:
 /// kilobytes of decoded pixels, and only one is ever on screen.
 const MAX_COVERS: usize = 32;
 
+/// Widest a cover is ever drawn, in cells — the now-playing card's ceiling, and
+/// more than the search panel's 20. It is what a cover is fetched and kept at,
+/// so nothing is held at a size no panel can put on screen.
+const MAX_COVER_COLS: u16 = 24;
+
 /// The search panel: a query line, a result list, and optionally the "add to"
 /// popup over the top of it.
 struct SearchState {
@@ -965,9 +1043,9 @@ impl App {
     /// the ordinary `h`/`l` business, so moving focus to the playlists gives
     /// the normal bindings back, exactly as it does in lyrics mode.
     fn search_has_focus(&self) -> bool {
-        self.search.as_ref().is_some_and(|s| {
-            s.typing || s.add.is_some() || self.active_panel == Panel::Songs
-        })
+        self.search
+            .as_ref()
+            .is_some_and(|s| s.typing || s.add.is_some() || self.active_panel == Panel::Songs)
     }
 
     /// `s` — opens the search panel, or closes it if it is already open.
@@ -1009,7 +1087,12 @@ impl App {
     /// A search hit has no place in the library, and everything downstream
     /// addresses a track by its position in one — so it is given a place first.
     fn play_search_result(&mut self) {
-        let Some(hit) = self.search.as_ref().and_then(SearchState::selected).cloned() else {
+        let Some(hit) = self
+            .search
+            .as_ref()
+            .and_then(SearchState::selected)
+            .cloned()
+        else {
             return;
         };
         let (pl, song) = self.library.place_search_result(hit.to_track());
@@ -1047,11 +1130,12 @@ impl App {
 
     /// Sends the highlighted result to the highlighted playlist.
     fn commit_add(&mut self) {
-        let targets: Vec<(String, String)> = self
+        let targets: Vec<(usize, String, String)> = self
             .add_targets()
             .into_iter()
             .filter_map(|(i, title)| {
                 Some((
+                    i,
                     self.library.playlist(i)?.playlist_id.clone(),
                     title.to_string(),
                 ))
@@ -1064,7 +1148,7 @@ impl App {
         let Some(row) = search.add.as_ref().and_then(TableState::selected) else {
             return;
         };
-        let Some((playlist_id, title)) = targets.get(row).cloned() else {
+        let Some((playlist, playlist_id, title)) = targets.get(row).cloned() else {
             return;
         };
         let Some(hit) = search.selected().cloned() else {
@@ -1083,10 +1167,13 @@ impl App {
         search::spawn_add(
             &self.lyrics_handle,
             std::sync::Arc::clone(&self.yt),
-            playlist_id,
-            hit.video_id,
-            hit.title,
-            title,
+            search::AddRequest {
+                playlist_id,
+                playlist,
+                video_id: hit.video_id,
+                title: hit.title,
+                where_to: title,
+            },
             self.search_tx.clone(),
         );
     }
@@ -1224,11 +1311,18 @@ impl App {
                 SearchMsg::Added {
                     title,
                     where_to,
+                    playlist,
                     result,
                 } => match result {
                     Ok(()) => {
                         log::info!("search: added {title:?} to {where_to:?}");
                         self.notify(format!("Added {title} to {where_to}"));
+                        // The playlist on the server now has a track this copy
+                        // of it does not. Fetching it again is the only way to
+                        // find out where the track landed — appended for a
+                        // playlist, at the *top* for Liked Music — and it is
+                        // what makes the new song playable without a restart.
+                        self.refresh_playlist(playlist);
                     }
                     Err(e) => {
                         log::warn!("search: adding {title:?} to {where_to:?} failed: {e}");
@@ -1268,7 +1362,31 @@ impl App {
         if self.covers.contains_key(&id) || !self.cover_pending.insert(id.clone()) {
             return;
         }
-        ytm_core::cover::spawn_fetch(&self.lyrics_handle, id, url, self.cover_tx.clone());
+        ytm_core::cover::spawn_fetch(
+            &self.lyrics_handle,
+            id,
+            url,
+            Self::cover_draw_px(),
+            self.cover_tx.clone(),
+        );
+    }
+
+    /// The largest square, in pixels, a cover can be drawn in on this terminal:
+    /// the card's cell ceiling times what a cell actually measures. Asked of the
+    /// terminal each time rather than cached, since a font size can change under
+    /// a running app and this is one ioctl per fetch.
+    fn cover_draw_px() -> u32 {
+        Self::cover_draw_px_for(kitty::cell_size())
+    }
+
+    /// The square above, for a given cell size. The cover is square and the
+    /// card's box is `MAX_COVER_COLS` wide by half that tall, so whichever axis
+    /// works out to more pixels is what the image has to satisfy.
+    fn cover_draw_px_for((cell_w, cell_h): (u32, u32)) -> u32 {
+        u32::max(
+            u32::from(MAX_COVER_COLS) * cell_w,
+            u32::from(MAX_COVER_COLS / 2) * cell_h,
+        )
     }
 
     fn drain_covers(&mut self) {
@@ -1324,19 +1442,94 @@ impl App {
         self.notify("Retrying…");
     }
 
+    /// Fetches a playlist again, because what the server holds has changed.
+    ///
+    /// The tracks come back on the same channel as the first load's, so the
+    /// only thing this has to get right is not asking for the impossible: the
+    /// search playlist is synthetic and has nothing to fetch.
+    fn refresh_playlist(&mut self, pl: usize) {
+        if self.library.is_search_playlist(pl) {
+            return;
+        }
+        let Some(id) = self.library.playlist(pl).map(|p| p.playlist_id.clone()) else {
+            return;
+        };
+        log::info!("library: refetching {id:?} after a change");
+        self.fetcher.fetch(pl, &id);
+    }
+
+    /// Keeps the queue and the playing track meaning the same songs across a
+    /// refetch of `pl` that replaced its tracks.
+    ///
+    /// `before` is the video ids the playlist held, in the order the queue's
+    /// indices were built against — an id is a track's identity, its index is
+    /// only where it sat at the time. `playing` is that track itself, kept
+    /// from before the replace for the one case that needs more than a number.
+    fn follow_tracks(&mut self, pl: usize, before: &[Option<String>], playing: Option<Track>) {
+        if before.is_empty() {
+            return;
+        }
+        let Some(moved) = moved_indices(before, self.library.songs(pl)) else {
+            return;
+        };
+        log::info!("library: playlist {pl} came back reordered — following the queue across");
+
+        let playing_ref = self.player.playing().filter(|(p, _)| *p == pl);
+        let library = &mut self.library;
+        self.player.remap_refs(|(p, song)| {
+            if p != pl {
+                return Some((p, song));
+            }
+            if let Some(new) = moved.get(song).copied().flatten() {
+                return Some((pl, new));
+            }
+            // Gone from the playlist altogether. A queue entry goes with it,
+            // but the track that is *playing* is still audibly playing, so it
+            // is filed where tracks played from search live rather than lost.
+            // Filing is idempotent, so the queue entry for that same track
+            // lands on the pair the playing one did.
+            if Some((p, song)) == playing_ref {
+                playing.clone().map(|t| library.place_search_result(t))
+            } else {
+                None
+            }
+        });
+    }
+
     /// Drain all pending song-batch messages from the background loader.
     /// Called each event-loop tick so the UI stays up-to-date without blocking.
     fn drain_song_channel(&mut self) {
         let mut arrived = false;
         while let Ok((idx, songs)) = self.songs_rx.try_recv() {
+            // What the playlist held before this batch replaced it. Empty on
+            // the first load, which is every batch at startup — only a refetch
+            // of a playlist already on screen can move anything, and only then
+            // is there anything to pay for.
+            let before: Vec<Option<String>> = self
+                .library
+                .songs(idx)
+                .iter()
+                .map(|t| t.video_id.clone())
+                .collect();
+            let playing = self
+                .player
+                .playing()
+                .filter(|(pl, _)| *pl == idx)
+                .and_then(|(pl, song)| self.library.track(pl, song).cloned());
+
             self.library.apply_song_batch(idx, songs);
+            self.follow_tracks(idx, &before, playing);
             arrived = true;
         }
         // The queue filter matches on track titles, which a batch can turn
         // from unknown into known. Its own key — the queue's revision — can't
-        // see that, since the queue itself didn't change.
+        // see that, since the queue itself didn't change. The songs filter is
+        // dropped for the same reason from the other end: its key includes the
+        // playlist's length, which a refetch can leave alone while changing
+        // every track under it.
         if arrived {
             self.queue_filter = None;
+            self.songs_filter = None;
         }
         if self.pending_queue_restore.is_some() {
             self.try_restore_queue();
@@ -2125,8 +2318,10 @@ impl App {
                                         // Copied out, so the cached filter is
                                         // no longer borrowed when the player
                                         // takes `&mut self`.
-                                        let q_pos =
-                                            self.filtered_queue_positions().get(display_idx).copied();
+                                        let q_pos = self
+                                            .filtered_queue_positions()
+                                            .get(display_idx)
+                                            .copied();
                                         if let Some(q_pos) = q_pos {
                                             self.player.jump_to(&self.library, q_pos);
                                         }
@@ -2922,11 +3117,57 @@ impl App {
         // `n` columns across needs `n / 2` rows. Bounded by both, and by a
         // ceiling — a cover taller than the column leaves nothing for the text.
         let side = u16::min(body.width.saturating_sub(2), (body.height / 2).max(1) * 2);
-        let side = side.min(24) / 2 * 2; // even, so the halves land on cells
+        let side = side.min(MAX_COVER_COLS) / 2 * 2; // even, so the halves land on cells
         let (cover_w, cover_h) = (side, side / 2);
         let can_draw = self.covers_enabled && cover_w >= 8 && body.height > cover_h + 4;
 
-        let mut y = body.y;
+        // The words, built before anything is placed: the card is centred as a
+        // whole, so where the cover goes depends on how many lines follow it.
+        // Each gets exactly one line — a long title truncates rather than
+        // pushing the album off the bottom.
+        let width = body.width as usize;
+        // Green, because green is what this app means by "playing" — the same
+        // colour the songs list marks the current row with.
+        let mut lines = vec![
+            Line::styled(
+                truncate_line(track.title.as_deref().unwrap_or("Unknown"), width),
+                theme::PLAYING,
+            )
+            .centered(),
+        ];
+        let artist = track.artist_names();
+        if !artist.is_empty() {
+            lines.push(Line::styled(truncate_line(&artist, width), theme::META).centered());
+        }
+        if let Some(album) = track.album.as_ref().map(|a| a.name.as_str())
+            && !album.is_empty()
+        {
+            lines.push(Line::styled(truncate_line(album, width), theme::DIM).centered());
+        }
+        // A rule as wide as the art, then the length — the one number worth
+        // having here, and it keeps the block from ending on a ragged edge.
+        if let Some(duration) = track_duration(track) {
+            lines.push(Line::from(""));
+            lines.push(
+                Line::styled(
+                    symbols::line::NORMAL
+                        .horizontal
+                        .repeat(cover_w.max(8) as usize / 2),
+                    theme::RULE,
+                )
+                .centered(),
+            );
+            lines.push(Line::styled(duration, theme::DIM).centered());
+        }
+
+        // Cover, a blank row, then the words — placed as one block and centred
+        // in the column rather than hung from its top. Pinned up there it reads
+        // as a rendering accident, art or no art, and the column is otherwise
+        // empty: in lyrics mode this panel is something to glance at, not a
+        // list to run down.
+        let card_h = if can_draw { cover_h + 1 } else { 0 } + lines.len() as u16;
+        let mut y = body.y + body.height.saturating_sub(card_h) / 2;
+
         if can_draw {
             let rect = Rect {
                 x: body.x + (body.width.saturating_sub(cover_w)) / 2,
@@ -2952,8 +3193,6 @@ impl App {
             y += cover_h + 1;
         }
 
-        // The words. Centred under the art, and each given one line — a long
-        // title truncates rather than pushing the album off the bottom.
         let text_area = Rect {
             y,
             height: body.height.saturating_sub(y - body.y),
@@ -2961,50 +3200,6 @@ impl App {
         };
         if text_area.height == 0 {
             return;
-        }
-        let width = text_area.width as usize;
-        // Green, because green is what this app means by "playing" — the same
-        // colour the songs list marks the current row with. Without art above
-        // it the block would otherwise be four grey lines pinned to the top of
-        // an empty column.
-        let mut lines = vec![
-            Line::styled(
-                truncate_line(track.title.as_deref().unwrap_or("Unknown"), width),
-                theme::PLAYING,
-            )
-            .centered(),
-        ];
-        let artist = track.artist_names();
-        if !artist.is_empty() {
-            lines.push(Line::styled(truncate_line(&artist, width), theme::META).centered());
-        }
-        if let Some(album) = track.album.as_ref().map(|a| a.name.as_str())
-            && !album.is_empty()
-        {
-            lines.push(Line::styled(truncate_line(album, width), theme::DIM).centered());
-        }
-        // A rule as wide as the art, then the length — the one number worth
-        // having here, and it keeps the block from ending on a ragged edge.
-        if let Some(duration) = track_duration(track) {
-            lines.push(Line::from(""));
-            lines.push(
-                Line::styled(
-                    symbols::line::NORMAL.horizontal.repeat(cover_w.max(8) as usize / 2),
-                    theme::RULE,
-                )
-                .centered(),
-            );
-            lines.push(Line::styled(duration, theme::DIM).centered());
-        }
-
-        // With no cover above them the lines would sit at the very top of an
-        // otherwise empty column, which reads as a rendering accident. Centred,
-        // it reads as a card.
-        if !can_draw {
-            let pad = (text_area.height as usize).saturating_sub(lines.len()) / 2;
-            let mut padded = vec![Line::from(""); pad];
-            padded.extend(lines);
-            lines = padded;
         }
         frame.render_widget(Paragraph::new(lines), text_area);
     }
@@ -3148,10 +3343,7 @@ impl App {
                 vec![
                     Line::styled("Search failed", theme::ERROR),
                     Line::from(""),
-                    Line::styled(
-                        truncate_line(err, body.width as usize),
-                        theme::ERROR_BODY,
-                    ),
+                    Line::styled(truncate_line(err, body.width as usize), theme::ERROR_BODY),
                     Line::from(""),
                     Line::from(hint("↵", "try again")),
                 ],
@@ -3200,9 +3392,8 @@ impl App {
         } else {
             (body, None)
         };
-        self.cover_target = cover_area.and_then(|rect| {
-            Some((search.selected()?.video_id.clone(), rect))
-        });
+        self.cover_target =
+            cover_area.and_then(|rect| Some((search.selected()?.video_id.clone(), rect)));
 
         // The details under the cover, which the image must not overlap.
         if let (Some(cover), Some(hit)) = (cover_area, search.selected()) {
@@ -3214,23 +3405,28 @@ impl App {
             if below.height > 0 {
                 // Centred under the cover, as the now-playing card is: the art
                 // is the only thing here with a shape, so the words sit with it.
-                let mut lines = vec![
-                    Line::styled(
-                        truncate_line(&hit.title, below.width as usize),
-                        theme::PRIMARY,
-                    )
-                    .centered(),
-                ];
-                for (text, style) in [
-                    (hit.artist.clone(), theme::META),
-                    (hit.album.clone(), theme::DIM),
+                //
+                // Wrapped rather than cut, because this column *is* the detail
+                // view — a search list already shows a truncated title, and a
+                // panel whose whole job is to say more about the highlighted
+                // row saying the same amount less is no use. The caps keep the
+                // kind and length below from being pushed off a short panel by
+                // a long title; each is what the field is ever plausibly worth.
+                let width = below.width as usize;
+                let mut lines: Vec<Line> = Vec::new();
+                for (text, style, max) in [
+                    (hit.title.as_str(), theme::PRIMARY, 3),
+                    (hit.artist.as_str(), theme::META, 2),
+                    (hit.album.as_str(), theme::DIM, 2),
                 ] {
-                    if !text.is_empty() {
-                        lines.push(
-                            Line::styled(truncate_line(&text, below.width as usize), style)
-                                .centered(),
-                        );
+                    if text.is_empty() {
+                        continue;
                     }
+                    lines.extend(
+                        wrap_words(text, width, max)
+                            .into_iter()
+                            .map(|piece| Line::styled(piece, style).centered()),
+                    );
                 }
                 let (marker, style) = kind_marker(hit.kind);
                 lines.push(Line::from(""));
@@ -3363,9 +3559,7 @@ impl App {
             .map(|(name, count)| {
                 Row::new(vec![
                     Cell::from(Line::styled(name.clone(), theme::PRIMARY)),
-                    Cell::from(
-                        Line::styled(count.to_string(), theme::DIM).right_aligned(),
-                    ),
+                    Cell::from(Line::styled(count.to_string(), theme::DIM).right_aligned()),
                 ])
             })
             .collect();
@@ -4184,13 +4378,88 @@ impl App {
             let s = track.artist_names();
             (!s.is_empty()).then_some(s)
         };
-        (title, artist, fmt_secs(ast.elapsed), fmt_secs_rounded(ast.total))
+        (
+            title,
+            artist,
+            fmt_secs(ast.elapsed),
+            fmt_secs_rounded(ast.total),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a cover is asked for and kept at, which is the whole of how sharp
+    /// one looks: too small and the terminal scales it up to fill the cells.
+    mod cover_size {
+        use super::*;
+
+        #[test]
+        fn the_drawn_size_follows_the_terminals_own_cells() {
+            // An ordinary display: a 24×12 card of 10×20 cells is 240px square.
+            assert_eq!(App::cover_draw_px_for((10, 20)), 240);
+            // A HiDPI one, where the same card is physically the same size but
+            // more than twice the pixels — the case a fixed 10×20 got wrong.
+            assert_eq!(App::cover_draw_px_for((20, 44)), 528);
+            // Cells are not always twice as tall as wide, and the axis that
+            // needs the most pixels is the one that decides.
+            assert_eq!(App::cover_draw_px_for((16, 24)), 384);
+        }
+    }
+
+    /// Following a queue across a playlist that was fetched again — what makes
+    /// `a` safe to act on the library rather than only the copy of it here.
+    mod refetch {
+        use super::*;
+
+        fn songs(ids: &[&str]) -> Vec<Track> {
+            ids.iter()
+                .map(|id| Track {
+                    video_id: Some((*id).to_string()),
+                    title: Some((*id).to_string()),
+                    artists: Vec::new(),
+                    album: None,
+                    duration: None,
+                    duration_seconds: None,
+                    thumbnail: None,
+                })
+                .collect()
+        }
+
+        fn ids(ids: &[&str]) -> Vec<Option<String>> {
+            ids.iter().map(|id| Some((*id).to_string())).collect()
+        }
+
+        #[test]
+        fn a_track_appended_to_a_playlist_moves_nothing() {
+            // Which is what adding to an ordinary playlist does, so the queue
+            // is left alone entirely.
+            let out = moved_indices(&ids(&["a", "b"]), &songs(&["a", "b", "new"]));
+            assert_eq!(out, None);
+        }
+
+        #[test]
+        fn a_like_lands_at_the_top_and_moves_everything_down() {
+            let out = moved_indices(&ids(&["a", "b"]), &songs(&["new", "a", "b"]));
+            assert_eq!(out, Some(vec![Some(1), Some(2)]));
+        }
+
+        #[test]
+        fn a_track_no_longer_in_the_playlist_is_marked_gone() {
+            // An edit made somewhere else. `b` has no index to move to, and
+            // saying so is what lets the queue drop it rather than inherit
+            // whatever took its place.
+            let out = moved_indices(&ids(&["a", "b", "c"]), &songs(&["c", "a"]));
+            assert_eq!(out, Some(vec![Some(1), None, Some(0)]));
+        }
+
+        #[test]
+        fn a_first_load_has_nothing_to_follow() {
+            assert_eq!(moved_indices(&[], &songs(&["a"])), None);
+        }
+    }
 
     /// The filter's matching rule, which memoising moved but must not change.
     /// `App` itself can't be built in a test — it boots libmpv.
@@ -4799,7 +5068,12 @@ mod tests {
 
     #[test]
     fn a_row_that_fits_is_left_whole() {
-        let spans = fit_meta("Echo", theme::PRIMARY, &[("Crusher-P".into(), theme::META)], 40);
+        let spans = fit_meta(
+            "Echo",
+            theme::PRIMARY,
+            &[("Crusher-P".into(), theme::META)],
+            40,
+        );
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "Echo  ·  Crusher-P");
     }
@@ -4824,7 +5098,10 @@ mod tests {
         let spans = fit_meta(
             "Echo",
             theme::PRIMARY,
-            &[("Crusher-P".into(), theme::META), ("An Album".into(), theme::DIM)],
+            &[
+                ("Crusher-P".into(), theme::META),
+                ("An Album".into(), theme::DIM),
+            ],
             24,
         );
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4836,7 +5113,12 @@ mod tests {
     #[test]
     fn a_field_with_no_room_left_is_dropped_whole() {
         // Four cells of ellipsis and separator would say less than nothing.
-        let spans = fit_meta("Echo", theme::PRIMARY, &[("Crusher-P".into(), theme::META)], 8);
+        let spans = fit_meta(
+            "Echo",
+            theme::PRIMARY,
+            &[("Crusher-P".into(), theme::META)],
+            8,
+        );
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "Echo");
     }
@@ -5075,6 +5357,49 @@ mod tests {
     fn a_character_wider_than_the_column_still_makes_progress() {
         let out = wrap_n_lines("君の名", 1, usize::MAX);
         assert_eq!(out, ["君", "の", "名"]);
+    }
+
+    // ── the search panel's detail card, which wraps rather than cuts ───────
+
+    #[test]
+    fn words_break_between_words_where_there_are_any() {
+        // The card's own width. Cell-exact wrapping gave "Everybody Wants To R
+        // / ule The World", which reads as a rendering fault rather than a
+        // long title.
+        let out = wrap_words("Everybody Wants To Rule The World", 20, usize::MAX);
+        assert_eq!(out, ["Everybody Wants To", "Rule The World"]);
+        assert!(out.iter().all(|l| width_of(l) <= 20), "{out:?}");
+    }
+
+    #[test]
+    fn a_word_longer_than_the_column_is_broken_by_cells() {
+        // Nothing to break on, so the fallback is the lyric wrap — the
+        // alternative is a line running past the column.
+        let out = wrap_words("Supercalifragilistic", 8, usize::MAX);
+        assert!(out.iter().all(|l| width_of(l) <= 8), "{out:?}");
+        assert_eq!(out.concat(), "Supercalifragilistic");
+    }
+
+    #[test]
+    fn a_cjk_title_wraps_by_cells_since_it_has_no_spaces() {
+        let out = wrap_words("君の名前を呼ぶよ夜が明けるまで", 8, usize::MAX);
+        assert!(out.len() > 1, "did not wrap: {out:?}");
+        assert!(out.iter().all(|l| width_of(l) <= 8), "{out:?}");
+        assert_eq!(out.concat(), "君の名前を呼ぶよ夜が明けるまで");
+    }
+
+    #[test]
+    fn a_wrap_that_runs_out_of_lines_says_so() {
+        let out = wrap_words("Everybody Wants To Rule The World", 20, 1);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with('…'), "{out:?}");
+        assert!(width_of(&out[0]) <= 20, "{out:?}");
+    }
+
+    #[test]
+    fn text_that_fits_is_left_exactly_alone() {
+        assert_eq!(wrap_words("Kaai Yuki", 20, 2), ["Kaai Yuki"]);
+        assert_eq!(wrap_words("", 20, 2), [""]);
     }
 
     #[test]

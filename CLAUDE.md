@@ -103,7 +103,11 @@ tui/        the ratatui frontend — single `ytm` binary
   Shuffle restores the order the queue had before it (`unshuffled` + `reorder_to`), rather
   than sorting: a queue built by hand with `a` has an order the user chose, and across
   playlists the `(playlist, song)` pairs say nothing about it. Entries added while shuffled
-  keep their place at the end, removed ones stay removed.
+  keep their place at the end, removed ones stay removed. `remap_refs` is the other side of
+  a `TrackRef` being a position: when a playlist is fetched again and comes back in a
+  different order, the caller says where each track went and this applies it to the queue,
+  to `unshuffled` and to what is playing — `remap_queue` holding the position on the same
+  entry as things are dropped around it.
 - **`lyrics.rs`** — policy over `lrclib`. `LyricsService::best_for` layers `/get` (exact, has
   duration, returns one) over `/search` (returns many, ignores duration), preferring synced
   over plain; `rank` does duration-proximity scoring client-side. `spawn_best`/`spawn_choices`
@@ -179,9 +183,14 @@ tui/        the ratatui frontend — single `ytm` binary
   into a synthetic `__search__` playlist so the queue, player, lyrics and prefetch can all
   address it as the `(playlist, song)` pair they already expect.
 - **`cover.rs`** — fetches a thumbnail and decodes it to RGB. `at_size` rewrites the CDN's
-  own resize parameters (`=w120-h120-l90-rj`) to ask for a usable 480px instead of the 120px
-  a search row advertises; `Cover::scaled` box-averages down to the panel's size at draw
-  time, since going 480→160 by point sampling drops eight of every nine pixels.
+  own resize parameters (`=w120-h120-l90-rj`) to ask for a bigger copy than the 120px a
+  search row advertises, and the size asked for is the *terminal's*: `spawn_fetch` takes the
+  largest square any panel could draw the cover in, requests twice that (`fetch_px`, floored
+  at 480 and capped at 1080 — measured, the CDN serves any size up to 1400 exactly and
+  anything beyond as 1400), and returns it scaled down to that square. So what is held in
+  memory is what can be shown, and the 2× is there because `Cover::scaled` box-averages: 2×2
+  source pixels per output pixel is what makes an edge land smoothly rather than being point
+  sampled. `scaled` runs again at draw time, down to the rectangle the panel actually got.
 - **`persistence.rs`** — all through `write_private` (above), since these are written on the
   way out, when an interrupted write is most likely. `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID), `translations.json` (**AI** translations, keyed by lrclib
@@ -288,6 +297,22 @@ tui/        the ratatui frontend — single `ytm` binary
     modal listing the user's own playlists to add it to, `/` returns to the query line.
     Liked Music is special-cased: its id is literally `LM` and it is the like button rather
     than a playlist items can be added to.
+    An add that lands **refetches that playlist** (`refresh_playlist`), so the new track is
+    playable in the session that added it rather than at the next start. The refetch is what
+    makes `TrackRef`'s "position, not identity" nature dangerous — a like lands at the *top*
+    of Liked Music, moving every song down one — so `moved_indices` matches the old tracks to
+    the new by video id and `Player::remap_refs` carries the queue, the order Shuffle is
+    holding and the playing track across. `None` for every track means nothing moved, which
+    is what appending to an ordinary playlist does, and then nothing is touched at all. A
+    track that has left the playlist entirely (an edit made in a browser) drops out of the
+    queue; if it is the one *playing*, it is filed under the search playlist instead, since
+    it is still audibly a track and its lyrics and title have to keep resolving.
+    The highlighted result's details are the one place the panel wraps rather than truncates
+    (`wrap_words`): the list beside it already shows a cut-down title, so a column whose only
+    job is to say more about that row has to actually say more. It breaks between words, and
+    falls back to `wrap_n_lines`'s cell-exact split for a run without any — which is also the
+    CJK path. Each field is capped (3 lines, then 2, then 2) so a long title can't push the
+    kind and length off a short panel.
     `search_has_focus` is the one predicate deciding whether the panel owns the keyboard, and
     the key dispatch, the hint bar and the header colour all read it, so they cannot disagree.
     Typing a query and the add modal take every key regardless of focus — `h` mid-word must
@@ -317,7 +342,14 @@ tui/        the ratatui frontend — single `ytm` binary
     kitty, Ghostty and WezTerm get covers and everything else silently gets none, which is
     the right direction to be wrong in when the failure mode is base64 sprayed across the
     screen. `q=2` on every escape suppresses the terminal's reply, which crossterm would
-    otherwise read as keypresses.
+    otherwise read as keypresses. How many pixels to send is the other half of how a cover
+    looks: the terminal is told its target in *cells* and scales the image to fit, so an
+    image sent smaller than the rectangle physically holds is scaled **up**, which is what a
+    soft cover on a HiDPI display is. `cell_size` therefore asks what a cell really measures
+    — `TIOCGWINSZ` via crossterm, an ioctl rather than a query written to the terminal, so
+    unlike the support handshake above it cannot hang — and falls back to 10×20 on a zero, an
+    implausible size, or no tty. `App::cover_draw_px` turns that into the pixels the
+    now-playing card's `MAX_COVER_COLS`-wide box comes to, which is what gets fetched.
   - **Fitting** (`fit_meta`) is the one rule for a title with metadata after it: the title
     has first claim on the width, each following field takes what is left, and anything cut
     is marked `…`. Used by the songs list, the queue, the search results and the player bar,
