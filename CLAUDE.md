@@ -285,8 +285,20 @@ tui/        the ratatui frontend — single `ytm` binary
     Typing a query and the add modal take every key regardless of focus — `h` mid-word must
     type an `h` — but once there are results to move through, `h`/`l` are the ordinary panel
     keys and focus returns to the playlists, exactly as in lyrics mode.
+  - **Now playing card**: in lyrics mode the *playlists* column is given over to the playing
+    track — cover centred, then title (Green, since green is what this app means by playing),
+    artist, album, a short rule and the length. You are reading rather than browsing at that
+    point, and it is the one column wide enough for a square picture without taking room from
+    the words. `render_now_playing_card` reserves the cover's square whether or not the image
+    has arrived, so nothing moves under the text when it does, and shows a `♪` in the meantime.
+    Where no image can be drawn at all the block is centred vertically instead of clinging to
+    the top of an empty column.
   - **Cover art** (`kitty.rs`) draws the highlighted result's cover with the kitty graphics
-    protocol. It works *around* ratatui rather than through it: the frame is drawn with that
+    protocol, and the now-playing card's. `cover_target` — a `(video id, rect)` claimed
+    during the frame and acted on after it — is how a panel asks for one; `render` clears it
+    first, so a cover can never outlive the panel that wanted it. Track thumbnails ride along
+    with the playlist fetch (`Track::thumbnail`), so showing one costs no request of its own.
+    It works *around* ratatui rather than through it: the frame is drawn with that
     rectangle left empty, then the image is placed over it afterwards, because the terminal
     composites images above the cell grid. That persistence is what the module is mostly
     about — an image left behind hangs over whatever comes next, so `Canvas` tracks exactly

@@ -802,8 +802,10 @@ pub struct App {
     canvas: kitty::Canvas,
     /// Whether this terminal can show a cover at all.
     covers_enabled: bool,
-    /// The rectangle the last frame left empty for the cover, if any.
-    cover_area: Option<Rect>,
+    /// What the last frame left room for: which video's cover, and where.
+    /// Set while rendering, acted on afterwards — see [`Self::draw_cover`].
+    /// Search and lyrics never both own a panel, so one slot is enough.
+    cover_target: Option<(String, Rect)>,
 }
 
 impl App {
@@ -892,7 +894,7 @@ impl App {
             cover_rx,
             canvas: kitty::Canvas::default(),
             covers_enabled,
-            cover_area: None,
+            cover_target: None,
         }
     }
 
@@ -914,7 +916,7 @@ impl App {
     fn toggle_search(&mut self) {
         if self.search.take().is_some() {
             self.canvas.clear();
-            self.cover_area = None;
+            self.cover_target = None;
             return;
         }
         // Lyrics take the same column, and two panels cannot both have it.
@@ -1181,27 +1183,34 @@ impl App {
 
     // ── cover art ─────────────────────────────────────────────────────────────
 
-    /// Starts a fetch for the highlighted result's cover, if it isn't held or
-    /// already coming.
+    /// The cover that wants showing: the highlighted search result, or — in
+    /// lyrics mode, where the left column is given over to it — the track
+    /// that is playing.
+    fn wanted_cover(&self) -> Option<(String, String)> {
+        if let Some(search) = self.search.as_ref() {
+            let hit = search.selected()?;
+            return Some((hit.video_id.clone(), hit.thumbnail.clone()?));
+        }
+        if self.lyrics_mode {
+            let (pl, song) = self.player.playing()?;
+            let track = self.library.track(pl, song)?;
+            return Some((track.video_id.clone()?, track.thumbnail.clone()?));
+        }
+        None
+    }
+
+    /// Starts a fetch for that cover, if it isn't held or already coming.
     fn ensure_cover(&mut self) {
         if !self.covers_enabled {
             return;
         }
-        let Some((id, url)) = self.search.as_ref().and_then(|s| {
-            let hit = s.selected()?;
-            Some((hit.video_id.clone(), hit.thumbnail.clone()?))
-        }) else {
+        let Some((id, url)) = self.wanted_cover() else {
             return;
         };
         if self.covers.contains_key(&id) || !self.cover_pending.insert(id.clone()) {
             return;
         }
-        ytm_core::cover::spawn_fetch(
-            &self.lyrics_handle,
-            id,
-            url,
-            self.cover_tx.clone(),
-        );
+        ytm_core::cover::spawn_fetch(&self.lyrics_handle, id, url, self.cover_tx.clone());
     }
 
     fn drain_covers(&mut self) {
@@ -1228,16 +1237,7 @@ impl App {
         if !self.covers_enabled {
             return;
         }
-        let Some(area) = self.cover_area else {
-            self.canvas.clear();
-            return;
-        };
-        let Some(id) = self
-            .search
-            .as_ref()
-            .and_then(SearchState::selected)
-            .map(|h| h.video_id.clone())
-        else {
+        let Some((id, area)) = self.cover_target.clone() else {
             self.canvas.clear();
             return;
         };
@@ -1445,9 +1445,9 @@ impl App {
 
     fn toggle_lyrics_mode(&mut self) {
         self.lyrics_mode = !self.lyrics_mode;
-        if self.lyrics_mode && self.search.take().is_some() {
+        if self.search.take().is_some() {
             self.canvas.clear();
-            self.cover_area = None;
+            self.cover_target = None;
         }
         self.lyrics_picker = None;
         self.reset_lyrics_view();
@@ -2792,6 +2792,10 @@ impl App {
         self.playlists_area = playlists;
         self.songs_area = right;
 
+        // Cleared here and claimed by whichever panel wants it below, so a
+        // cover can never outlive the panel that asked for it.
+        self.cover_target = None;
+
         self.render_playlists(frame, playlists);
         self.render_right_panel(frame, right);
         self.render_player(frame, now_playing, progress);
@@ -2805,7 +2809,141 @@ impl App {
 
     // ── playlists panel ───────────────────────────────────────────────────────
 
+    /// The left column while the lyrics panel is open: the cover, then the
+    /// track under it.
+    ///
+    /// The playlist list is not much use with lyrics on screen — you are
+    /// reading, not browsing — and the column is the one piece of the layout
+    /// wide enough to hold a square picture without taking room from the words.
+    ///
+    /// Follows the same chrome as everything else: an uppercase header, a rule,
+    /// and no border. The art is the only thing on screen with a shape of its
+    /// own, so the text under it is centred to sit with it, and graded down —
+    /// title, then artist, then album — so the eye lands on the title first.
+    fn render_now_playing_card(&mut self, frame: &mut Frame, area: Rect) {
+        let status = self
+            .player
+            .playing()
+            .and_then(|(pl, _)| self.library.playlist(pl))
+            .filter(|p| p.playlist_id != Library::SEARCH_PLAYLIST_ID)
+            .map(|p| Line::styled(truncate_line(&p.title, 18), theme::DIM));
+        let body = section(frame, area, "Now playing", status, false);
+        self.cover_target = None;
+        if body.height == 0 || body.width == 0 {
+            return;
+        }
+
+        let Some(track) = self
+            .player
+            .playing()
+            .and_then(|(pl, song)| self.library.track(pl, song))
+        else {
+            centered_message(
+                frame,
+                body,
+                vec![Line::styled("Nothing playing", theme::DIM)],
+            );
+            return;
+        };
+
+        // A square of cells: they are about twice as tall as wide, so a cover
+        // `n` columns across needs `n / 2` rows. Bounded by both, and by a
+        // ceiling — a cover taller than the column leaves nothing for the text.
+        let side = u16::min(body.width.saturating_sub(2), (body.height / 2).max(1) * 2);
+        let side = side.min(24) / 2 * 2; // even, so the halves land on cells
+        let (cover_w, cover_h) = (side, side / 2);
+        let can_draw = self.covers_enabled && cover_w >= 8 && body.height > cover_h + 4;
+
+        let mut y = body.y;
+        if can_draw {
+            let rect = Rect {
+                x: body.x + (body.width.saturating_sub(cover_w)) / 2,
+                y,
+                width: cover_w,
+                height: cover_h,
+            };
+            // Claimed whether or not the picture has arrived: the space is
+            // reserved by the layout either way, and a cover appearing without
+            // moving the text under it is the point.
+            if let Some(id) = track.video_id.clone() {
+                self.cover_target = Some((id, rect));
+            }
+            // A placeholder in the same square while it loads, so the column
+            // isn't briefly empty on every track change.
+            if self
+                .cover_target
+                .as_ref()
+                .is_none_or(|(id, _)| !self.covers.contains_key(id))
+            {
+                centered_message(frame, rect, vec![Line::styled("♪", theme::DIM)]);
+            }
+            y += cover_h + 1;
+        }
+
+        // The words. Centred under the art, and each given one line — a long
+        // title truncates rather than pushing the album off the bottom.
+        let text_area = Rect {
+            y,
+            height: body.height.saturating_sub(y - body.y),
+            ..body
+        };
+        if text_area.height == 0 {
+            return;
+        }
+        let width = text_area.width as usize;
+        // Green, because green is what this app means by "playing" — the same
+        // colour the songs list marks the current row with. Without art above
+        // it the block would otherwise be four grey lines pinned to the top of
+        // an empty column.
+        let mut lines = vec![
+            Line::styled(
+                truncate_line(track.title.as_deref().unwrap_or("Unknown"), width),
+                theme::PLAYING,
+            )
+            .centered(),
+        ];
+        let artist = track.artist_names();
+        if !artist.is_empty() {
+            lines.push(Line::styled(truncate_line(&artist, width), theme::META).centered());
+        }
+        if let Some(album) = track.album.as_ref().map(|a| a.name.as_str())
+            && !album.is_empty()
+        {
+            lines.push(Line::styled(truncate_line(album, width), theme::DIM).centered());
+        }
+        // A rule as wide as the art, then the length — the one number worth
+        // having here, and it keeps the block from ending on a ragged edge.
+        if let Some(duration) = track_duration(track) {
+            lines.push(Line::from(""));
+            lines.push(
+                Line::styled(
+                    symbols::line::NORMAL.horizontal.repeat(cover_w.max(8) as usize / 2),
+                    theme::RULE,
+                )
+                .centered(),
+            );
+            lines.push(Line::styled(duration, theme::DIM).centered());
+        }
+
+        // With no cover above them the lines would sit at the very top of an
+        // otherwise empty column, which reads as a rendering accident. Centred,
+        // it reads as a card.
+        if !can_draw {
+            let pad = (text_area.height as usize).saturating_sub(lines.len()) / 2;
+            let mut padded = vec![Line::from(""); pad];
+            padded.extend(lines);
+            lines = padded;
+        }
+        frame.render_widget(Paragraph::new(lines), text_area);
+    }
+
     fn render_playlists(&mut self, frame: &mut Frame, area: Rect) {
+        // Lyrics mode gives this column to the cover instead — see
+        // `render_now_playing_card`.
+        if self.lyrics_mode {
+            self.render_now_playing_card(frame, area);
+            return;
+        }
         let focused = self.active_panel == Panel::Playlists;
         let count = self.library.len();
         let status = (count > 0).then(|| Line::styled(count.to_string(), theme::DIM));
@@ -2909,12 +3047,12 @@ impl App {
         }
         let body = section(frame, area, "Search", Some(Line::from(query)), focused);
         if body.height == 0 || body.width == 0 {
-            self.cover_area = None;
+            self.cover_target = None;
             return;
         }
 
         if search.loading {
-            self.cover_area = None;
+            self.cover_target = None;
             frame.render_stateful_widget(
                 Throbber::default()
                     .label(" Searching YouTube Music…")
@@ -2926,7 +3064,7 @@ impl App {
         }
 
         if let Some(err) = &search.error {
-            self.cover_area = None;
+            self.cover_target = None;
             centered_message(
                 frame,
                 body,
@@ -2945,7 +3083,7 @@ impl App {
         }
 
         if search.results.is_empty() {
-            self.cover_area = None;
+            self.cover_target = None;
             let msg = if search.ran.is_empty() {
                 vec![
                     Line::styled("Type a query, then press ↵", theme::DIM),
@@ -2985,7 +3123,9 @@ impl App {
         } else {
             (body, None)
         };
-        self.cover_area = cover_area;
+        self.cover_target = cover_area.and_then(|rect| {
+            Some((search.selected()?.video_id.clone(), rect))
+        });
 
         // The details under the cover, which the image must not overlap.
         if let (Some(cover), Some(hit)) = (cover_area, search.selected()) {
@@ -3166,7 +3306,6 @@ impl App {
             }
             return;
         }
-        self.cover_area = None;
 
         // Lyrics take over the whole right column — Info, Track and the song
         // list all give way to it.
@@ -3975,6 +4114,7 @@ mod tests {
                 album: None,
                 duration: None,
                 duration_seconds: None,
+                thumbnail: None,
             }
         }
 

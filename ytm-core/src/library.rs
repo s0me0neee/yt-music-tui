@@ -21,6 +21,12 @@ pub struct Track {
     pub album: Option<Album>,
     pub duration: Option<String>,
     pub duration_seconds: Option<u32>,
+    /// Cover art URL, largest the API offered. Carried from the playlist
+    /// fetch, which has always returned these — so showing a cover costs no
+    /// request of its own. `default` because a `queue.json` written before
+    /// this field existed has none.
+    #[serde(default)]
+    pub thumbnail: Option<String>,
 }
 
 impl Track {
@@ -39,6 +45,18 @@ pub struct Playlist {
     pub playlist_id: String,
     pub title: String,
     pub count: Option<u32>,
+}
+
+/// The biggest cover the API listed.
+///
+/// They come smallest-first and every size is the same picture, so the largest
+/// is the one worth having: `cover::at_size` can ask the CDN to shrink it, but
+/// nothing can put back detail that was never fetched.
+fn largest_thumbnail(thumbnails: &[ytmusicapi::Thumbnail]) -> Option<String> {
+    thumbnails
+        .iter()
+        .max_by_key(|t| t.width.unwrap_or(0))
+        .map(|t| t.url.clone())
 }
 
 // ── fetching ─────────────────────────────────────────────────────────────────
@@ -84,6 +102,7 @@ pub async fn get_songs(yt: &YTMusicClient, playlist_id: &str) -> Option<Vec<Trac
                             album: t.album,
                             duration: t.duration,
                             duration_seconds: t.duration_seconds,
+                            thumbnail: largest_thumbnail(&t.thumbnails),
                         })
                         .collect(),
                 );
@@ -364,6 +383,7 @@ mod tests {
             album: None,
             duration: None,
             duration_seconds: Some(100),
+            thumbnail: None,
         }
     }
 

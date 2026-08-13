@@ -128,6 +128,7 @@ impl SearchResult {
             }),
             duration: (!self.duration.is_empty()).then(|| self.duration.clone()),
             duration_seconds: self.duration_seconds,
+            thumbnail: self.thumbnail.clone(),
         }
     }
 }

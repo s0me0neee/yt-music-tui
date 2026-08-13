@@ -330,6 +330,7 @@ mod tests {
             album: None,
             duration: None,
             duration_seconds: Some(100),
+            thumbnail: None,
         }
     }
 
