@@ -1,7 +1,14 @@
 /target
+
+# Credentials. None of these belong in the repo, and two of them were in it
+# once — the history was rewritten to remove them.
+secret/
+clientid
 tokencache.json
-.DS_Store
+browser.json
 .yt-tui-browser
+
+.DS_Store
 bg_snapshot.bin
 rustypipe_cache.json
 rustypipe_reports/
