@@ -613,6 +613,10 @@ impl Player {
         log::info!("do_play: pl={pl_idx} song={song_idx} videoId={video_id:?}");
         match video_id {
             Some(id) if !id.is_empty() => {
+                // Before the command, not with it: the caller reads the audio
+                // state again within microseconds and the audio thread will
+                // not have woken. See [`AudioEngine::begin_track`].
+                self.audio.begin_track(&id);
                 self.audio.send(Cmd::Play(id));
                 self.audio.send(Cmd::Volume(self.volume));
             }

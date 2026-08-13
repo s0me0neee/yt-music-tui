@@ -254,6 +254,24 @@ fn fit_hints(items: &[(&str, &str)], width: usize) -> Vec<Span<'static>> {
     spans
 }
 
+/// The audio length to rank lyrics against: what mpv measured, but only where
+/// it is measured for the track being looked up.
+///
+/// The check is the whole point. `total` is only zero *between* tracks — the
+/// moment a new one starts it still holds the last one's length, which is a
+/// perfectly plausible number for the wrong song, and ranking is mostly a
+/// question of which record's length is closest. Measured against the user's
+/// own session: `typing (feat. Kaai Yuki)` is 191.8s and matched lrclib
+/// #32826273 at 192.0s, but was looked up against the previous track's 172.8s
+/// and got #35821757 at 177.0s instead. `Constellation` kept its record and
+/// lost its *timings*, demoted to plain by a 7.2s gap that wasn't there.
+///
+/// `None` means "not known yet", which is what [`App::DURATION_WAIT`] waits
+/// out before falling back to YouTube's own figure.
+fn measured_duration(state: &AudioState, video_id: &str) -> Option<f64> {
+    (state.track.as_deref() == Some(video_id) && state.total > 0.0).then_some(state.total)
+}
+
 /// Moves the selection down one row, stopping at the last of `len`.
 ///
 /// `TableState::select_next` knows nothing about how many rows there are, so
@@ -1700,8 +1718,10 @@ impl App {
         //
         // mpv reports it a moment after the file loads, so this waits a tick
         // or two — invisible next to the second the lookup itself takes, and
-        // bounded so a track that never starts still gets its lyrics.
-        let total = self.player.audio_state().total;
+        // bounded so a track that never starts still gets its lyrics. What is
+        // *not* waited for is the figure left over from the track before, which
+        // is what `measured_duration` is checking for.
+        let total = measured_duration(&self.player.audio_state(), video_id).unwrap_or(0.0);
         if total <= 0.0 {
             let waited = match &self.lyrics_duration_wait {
                 Some((id, since)) if id == video_id => since.elapsed(),
@@ -4555,6 +4575,50 @@ mod tests {
             // Cells are not always twice as tall as wide, and the axis that
             // needs the most pixels is the one that decides.
             assert_eq!(App::cover_draw_px_for((16, 24)), 384);
+        }
+    }
+
+    /// Which track the audio state's numbers belong to — the difference
+    /// between ranking lyrics against this song and against the last one.
+    mod duration {
+        use super::*;
+
+        fn state(track: Option<&str>, total: f64) -> AudioState {
+            AudioState {
+                total,
+                track: track.map(str::to_string),
+                ..AudioState::default()
+            }
+        }
+
+        #[test]
+        fn a_length_measured_for_this_track_is_used() {
+            assert_eq!(
+                measured_duration(&state(Some("abc"), 191.8), "abc"),
+                Some(191.8)
+            );
+        }
+
+        #[test]
+        fn the_previous_tracks_length_is_not() {
+            // The bug this exists for: `Play` is a message to another thread,
+            // and the event loop reads this back before that thread has woken.
+            // 172.8s is a plausible length, so nothing downstream could tell it
+            // was the wrong song's — it picked a record 15s short and kept it.
+            assert_eq!(
+                measured_duration(&state(Some("previous"), 172.8), "abc"),
+                None
+            );
+        }
+
+        #[test]
+        fn a_track_mpv_has_not_reported_yet_has_no_length() {
+            // Stamped as ours, but the duration hasn't arrived: still nothing
+            // to rank against, which is what the four-second wait is for.
+            assert_eq!(measured_duration(&state(Some("abc"), 0.0), "abc"), None);
+            assert_eq!(measured_duration(&state(None, 0.0), "abc"), None);
+            // And nothing playing at all — a queue restored but not started.
+            assert_eq!(measured_duration(&state(None, 191.8), "abc"), None);
         }
     }
 

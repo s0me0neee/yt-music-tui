@@ -107,6 +107,13 @@ tui/        the ratatui frontend — single `ytm` binary
   on the `duration` property change meant a track started while the previous one was still
   settling resolved, cached its URL and was never loaded: audio carried on with the old song
   under the new song's title.
+  `AudioState::track` names the video the rest of the snapshot describes, and
+  `begin_track` — called by `do_play` on the *caller's* thread, before the `Play` command is
+  even queued — is what makes it true immediately. `Cmd::Play` is a message to another
+  thread that wakes every 20 ms, while the event loop reads the state back within
+  microseconds, so for that window every figure in it belonged to the track playing a moment
+  ago. `total` is the one that did damage: a plausible length for the wrong song, and lyrics
+  are ranked mostly on which record's length is closest. See `measured_duration` in `app.rs`.
 - **`player.rs`** — `Player`: queue, play modes, volume/mute, song-end advance. Leaving
   Shuffle restores the order the queue had before it (`unshuffled` + `reorder_to`), rather
   than sorting: a queue built by hand with `a` has an order the user chose, and across
@@ -301,6 +308,13 @@ tui/        the ratatui frontend — single `ytm` binary
     fetch. Results are cached per video ID and never re-fetched, so toggling is free —
     `MAX_LYRICS` of them, oldest first, since nothing else ever took one out and a session
     left running all day held every track it had played.
+    A lookup is ranked against the length **mpv measured for that track** — `ensure_lyrics`
+    waits up to `DURATION_WAIT` for it and falls back to YouTube's rounded figure after
+    that. `measured_duration` is what makes "for that track" true: the snapshot's `total`
+    holds the *previous* song's length until mpv reports the new one, and using it picked a
+    different record, or the same one demoted to plain because the gap looked like a timing
+    mismatch. Since the cache entry is terminal, one wrong lookup was the answer for the
+    rest of the session.
     The picker collapses records carrying identical lyrics — two thirds of what lrclib
     returns for a popular track — and its left column marks `IN USE` (what the panel is
     showing) and `AUTO` (the record automatic matching resolved to). The record on screen

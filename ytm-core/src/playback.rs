@@ -37,6 +37,13 @@ pub struct AudioState {
     pub loading: bool,
     pub error: Option<String>,
     pub song_ended: bool, // set on natural eof; caller must reset after reading
+    /// The video the rest of this snapshot describes.
+    ///
+    /// Without it there is no way to tell a figure that has arrived from one
+    /// left over: `total` is the *previous* track's until mpv reports the new
+    /// one, and a reader that can't see the difference will use it. See
+    /// [`AudioEngine::begin_track`].
+    pub track: Option<String>,
 }
 
 pub struct AudioEngine {
@@ -70,6 +77,26 @@ impl AudioEngine {
     /// Snapshot of the current playback state.
     pub fn state(&self) -> AudioState {
         self.lock_state().clone()
+    }
+
+    /// Says the snapshot now describes `video_id`, before the audio thread has
+    /// seen the [`Cmd::Play`] that follows.
+    ///
+    /// The commands are a mailbox and the audio thread reads it every 20 ms,
+    /// but the caller carries on immediately — and the very next thing the
+    /// event loop does is look at this state. For those few milliseconds every
+    /// figure in it belongs to the track that was playing a moment ago, and a
+    /// reader has no way to know: `total` is a plausible number for the wrong
+    /// song. Stamping the id here, from the thread that decided to play it,
+    /// closes the window rather than narrowing it.
+    pub fn begin_track(&self, video_id: &str) {
+        let mut s = self.lock_state();
+        s.track = Some(video_id.to_string());
+        s.elapsed = 0.0;
+        s.total = 0.0;
+        s.loading = true;
+        s.song_ended = false;
+        s.error = None;
     }
 
     /// Atomically reads and clears `song_ended`. `true` only once per natural
@@ -395,6 +422,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         load_retried = false;
                         {
                             let mut s = lock_state(&state);
+                            s.track = Some(id.clone());
                             s.loading = true;
                             s.paused = false;
                             s.elapsed = 0.0;
@@ -456,6 +484,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         log::debug!("[audio] Stop");
                         pending_resolve = None; // don't auto-play a late resolve
                         current_id = None;
+                        lock_state(&state).track = None;
                         if let Err(e) = mpv.command("stop", &[]) {
                             log::warn!("[audio] stop failed: {e}");
                         }
