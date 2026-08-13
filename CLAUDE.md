@@ -505,10 +505,18 @@ Cargo resolves versions more loosely than expected in edition 2024. When adding 
 dependencies, pin exact versions in `Cargo.toml` and run `cargo tree` to confirm the resolved
 version before writing code against a specific API.
 
-**reqwest is pinned to 0.12** across the workspace to match what `ytmusicapi` already pulls in.
-Do not bump `lrclib` to 0.13 casually — it would add a second HTTP stack plus an `aws-lc-sys`
-C build (needs cc + cmake). Verify with `cargo tree -i aws-lc-sys` (should report *not found*).
-Note 0.12 has no `query` feature; `.query()` is unconditional there.
+**reqwest is on 0.13 in this workspace's own crates, and 0.12 arrives anyway.** Both
+`ytmusicapi 0.5` and `rust-translate 0.1.3` require `0.12`, so there is no version of this
+where one stack serves everything: `cargo tree -d` lists `reqwest v0.12.28` beside
+`v0.13.4`, and `cargo tree -i aws-lc-sys` — which used to report *not found* — now traces
+back through `hyper-rustls` to our own two crates, because 0.13's `default-tls` is rustls
+with `aws-lc-rs` rather than 0.12's native-tls. That is a C build (cc + cmake) on every
+platform the app is built for, Windows included.
+Going back to `0.12` in `lrclib/Cargo.toml` and `ytm-core/Cargo.toml` is the one-line way to
+restore both, and costs nothing at the call sites — `get`/`query`/`json`/`bytes`/`chunk` are
+the same on either. Note 0.13 moved `RequestBuilder::query` behind a **`query` feature**,
+where 0.12 has it unconditionally, so a bump in either direction has to touch the features
+list as well as the version.
 
 **`mpris-server 0.10`** is a Linux-only target dependency, so Windows and macOS builds never
 see zbus at all. Its `tokio` feature matters more than it looks: zbus picks a reactor by
@@ -516,18 +524,18 @@ asking `Handle::try_current()` *while the connection is being built*, so `Server
 be called from inside the runtime (`MediaControls::new` uses `Handle::block_on` for exactly
 this) or it silently starts a second, async-io driver thread. `async-io` is compiled either
 way — mpris-server depends on zbus with default features, and features unify — which costs
-build time only. zbus 5 shares nothing with the reqwest 0.12 stack; `cargo tree -i aws-lc-sys`
-still reports *not found*.
+build time only. zbus 5 shares nothing with either reqwest stack.
 
 `rust-translate 0.1.3` is the free path's transport, and the source of `supported_languages`
 that `normalise_language` checks `lyrics.translate-to` against. It brings no HTTP stack of its
-own — its `reqwest 0.12.4` resolves to the 0.12 already in the graph. It does ask for tokio's
+own — its `reqwest 0.12.4` resolves to the 0.12 `ytmusicapi` pulls in, which is also why
+0.12 is in the graph whatever this workspace's own crates ask for. It does ask for tokio's
 `full` feature set, which unifies across the workspace; that costs build time, nothing at
 runtime. See `ytm-core/src/translate.rs` for what it gets wrong and how that is handled.
 
 The AI path in `translate/llm.rs` calls the Anthropic Messages API over the workspace's own
-`reqwest` — no SDK, since there is no official Rust one, and no new HTTP stack. `cargo tree -i
-aws-lc-sys` still reports *not found*. DeepSeek serves the same request shape at its own host,
+`reqwest` — no SDK, since there is no official Rust one, and no new HTTP stack. DeepSeek
+serves the same request shape at its own host,
 so `Provider` carries the four things that differ: the URL, `Authorization: Bearer` against
 Anthropic's `x-api-key`, the `max_tokens` ceiling (8192 there, 32000 here), and whether
 `output_config` can constrain the reply. It can't on DeepSeek, so the schema goes in the
@@ -550,7 +558,8 @@ for the kitty protocol is hand-written in `tui/src/kitty.rs` for the same reason
 `translate::percent_encode` is — a dozen lines of table lookup against a dependency to audit
 and pin.
 
-Key deps: `ratatui 0.30`, `ytmusicapi 0.4.2`, `libmpv2 6`, `reqwest 0.12`, `thiserror 1`,
+Key deps: `ratatui 0.30`, `ytmusicapi 0.5`, `libmpv2 6`, `reqwest 0.13` (and `0.12`, pulled
+in by `ytmusicapi` and `rust-translate`), `thiserror 2`, `toml 1` / `toml_edit 0.25`,
 `mpris-server 0.10` (Linux only),
-`rust-translate 0.1.3`, `ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.8`,
-`throbber-widgets-tui 0.11`.
+`rust-translate 0.1.3`, `ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.10`,
+`dirs 6`, `throbber-widgets-tui 0.11`.

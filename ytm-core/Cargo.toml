@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 lrclib = { path = "../lrclib" }
-ytmusicapi = "0.4.2"
+ytmusicapi = "0.5.0"
 libmpv2 = "6.0.0"
 # Lyric translation calls translate_a/single directly through this, because the
 # reply has to be read segment by segment — see `translate.rs`. 0.12 to match
@@ -13,31 +13,37 @@ libmpv2 = "6.0.0"
 # add an aws-lc-sys C build. Verify with `cargo tree -i aws-lc-sys` (*not
 # found*). No "json" feature: the reply is a positional array, not an object,
 # so it is parsed with serde_json directly.
-reqwest = { version = "0.12", features = ["gzip"] }
+reqwest = { version = "0.13.4", features = ["gzip"] }
 # Kept only for `supported_languages`, which `normalise_language` checks
 # `lyrics.translate-to` against. Its `translate` function is unused: it reads
 # just the first segment of a reply and silently drops the rest.
 rust-translate = "0.1.3"
 # "sync" is not needed: concurrency in `translate.rs` is bounded by spawning in
 # rounds rather than with a semaphore.
-tokio = { version = "1", features = ["rt", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# config.toml parsing. Read-only, so no "display" feature.
-toml = { version = "0.8.23", default-features = false, features = ["parse"] }
+tokio = { version = "1.53.1", features = ["rt", "time"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# config.toml parsing. Read-only, so no "display" feature — but "serde" is
+# needed even though nothing here derives `Deserialize` on a config struct:
+# 1.x moved `toml::Table` and `toml::Value` behind it, and reading each setting
+# out of a parsed table by hand is the whole point of `config.rs`.
+toml = { version = "1.1.4", default-features = false, features = [
+	"parse",
+	"serde",
+] }
 # Format-preserving edits: the app records the browser that worked back into
 # config.toml, which is hand-edited and full of comments worth keeping.
-toml_edit = "0.22.27"
+toml_edit = "0.25.13"
 # Cover art. `default-features = false` drops rayon: a 120px thumbnail decodes
 # in well under a millisecond and does not want a thread pool, which would also
 # be a second one alongside tokio's. The only image format needed is JPEG —
 # YouTube's image CDN serves `…=w120-h120-l90-rj`, where `rj` *is* "return
 # JPEG" — so the `image` crate and its format zoo buy nothing here.
 jpeg-decoder = { version = "0.3.2", default-features = false }
-thiserror = "1"
-log = "0.4"
-rand = "0.8"
-dirs = "5"
+thiserror = "2.0.20"
+log = "0.4.33"
+rand = "0.10.2"
+dirs = "6.0.0"
 inquire = "0.9.4"
 # Same version as the `tui` binary's, so one hotpath is compiled rather than
 # two side by side.
@@ -55,11 +61,11 @@ mpris-server = { version = "0.10.0", features = ["tokio"] }
 # `macros` for #[tokio::test] in the live lyrics tests; `test-util` for the
 # paused clock that keeps the retry-backoff tests instant.
 tokio = { version = "1", features = [
-    "rt",
-    "rt-multi-thread",
-    "macros",
-    "time",
-    "test-util",
+	"rt",
+	"rt-multi-thread",
+	"macros",
+	"time",
+	"test-util",
 ] }
 
 [build-dependencies]

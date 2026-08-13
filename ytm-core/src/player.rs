@@ -590,7 +590,7 @@ impl Player {
         self.unshuffled = None;
         if matches!(self.mode, PlayMode::Shuffle) {
             self.unshuffled = Some(self.queue.clone());
-            self.queue.shuffle(&mut rand::thread_rng());
+            self.queue.shuffle(&mut rand::rng());
         }
         self.queue_pos = self
             .queue
@@ -655,7 +655,7 @@ impl Player {
         match (old_mode, self.mode) {
             (_, PlayMode::Shuffle) => {
                 self.unshuffled = Some(self.queue.clone());
-                self.queue.shuffle(&mut rand::thread_rng());
+                self.queue.shuffle(&mut rand::rng());
             }
             (PlayMode::Shuffle, _) => self.restore_order(),
             _ => {} // Single <-> Cycle switch doesn't need a reorder
