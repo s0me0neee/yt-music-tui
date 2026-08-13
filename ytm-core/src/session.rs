@@ -6,6 +6,7 @@
 //! pasting a "Copy as cURL" export from browser DevTools.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -33,10 +34,80 @@ pub fn app_config_dir() -> PathBuf {
 }
 
 /// Creates the config directory if it doesn't exist, then returns its path.
+///
+/// The directory is restricted to its owner on every startup, not only on the
+/// one that created it: everything in it is either a credential
+/// (`browser.json`) or a record of what the user listens to, and installs made
+/// before this existed are sitting at whatever the umask gave them.
 pub fn ensure_config_dir() -> Result<PathBuf> {
     let dir = app_config_dir();
     std::fs::create_dir_all(&dir)?;
+    restrict(&dir, 0o700);
+    // The one file inside worth naming: `browser.json` is a signed-in session,
+    // and an install predating [`write_private`] still has it world-readable
+    // until the next cookie refresh replaces it.
+    restrict(&browser_json_path(), 0o600);
     Ok(dir)
+}
+
+/// Restricts `path` to its owner. Unix-only, and best-effort: a permission we
+/// couldn't tighten is worth a log line, never a failure to start.
+fn restrict(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !path.exists() {
+            return;
+        }
+        let perms = std::fs::Permissions::from_mode(mode);
+        if let Err(e) = std::fs::set_permissions(path, perms) {
+            log::warn!("[session] couldn't restrict {} ({e})", path.display());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
+/// Writes `contents` to `path` so that only this user can read it, and so that
+/// an interrupted write can't leave a half-file behind.
+///
+/// Both halves matter for `browser.json`. It holds the cookies that *are* the
+/// signed-in session — `fs::write` would leave them at 0644 under the usual
+/// umask, readable by anyone with an account on the machine — and it is
+/// rewritten in place every few hours by the background cookie refresh, where a
+/// truncated file costs the user a full re-setup. Writing a private temporary
+/// file and renaming it over the target is atomic, so a reader sees the old
+/// contents or the new ones and never a prefix of either.
+pub fn write_private(path: &Path, contents: &str) -> Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+
+    // `create_new` after removing our own leftover: it fails rather than
+    // follows if anything is at that path, and it is what makes `mode` below
+    // describe the file we actually write to.
+    std::fs::remove_file(&tmp).ok();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let write = || -> std::io::Result<()> {
+        let mut file = opts.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        // Before the rename, so a power loss can't leave the new name pointing
+        // at an empty file.
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    };
+
+    write().inspect_err(|_| {
+        std::fs::remove_file(&tmp).ok();
+    })?;
+    Ok(())
 }
 
 pub fn browser_json_path() -> PathBuf {
@@ -71,11 +142,11 @@ pub fn ensure_config_toml() -> Result<()> {
     let path = config_toml_path();
     match std::fs::read_to_string(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&path, crate::config::TEMPLATE)?;
+            write_private(&path, crate::config::TEMPLATE)?;
         }
         Ok(existing) if existing == crate::config::LEGACY_STUB => {
             log::info!("config: filling in the empty config.toml template");
-            std::fs::write(&path, crate::config::TEMPLATE)?;
+            write_private(&path, crate::config::TEMPLATE)?;
         }
         _ => {}
     }
@@ -248,8 +319,8 @@ impl Session {
     pub fn setup_with_browser(&self, browser: Browser) -> Result<()> {
         let cookie_header = extract_cookies_via_ytdlp(browser)?;
         let headers = build_default_headers(cookie_header);
-        std::fs::write(&self.browser_json, serde_json::to_string_pretty(&headers)?)?;
-        std::fs::write(browser_file_path(), browser.as_ytdlp_arg())?;
+        write_private(&self.browser_json, &serde_json::to_string_pretty(&headers)?)?;
+        write_private(&browser_file_path(), browser.as_ytdlp_arg())?;
         // Only once the extraction has actually worked — a browser that can't
         // produce cookies is not worth re-running silently forever.
         crate::config::remember_cookie_browser(browser.as_ytdlp_arg());
@@ -260,7 +331,7 @@ impl Session {
     /// command and writes `browser.json`. No prompts — safe to call without a TTY.
     pub fn setup_with_curl(&self, curl: &str) -> Result<()> {
         let headers = parse_curl(curl.trim())?;
-        std::fs::write(&self.browser_json, serde_json::to_string_pretty(&headers)?)?;
+        write_private(&self.browser_json, &serde_json::to_string_pretty(&headers)?)?;
         Ok(())
     }
 
@@ -301,7 +372,7 @@ impl Session {
         let json_str = std::fs::read_to_string(&self.browser_json)?;
         let mut json: serde_json::Value = serde_json::from_str(&json_str)?;
         json["cookie"] = serde_json::Value::String(cookie_header);
-        std::fs::write(&self.browser_json, serde_json::to_string_pretty(&json)?)?;
+        write_private(&self.browser_json, &serde_json::to_string_pretty(&json)?)?;
         log::info!("[session] cookies refreshed");
         Ok(())
     }
@@ -374,8 +445,15 @@ impl Drop for FileGuard {
 
 #[hotpath::measure]
 fn extract_cookies_via_ytdlp(browser: Browser) -> Result<String> {
-    let tmp = std::env::temp_dir()
-        .join(format!("yt-tui-cookies-{}.txt", std::process::id()))
+    // Not the system temp directory. yt-dlp writes every youtube.com cookie
+    // into this file, and on a shared machine `/tmp/yt-tui-cookies-<pid>.txt`
+    // is both guessable and creatable by anyone: whoever gets there first owns
+    // the path, and so either reads the session out of it or chooses where
+    // yt-dlp's write lands. The config directory is this user's alone —
+    // `ensure_config_dir` restricts it — so nobody else can even look.
+    let dir = ensure_config_dir()?;
+    let tmp = dir
+        .join(format!(".cookies-{}.txt", std::process::id()))
         .to_string_lossy()
         .into_owned();
     let _guard = FileGuard(tmp.clone());
@@ -457,6 +535,17 @@ fn diagnose_ytdlp_stderr(browser: Browser, stderr: &str) -> String {
     format!("{hint}\n\nyt-dlp said:\n{tail}")
 }
 
+/// Whether a cookie's domain is YouTube's, rather than merely ending in it.
+///
+/// A plain `ends_with("youtube.com")` also accepts `notyoutube.com` — a domain
+/// anyone can register — and every cookie that passes this test is put in the
+/// header sent to Google. The leading dot is how a Netscape cookie file spells
+/// "and its subdomains".
+fn is_youtube_domain(domain: &str) -> bool {
+    let domain = domain.trim_start_matches('.');
+    domain == "youtube.com" || domain.ends_with(".youtube.com")
+}
+
 fn parse_netscape_cookies(content: &str) -> String {
     content
         .lines()
@@ -474,7 +563,7 @@ fn parse_netscape_cookies(content: &str) -> String {
             // accumulate dozens of them and the resulting header blows past
             // Google's request-size limit (HTTP 413). ytmusicapi does not
             // need them.
-            if domain.ends_with("youtube.com") && !name.starts_with("ST-") {
+            if is_youtube_domain(domain) && !name.starts_with("ST-") {
                 Some(format!("{name}={value}"))
             } else {
                 None
@@ -588,6 +677,62 @@ ERROR: Unable to extract cookies from browser";
     #[test]
     fn silence_from_yt_dlp_adds_nothing() {
         assert_eq!(diagnose_ytdlp_stderr(Browser::Chrome, "   \n\n"), "");
+    }
+
+    #[test]
+    fn only_youtubes_own_cookies_are_forwarded() {
+        assert!(is_youtube_domain("youtube.com"));
+        assert!(is_youtube_domain(".youtube.com"));
+        assert!(is_youtube_domain("music.youtube.com"));
+        assert!(is_youtube_domain(".music.youtube.com"));
+        // Anyone can register this one, and a suffix match would send Google
+        // whatever it had set.
+        assert!(!is_youtube_domain("notyoutube.com"));
+        assert!(!is_youtube_domain("evil-youtube.com"));
+        assert!(!is_youtube_domain("youtube.com.attacker.net"));
+        assert!(!is_youtube_domain(""));
+    }
+
+    #[test]
+    fn a_lookalike_domains_cookies_never_reach_the_header() {
+        let jar = "\
+# Netscape HTTP Cookie File
+.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\treal
+notyoutube.com\tTRUE\t/\tTRUE\t0\tSTOLEN\tnope
+.youtube.com\tTRUE\t/\tTRUE\t0\tST-tab1\tdropped
+";
+        let header = parse_netscape_cookies(jar);
+        assert_eq!(header, "SAPISID=real");
+    }
+
+    #[test]
+    fn a_private_write_replaces_the_file_whole() {
+        let dir = std::env::temp_dir().join(format!("ytm-write-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("browser.json");
+
+        write_private(&path, "first").expect("written");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        // Rewriting in place is what the cookie refresh does every few hours.
+        write_private(&path, "second").expect("rewritten");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        // The temporary is not left behind for the next run to trip over.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left {strays:?} behind");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            // The cookies *are* the session — nobody else gets to read them.
+            assert_eq!(mode & 0o077, 0, "mode {mode:o} is readable by others");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

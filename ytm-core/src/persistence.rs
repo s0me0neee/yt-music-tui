@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::library::Library;
 use crate::player::TrackRef;
-use crate::session::{lyrics_path, queue_path, settings_path, translations_path};
+use crate::session::{
+    lyrics_path, queue_path, settings_path, translations_path, write_private,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueEntry {
@@ -24,9 +26,13 @@ pub struct QueueState {
     pub position: Option<usize>,
 }
 
+/// Every one of these goes through [`write_private`]: they are written on the
+/// way out, when a `Ctrl+C` landing mid-write is at its most likely, and a
+/// half-written file reads back as no file at all — the queue, the volume or a
+/// paid-for translation silently gone. A rename is atomic, so the worst case
+/// becomes the previous contents rather than none.
 pub fn save_queue(state: &QueueState) -> Result<()> {
-    std::fs::write(queue_path(), serde_json::to_string_pretty(state)?)?;
-    Ok(())
+    write_private(&queue_path(), &serde_json::to_string_pretty(state)?)
 }
 
 pub fn load_queue() -> Option<QueueState> {
@@ -56,8 +62,7 @@ impl Default for Settings {
 }
 
 pub fn save_settings(settings: &Settings) -> Result<()> {
-    std::fs::write(settings_path(), serde_json::to_string_pretty(settings)?)?;
-    Ok(())
+    write_private(&settings_path(), &serde_json::to_string_pretty(settings)?)
 }
 
 pub fn load_settings() -> Settings {
@@ -95,8 +100,7 @@ impl LyricsOverrides {
 }
 
 pub fn save_lyrics_overrides(overrides: &LyricsOverrides) -> Result<()> {
-    std::fs::write(lyrics_path(), serde_json::to_string_pretty(overrides)?)?;
-    Ok(())
+    write_private(&lyrics_path(), &serde_json::to_string_pretty(overrides)?)
 }
 
 pub fn load_lyrics_overrides() -> LyricsOverrides {
@@ -202,11 +206,10 @@ impl Translations {
 }
 
 pub fn save_translations(translations: &Translations) -> Result<()> {
-    std::fs::write(
-        translations_path(),
-        serde_json::to_string_pretty(translations)?,
-    )?;
-    Ok(())
+    write_private(
+        &translations_path(),
+        &serde_json::to_string_pretty(translations)?,
+    )
 }
 
 pub fn load_translations() -> Translations {
@@ -302,6 +305,90 @@ pub fn try_restore(library: &Library, saved: &QueueState) -> RestoreOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::{Playlist, Track};
+
+    // ── restoring a saved queue ──────────────────────────────────────────────
+
+    fn library() -> Library {
+        Library::new(vec![Playlist {
+            playlist_id: "PL1".to_string(),
+            title: "Mine".to_string(),
+            count: Some(1),
+        }])
+    }
+
+    fn track(video_id: &str) -> Track {
+        Track {
+            video_id: Some(video_id.to_string()),
+            title: Some("Song".to_string()),
+            artists: Vec::new(),
+            album: None,
+            duration: None,
+            duration_seconds: Some(100),
+        }
+    }
+
+    fn saved() -> QueueState {
+        QueueState {
+            entries: vec![QueueEntry {
+                playlist_id: Some("PL1".to_string()),
+                video_id: "aaa".to_string(),
+            }],
+            position: Some(0),
+        }
+    }
+
+    #[test]
+    fn a_queue_waits_for_the_playlist_it_names() {
+        let lib = library();
+        assert!(matches!(
+            try_restore(&lib, &saved()),
+            RestoreOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn a_playlist_that_failed_to_load_does_not_discard_the_queue() {
+        // The failure this pairs with: marking a failed fetch "loaded" made
+        // the saved video look permanently absent, so a queue the user had
+        // built over weeks was dropped because one request timed out. Pending
+        // keeps it, and `r` re-fetching is what finally resolves it.
+        let mut lib = library();
+        lib.apply_song_batch(0, None);
+        assert!(matches!(
+            try_restore(&lib, &saved()),
+            RestoreOutcome::Pending
+        ));
+
+        lib.apply_song_batch(0, Some(vec![track("aaa")]));
+        let RestoreOutcome::Ready { queue, position } = try_restore(&lib, &saved()) else {
+            panic!("the retry should have restored it");
+        };
+        assert_eq!(queue, [(0, 0)]);
+        assert_eq!(position, Some(0));
+    }
+
+    #[test]
+    fn a_playlist_that_is_loaded_and_really_empty_abandons_the_queue() {
+        // No amount of waiting brings the track back — the user deleted it.
+        let mut lib = library();
+        lib.apply_song_batch(0, Some(Vec::new()));
+        assert!(matches!(
+            try_restore(&lib, &saved()),
+            RestoreOutcome::Abandoned
+        ));
+    }
+
+    #[test]
+    fn a_queue_naming_a_playlist_that_is_gone_is_abandoned() {
+        let lib = Library::new(Vec::new());
+        assert!(matches!(
+            try_restore(&lib, &saved()),
+            RestoreOutcome::Abandoned
+        ));
+    }
+
+    // ── translations ─────────────────────────────────────────────────────────
 
     fn lines() -> Vec<String> {
         vec!["\u{4e00}".to_string(), "\u{4e8c}".to_string()]

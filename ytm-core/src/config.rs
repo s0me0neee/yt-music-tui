@@ -454,7 +454,10 @@ pub fn remember_cookie_browser(browser: &str) {
     }
     doc["auth"]["cookie-browser"] = toml_edit::value(browser);
 
-    match std::fs::write(&path, doc.to_string()) {
+    // Atomically, like every other file the app writes: this one is the
+    // *user's*, comments and all, and a truncated config.toml would cost them
+    // both their settings and the browser this call exists to record.
+    match crate::session::write_private(&path, &doc.to_string()) {
         Ok(()) => log::info!("config: remembered cookie-browser = {browser:?}"),
         Err(e) => log::warn!("config: can't write {} ({e})", path.display()),
     }
