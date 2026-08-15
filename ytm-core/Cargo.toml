@@ -57,6 +57,67 @@ hotpath = "0.23.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = { version = "0.10.0", features = ["tokio"] }
 
+# The same feature on Windows: the System Media Transport Controls, which is
+# both the media keys and the panel the volume flyout and the lock screen show.
+# Namespace features only — no `Win32_UI_*`, because the SMTC here hangs off a
+# `MediaPlayer` rather than an HWND (see `media/smtc.rs`). `Win32_System_Com` is
+# for `CoInitializeEx` alone: WinRT calls need an apartment, and the thread that
+# owns these objects is ours to initialise.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
+	"Foundation",
+	"Media",
+	"Media_Playback",
+	"Storage_Streams",
+	"Win32_System_Com",
+] }
+
+# And on macOS: the Now Playing centre and the remote command centre, which is
+# Control Centre, the media keys and a headset's play button. AppKit is here
+# only to be an *app* — an accessory `NSApplication`, no window — since neither
+# of the two answers a process the system does not think is one. Features are
+# per-class in these crates, so each list is exactly what `media/nowplaying.rs`
+# names; `objc2-app-kit` and `objc2-core-foundation` on the media-player crate
+# are what turn on the `NSImage`/`CGSize` artwork initialiser.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", features = [
+	"NSString",
+	"NSDictionary",
+	"NSValue",
+	"NSData",
+	"NSArray",
+	"NSDate",
+	"NSRunLoop",
+] }
+objc2-app-kit = { version = "0.3.2", features = [
+	"NSApplication",
+	"NSImage",
+	"NSResponder",
+	"NSRunningApplication",
+] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFCGTypes"] }
+objc2-media-player = { version = "0.3.2", features = [
+	"MPNowPlayingInfoCenter",
+	"MPRemoteCommandCenter",
+	"MPRemoteCommand",
+	"MPRemoteCommandEvent",
+	"MPMediaItem",
+	"MPRemoteControlTypes",
+	"block2",
+	"objc2-app-kit",
+	"objc2-core-foundation",
+] }
+
+# `Media_Control` is the *reading* half of the same API — how a client
+# enumerates what every app on the machine is publishing. Only the round-trip
+# test needs it (it reads our own session back, the way the Linux one reads
+# itself off D-Bus), so it goes here rather than in the dependency above and is
+# never compiled into the shipped binary.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.62.2", features = ["Media_Control"] }
+
 [dev-dependencies]
 # `macros` for #[tokio::test] in the live lyrics tests; `test-util` for the
 # paused clock that keeps the retry-backoff tests instant.

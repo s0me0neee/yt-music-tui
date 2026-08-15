@@ -644,6 +644,12 @@ const MAX_LYRICS: usize = 256;
 /// then when nothing points into it. See [`App::prune_search_history`].
 const MAX_SEARCH_TRACKS: usize = 128;
 
+/// How big a cover to ask the CDN for on the OS's own media panel. Fixed,
+/// unlike the terminal's, because that panel is not the terminal: Windows'
+/// flyout and macOS's Control Centre both draw it a few hundred pixels across
+/// on a HiDPI display, and the CDN serves any size up to 1400 exactly.
+const MEDIA_COVER_PX: u32 = 600;
+
 /// Which translator the lyrics panel is showing. `i` picks [`Self::Free`] and
 /// `I` picks [`Self::Ai`]; each key turns its own off again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2150,11 +2156,12 @@ impl App {
         })
     }
 
-    // ── MPRIS ─────────────────────────────────────────────────────────────────
+    // ── the OS's media controls ───────────────────────────────────────────────
 
-    /// Acts on anything the desktop asked for — a media key, GNOME's player
-    /// widget, `playerctl`. Commands are collected first because acting on one
-    /// needs `&mut self` while the channel is borrowed from `self.media`.
+    /// Acts on anything the OS asked for — a media key, GNOME's player widget,
+    /// `playerctl`, a button in the Windows flyout, macOS's Control Centre.
+    /// Commands are collected first because acting on one needs `&mut self`
+    /// while the channel is borrowed from `self.media`.
     fn drain_media(&mut self) {
         let Some(media) = self.media.as_ref() else {
             return;
@@ -2165,7 +2172,7 @@ impl App {
         }
 
         for cmd in cmds {
-            log::debug!("[mpris] {cmd:?}");
+            log::debug!("[media] {cmd:?}");
             match cmd {
                 MediaCmd::Play => self.player.resume(&self.library),
                 MediaCmd::Pause => {
@@ -2196,8 +2203,8 @@ impl App {
         }
     }
 
-    /// Publishes the current state to the desktop. Called every tick; the
-    /// diffing that decides whether anything reaches D-Bus lives in
+    /// Publishes the current state to the OS. Called every tick; the diffing
+    /// that decides whether anything actually goes out lives in each backend's
     /// `MediaControls::update`.
     fn update_media(&mut self) {
         if self.media.is_none() {
@@ -2227,6 +2234,15 @@ impl App {
                 } else {
                     t.duration_seconds.unwrap_or(0).into()
                 },
+                // The same thumbnail the playlist fetch already carried, asked
+                // for at a size an OS panel is worth showing it at — not the
+                // terminal-derived one `spawn_fetch` computes, since the panel
+                // this ends up in has nothing to do with the terminal.
+                art_url: t
+                    .thumbnail
+                    .as_deref()
+                    .map(|url| ytm_core::cover::at_size(url, MEDIA_COVER_PX))
+                    .unwrap_or_default(),
             });
 
         // A queue restored from disk has a track but has never been handed to

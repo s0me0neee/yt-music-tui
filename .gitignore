@@ -1,4 +1,7 @@
 /target
+# `tools/macos-check` is its own workspace, so it has a target of its own.
+/tools/*/target
+/tools/*/Cargo.lock
 
 # Credentials. None of these belong in the repo, and two of them were in it
 # once — the history was rewritten to remove them.

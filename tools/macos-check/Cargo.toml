@@ -1,0 +1,60 @@
+# Type-checks the macOS media backend from a machine that is not a Mac.
+#
+#   cd tools/macos-check && cargo check --target aarch64-apple-darwin
+#
+# `cargo check` never links, and every crate here is pure Rust, so this needs
+# nothing but `rustup target add aarch64-apple-darwin` — no Xcode, no SDK. The
+# real `ytm-core/src/media/nowplaying.rs` is included by path, so this checks
+# the shipped source rather than a copy of it.
+#
+# Checking `ytm-core` itself for that target is not an option: `aws-lc-sys` and
+# `libmpv2-sys` both build C, and that does want a macOS toolchain. Hence the
+# stand-in in `src/lib.rs`, which is only the handful of `ytm-core` items the
+# backend reaches for.
+#
+# Its own workspace, so `cargo build` at the repo root neither builds it nor
+# needs the Apple target installed.
+[workspace]
+
+[package]
+name = "macos-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+log = "0.4.33"
+tokio = { version = "1.53.1", features = ["rt", "time"] }
+
+# Kept in step with the same block in `ytm-core/Cargo.toml` — that is the point
+# of the exercise, so a version or feature that only exists here proves nothing.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", features = [
+	"NSString",
+	"NSDictionary",
+	"NSValue",
+	"NSData",
+	"NSArray",
+	"NSDate",
+	"NSRunLoop",
+] }
+objc2-app-kit = { version = "0.3.2", features = [
+	"NSApplication",
+	"NSImage",
+	"NSResponder",
+	"NSRunningApplication",
+] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFCGTypes"] }
+objc2-media-player = { version = "0.3.2", features = [
+	"MPNowPlayingInfoCenter",
+	"MPRemoteCommandCenter",
+	"MPRemoteCommand",
+	"MPRemoteCommandEvent",
+	"MPMediaItem",
+	"MPRemoteControlTypes",
+	"block2",
+	"objc2-app-kit",
+	"objc2-core-foundation",
+] }

@@ -327,6 +327,16 @@ fn client() -> Option<&'static reqwest::Client> {
 }
 
 async fn fetch(url: &str) -> Result<Cover, String> {
+    decode(&fetch_bytes(url).await?)
+}
+
+/// The bytes behind a cover URL, read against [`MAX_BYTES`].
+///
+/// Split out from [`fetch`] because macOS's Now Playing centre wants an
+/// `NSImage` rather than a URL, so [`crate::media`] has to do the fetching
+/// itself — and should do it through the same client and the same ceiling as
+/// everything else here rather than growing its own.
+pub(crate) async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let client = client().ok_or("no HTTP client")?;
     let mut response = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !response.status().is_success() {
@@ -348,7 +358,7 @@ async fn fetch(url: &str) -> Result<Cover, String> {
         }
         bytes.extend_from_slice(&chunk);
     }
-    decode(&bytes)
+    Ok(bytes)
 }
 
 #[cfg(test)]

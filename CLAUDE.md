@@ -14,11 +14,35 @@ cargo test <name>    # run a single test by name
 cargo test -p lrclib -- --ignored   # the live lrclib.net API tests
 cargo test -p ytm-core translate -- --ignored   # the live translation tests
 # the AI one takes ANTHROPIC_API_KEY or DEEPSEEK_API_KEY, whichever is set
-cargo test -p ytm-core mpris -- --ignored       # needs a session D-Bus
+# the OS media-controls round trip — whichever protocol this machine speaks
+cargo test -p ytm-core media -- --ignored
+# ↑ Linux: needs a session D-Bus. Windows: publishes a real SMTC session other
+#   apps can see while it runs, so not two copies at once. macOS: none yet.
+
+# Windows only — does a console process get SMTC at all? Publishes a fake track
+# for 60 s and prints every button press. The proof the backend rests on.
+cargo run -p ytm-core --example smtc_probe
 ```
 
 While the app is running, `playerctl -p ytm status|metadata|play-pause` talks to it, and
-`dbus-monitor "type='signal',path='/org/mpris/MediaPlayer2'"` shows what it emits.
+`dbus-monitor "type='signal',path='/org/mpris/MediaPlayer2'"` shows what it emits. On Windows
+the equivalent is `Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager`,
+which is what the round-trip test above reads itself back through.
+
+### Type-checking the macOS backend from elsewhere
+
+`tools/macos-check` is a stand-in crate that `#[path]`-includes the real
+`ytm-core/src/media/nowplaying.rs` and stubs the few `ytm-core` items it uses, so:
+
+```bash
+rustup target add aarch64-apple-darwin
+cd tools/macos-check && cargo clippy --target aarch64-apple-darwin --all-targets
+```
+
+`cargo check` never links and every crate involved is pure Rust, so this needs no Xcode and
+no SDK. Checking `ytm-core` itself for that target does not work — `aws-lc-sys` and
+`libmpv2-sys` both build C. It is a compile check and nothing more: whether the Now Playing
+centre actually answers is a question only a Mac can settle.
 
 ### Linking libmpv
 
@@ -76,6 +100,7 @@ by something other than the ratatui frontend.
 lrclib/     lyrics.net API client + LRC format parser (no app knowledge)
 ytm-core/   session/auth, library, search, playback, queue, lyrics policy, persistence
 tui/        the ratatui frontend — single `ytm` binary
+tools/      not a member and not shipped — see `macos-check` above
 ```
 
 ### `lrclib/`
@@ -167,19 +192,75 @@ tui/        the ratatui frontend — single `ytm` binary
   time via `sentence_pieces`, which the endpoint cannot segment further. Blank and repeated
   lines are never sent, so a chorus costs one request. Returns one entry per input line,
   empty where nothing could be translated.
-- **`mpris.rs`** — MPRIS2 over the session D-Bus, via `mpris-server`. This is what makes the
-  keyboard's media keys work *and* what lists the app as a player in GNOME/KDE: both grab
-  `XF86Audio*` globally and forward to whoever owns an `org.mpris.MediaPlayer2.*` bus name,
-  so the TUI grabs no keys itself — it could not under Wayland anyway. Same shape as
-  `playback.rs`: an `Arc<Mutex<NowPlaying>>` the D-Bus tasks read, plus an `mpsc` of
-  `MediaCmd` the event loop drains, since `Player` is not shared. `MediaControls::update` is
-  called every tick but only emits `PropertiesChanged` on an actual change; `Position` is
-  never among them, deliberately — the spec keeps it out and has clients poll it, with
-  `Seeked` (emitted on a position jump larger than a tick can explain) as the only push.
-  MPRIS splits looping and shuffle where `PlayMode` fuses them, so `LoopStatus::None` is
-  answered as `Playlist`: this player always wraps. No session bus (ssh, headless) ⇒ `new`
-  returns `None` with a log line and nothing else changes. Linux-only; other targets get a
-  same-shaped stub so `app.rs` needs no `cfg`.
+- **`media/`** — the OS's own media controls: the keyboard's media keys, *and* the panel the
+  desktop shows for whatever is playing. Every platform has the feature and no two spell it
+  the same way, so `mod.rs` holds the vocabulary — `MediaCmd`, `NowPlaying`, `TrackInfo`,
+  `PlayState` — and one backend per target holds the protocol, selected by `#[cfg_attr(…,
+  path = …)]` on a single `mod backend`. All three expose the same three methods (`new`,
+  `update`, `try_recv`), so `app.rs` carries no `cfg` and gains no branch per platform; a
+  command a protocol cannot express simply never arrives. `new` returning `None` — no
+  session bus over ssh, no media stack on a stripped Windows install, not the main thread on
+  macOS — is logged and never fatal.
+
+  What every backend shares beyond the types is `SEEK_JUMP_SECS` and `is_seek`: a position
+  change bigger than one 200 ms tick can explain, on the same track, is the user having
+  seeked rather than the clock advancing. Position is deliberately *not* published every
+  tick anywhere — MPRIS because the spec says so, the other two because each update is a
+  cross-process call — so this is what says when to break that silence.
+
+  `TrackInfo::art_url` is the cover, and each backend wants it differently: MPRIS and SMTC
+  hand the URL over and let the desktop fetch it, while macOS has to fetch the bytes itself
+  because `MPMediaItemArtwork` wants an image. That is why `cover::fetch` is split, with
+  `fetch_bytes` — the bounded, `MAX_BYTES`-checked body read — exposed for it.
+
+  - **`media/mpris.rs`** (Linux) — MPRIS2 over the session D-Bus, via `mpris-server`. GNOME's
+    media-keys plugin, KDE's mpris2 engine and `playerctl` all grab `XF86Audio*` globally and
+    forward to whoever owns an `org.mpris.MediaPlayer2.*` bus name, so the TUI grabs no keys
+    itself — it could not under Wayland anyway. Same shape as `playback.rs`: an
+    `Arc<Mutex<NowPlaying>>` the D-Bus tasks read, plus an `mpsc` of `MediaCmd` the event
+    loop drains, since `Player` is not shared. `update` is called every tick but only emits
+    `PropertiesChanged` on an actual change; `Position` is never among them, deliberately —
+    the spec keeps it out and has clients poll it, with `Seeked` as the only push. MPRIS
+    splits looping and shuffle where `PlayMode` fuses them, so `LoopStatus::None` is answered
+    as `Playlist`: this player always wraps.
+  - **`media/smtc.rs`** (Windows) — the System Media Transport Controls: the panel behind the
+    volume flyout, the lock screen, and every Bluetooth headset's play button. The documented
+    Win32 route, `ISystemMediaTransportControlsInterop::GetForWindow`, wants an HWND and a
+    thread pumping messages for it — which is why `souvlaki` demands one and is no use to a
+    console app. The route taken instead is the other one Microsoft documents, for apps that
+    drive the SMTC by hand: create a `Windows.Media.Playback.MediaPlayer`, take the controls
+    it owns, and set `CommandManager.IsEnabled = false` so it stops trying to be the thing
+    those controls drive. The player is never given a source and never opens an audio device —
+    mpv still owns every sample; it is only the handle the controls hang off.
+    `examples/smtc_probe.rs` is the standalone proof that this works from a process with no
+    window at all, and was written before the backend was.
+    Shape mirrors `playback.rs`: a dedicated MTA thread owns the WinRT objects and the UI
+    thread never makes a COM call, since each one is a call into another process. The diff
+    stays on the UI thread as plain Rust and only the differences cross the channel.
+    The timeline is the exception to change-driven updates — it moves every tick by
+    definition — so it goes on its own schedule: track change, seek, or every 5 s, which is
+    what Microsoft's guidance asks for. Two things the API will not tell you: `MinSeekTime`
+    and `MaxSeekTime` must be set or `PlaybackPositionChangeRequested` is never raised at
+    all, and `ShuffleEnabled`/`AutoRepeatMode` each need a value once before their
+    change-requested events fire. There is no volume in SMTC, deliberately — Windows puts it
+    in the system mixer, against the audio session mpv opens as `ytm`.
+  - **`media/nowplaying.rs`** (macOS) — `MPNowPlayingInfoCenter` to publish and
+    `MPRemoteCommandCenter` to listen: Control Centre, the menu bar's Now Playing widget, a
+    paired Watch. Neither answers a process the system does not think is an application, so
+    `new` makes this one — `NSApplication::sharedApplication` with an **accessory**
+    activation policy, which is a real app with no Dock icon and no window. That is all
+    AppKit is used for. The interesting part is the run loop: command handlers are delivered
+    through the *main thread's*, and the usual answer is to give Cocoa the main thread and
+    move the TUI onto another (which is what `cliamp` does). Not needed here, because the
+    event loop already returns to the main thread every tick — `update` drains the main run
+    loop with a zero timeout before it returns, so a media key costs at most one tick of
+    latency and `App::run` does not move. A `MainThreadMarker` is held in the handle purely
+    to make it un-`Send`, so that rule cannot be broken by accident.
+    **Unverified at runtime**: written and type-checked against the real bindings (see
+    `tools/macos-check`), never run. Whether a pumped run loop is enough for the handlers to
+    fire is the one open question; if it is not, the fallback is the `cliamp` shape, and
+    `App::run()` is a single call in `tui/src/main.rs`.
+  - **`media/stub.rs`** — the BSDs and anything else that builds. A log line and nothing.
 - **`search.rs`** — YouTube Music search, built on `YTMusicClient::send_request` since
   `ytmusicapi 0.4.2` has no search of its own: same cookies, same context, no second HTTP
   stack. Parsing walks the response for result rows rather than pathing into it — YouTube
@@ -226,7 +307,9 @@ tui/        the ratatui frontend — single `ytm` binary
   against `MAX_BYTES` rather than with `bytes()`, and `decode` reads the JPEG *header* first
   so a claimed size past `MAX_DECODE_PX` is refused before `width × height × 3` is allocated
   for it. One `reqwest::Client` is shared by every fetch — covers arrive in runs, all to the
-  same host, and a client apiece was a TLS handshake apiece.
+  same host, and a client apiece was a TLS handshake apiece. `fetch` is `decode` over
+  `fetch_bytes`, split apart because the macOS media backend needs the raw JPEG and should
+  get it through the same client and the same ceiling as the terminal's own covers.
 - **`persistence.rs`** — all through `write_private` (above), since these are written on the
   way out, when an interrupted write is most likely. `queue.json`, `settings.json` (volume), `lyrics.json` (manual lyric
   choices, keyed by video ID), `translations.json` (**AI** translations, keyed by lrclib
@@ -454,7 +537,7 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `/` | Enter filter mode (songs or queue panel) |
 | `Esc` | Re-centre lyrics → close lyrics → clear filter → back to playlists → quit |
 | `Space` | Pause / resume |
-| `p` / `n` | Previous / next in queue — `p` past 3 s into a track restarts it, at the start it goes back one. Since the restart leaves playback at zero, a run of presses walks back a track at a time, untimed (`Player::restart_or_previous`, shared with the MPRIS `Previous` key) |
+| `p` / `n` | Previous / next in queue — `p` past 3 s into a track restarts it, at the start it goes back one. Since the restart leaves playback at zero, a run of presses walks back a track at a time, untimed (`Player::restart_or_previous`, shared with the OS's own previous-track key) |
 | `←` / `→` | Seek −5s / +5s |
 | `↑` / `↓` | Volume +5 / −5 |
 | `m` | Mute / unmute |
@@ -495,7 +578,7 @@ main.rs
                                                 ├─ drain_song_channel / drain_lyrics
                                                 │  / drain_translations / drain_media
                                                 ├─ render
-                                                ├─ update_media → MPRIS → D-Bus
+                                                ├─ update_media → media/* → the OS
                                                 └─ Player → AudioEngine → libmpv
 ```
 
@@ -525,6 +608,26 @@ be called from inside the runtime (`MediaControls::new` uses `Handle::block_on` 
 this) or it silently starts a second, async-io driver thread. `async-io` is compiled either
 way — mpris-server depends on zbus with default features, and features unify — which costs
 build time only. zbus 5 shares nothing with either reqwest stack.
+
+**The other two media backends are target dependencies for the same reason**, so no build
+ever sees more than one of them.
+
+`windows 0.62` (Windows) is namespace-featured, and the list is short because the SMTC here
+hangs off a `MediaPlayer` rather than an HWND: `Foundation`, `Media`, `Media_Playback`,
+`Storage_Streams`, and `Win32_System_Com` for `CoInitializeEx` alone. `Media_Control` — the
+*reading* half, how a client enumerates what every app on the machine is publishing — is a
+**dev**-dependency, since only the round-trip test wants it and it has no business in the
+shipped binary. No C builds and no second async runtime: WinRT calls are synchronous COM on
+a thread of ours.
+
+`objc2 0.6` + `block2` + `objc2-foundation` / `objc2-app-kit` / `objc2-core-foundation` /
+`objc2-media-player` 0.3 (macOS). These crates are feature-gated *per class*, so each list is
+exactly what `media/nowplaying.rs` names and a missing one shows up as an unresolved import
+rather than a link error. Two are non-obvious: `objc2-app-kit` and `objc2-core-foundation`
+have to be turned on **on `objc2-media-player`** for `MPMediaItemArtwork`'s
+`initWithBoundsSize:requestHandler:` to exist at all, since its signature mentions `NSImage`
+and `CGSize`. Keep the block in step with `tools/macos-check/Cargo.toml` — a version or
+feature that only exists in one of them proves nothing.
 
 `rust-translate 0.1.3` is the free path's transport, and the source of `supported_languages`
 that `normalise_language` checks `lyrics.translate-to` against. It brings no HTTP stack of its
@@ -560,6 +663,7 @@ and pin.
 
 Key deps: `ratatui 0.30`, `ytmusicapi 0.5`, `libmpv2 6`, `reqwest 0.13` (and `0.12`, pulled
 in by `ytmusicapi` and `rust-translate`), `thiserror 2`, `toml 1` / `toml_edit 0.25`,
-`mpris-server 0.10` (Linux only),
+`mpris-server 0.10` (Linux only), `windows 0.62` (Windows only),
+`objc2 0.6` + `objc2-* 0.3` + `block2 0.6` (macOS only),
 `rust-translate 0.1.3`, `ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.10`,
 `dirs 6`, `throbber-widgets-tui 0.11`.
