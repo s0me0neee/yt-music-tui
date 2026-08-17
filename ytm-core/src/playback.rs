@@ -53,13 +53,17 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn new() -> Self {
+    /// `rt` is the app's own runtime, which the resolve threads borrow to screen
+    /// a URL before mpv is handed it (see [`serves_whole_file`]). Taking a handle
+    /// rather than building a client of our own is what keeps this to one
+    /// reactor for the process.
+    pub fn new(rt: tokio::runtime::Handle) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let state = Arc::new(Mutex::new(AudioState::default()));
         let state2 = Arc::clone(&state);
         let handle = thread::Builder::new()
             .name("audio".into())
-            .spawn(move || run(rx, state2))
+            .spawn(move || run(rx, state2, rt))
             .expect("spawn audio thread");
         Self {
             cmd_tx: Some(tx),
@@ -113,12 +117,6 @@ impl AudioEngine {
     }
 }
 
-impl Default for AudioEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         // Dropping the sender ends the audio thread, which drops the embedded mpv.
@@ -131,15 +129,84 @@ impl Drop for AudioEngine {
 
 // ── URL resolution ──────────────────────────────────────────────────────────────
 
-#[hotpath::measure]
-fn resolve_url(video_id: &str) -> Option<String> {
-    // Don't start new yt-dlp work if the app is shutting down.
-    if is_shutdown_requested() {
-        return None;
-    }
+/// How many times a resolve is worth repeating when what came back is a URL mpv
+/// will not be able to play.
+///
+/// Each yt-dlp run draws afresh (see [`serves_whole_file`]), so the odds
+/// compound: at the refusal rate measured, four attempts leave a small fraction
+/// of plays to the load-failure retry that was the only defence before.
+const MAX_RESOLVE_ATTEMPTS: usize = 4;
 
+/// How long the screen may take. It is one round trip to the host that is about
+/// to serve the song, sitting in front of playback starting — either it answers
+/// at once or it is not worth waiting for.
+const SCREEN_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The one client the screen uses.
+///
+/// Every song is on a different `rr*.googlevideo` host, so unlike
+/// [`crate::cover`]'s there is no connection pool here worth sharing — but
+/// there is no reason to rebuild the client per request either.
+fn screen_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(SCREEN_TIMEOUT)
+                .build()
+                .inspect_err(|e| {
+                    log::warn!("[audio] no HTTP client ({e}) — resolved URLs go unscreened");
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Whether `url` will serve the file in one response — the only way mpv ever
+/// asks for it.
+///
+/// YouTube runs a server-side experiment, carried in the URL's own `fexp`, that
+/// refuses whole-file requests and serves bounded chunks only. yt-dlp never
+/// notices, because it downloads in chunks anyway; mpv opens with
+/// `Range: bytes=0-` and is answered **403**, which arrives as
+/// `MPV_ERROR_LOADING_FAILED` and is indistinguishable from the stale URL that
+/// error usually means. Which bucket a URL lands in is drawn per resolve rather
+/// than being a property of the song — measured over 24 resolves of one video,
+/// between a third and two thirds refused, and the same video played on the
+/// next attempt. So this asks the question mpv is about to ask.
+///
+/// A request that doesn't complete answers `true`. The point is to catch a
+/// refusal, and condemning a URL over a network hiccup would spend three more
+/// yt-dlp runs to arrive back where it started. Only headers are read: the
+/// response is dropped without touching the body, so nothing of the song is
+/// downloaded twice.
+fn serves_whole_file(rt: &tokio::runtime::Handle, url: &str) -> bool {
+    let Some(client) = screen_client() else {
+        return true;
+    };
+    rt.block_on(async {
+        match client.get(url).header("Range", "bytes=0-").send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                drop(resp);
+                if status.is_success() {
+                    return true;
+                }
+                log::debug!("[audio] screen: {status} for a whole-file request");
+                false
+            }
+            Err(e) => {
+                log::debug!("[audio] screen: could not ask ({e}) — using the URL anyway");
+                true
+            }
+        }
+    })
+}
+
+/// One yt-dlp run. The URL it gives back still has to get past
+/// [`serves_whole_file`] before mpv is handed it.
+fn yt_dlp_url(video_id: &str) -> Option<String> {
     let yt_url = format!("https://music.youtube.com/watch?v={video_id}");
-    log::debug!("[audio] yt-dlp resolving {video_id}");
     let out = Command::new("yt-dlp")
         .args([
             "-f",
@@ -154,7 +221,6 @@ fn resolve_url(video_id: &str) -> Option<String> {
         .ok()?;
 
     if !out.status.success() {
-        log::warn!("[audio] yt-dlp failed for {video_id}");
         return None;
     }
     let stdout = String::from_utf8(out.stdout).ok()?;
@@ -164,6 +230,43 @@ fn resolve_url(video_id: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+#[hotpath::measure]
+fn resolve_url(rt: &tokio::runtime::Handle, video_id: &str) -> Option<String> {
+    let mut last = None;
+    for attempt in 1..=MAX_RESOLVE_ATTEMPTS {
+        // Don't start new yt-dlp work if the app is shutting down. Checked each
+        // time round, not once: four attempts is several seconds of runs.
+        if is_shutdown_requested() {
+            return None;
+        }
+        log::debug!("[audio] yt-dlp resolving {video_id}");
+        let Some(url) = yt_dlp_url(video_id) else {
+            log::warn!("[audio] yt-dlp failed for {video_id}");
+            break;
+        };
+        if serves_whole_file(rt, &url) {
+            if attempt > 1 {
+                log::info!("[audio] {video_id}: a playable URL on attempt {attempt}");
+            }
+            return Some(url);
+        }
+        log::debug!("[audio] {video_id}: attempt {attempt} came back chunk-only — resolving again");
+        last = Some(url);
+    }
+    // Out of attempts, so hand the last one over rather than nothing. `None`
+    // sends the caller to mpv's own ytdl_hook, which draws from the same
+    // lottery, and the screen itself can be wrong — a captive portal answering
+    // 403 to everything would otherwise take playback down with it. Trying is
+    // what this did before the screen existed, and the load-failure retry is
+    // still behind it.
+    if last.is_some() {
+        log::warn!(
+            "[audio] {video_id}: {MAX_RESOLVE_ATTEMPTS} resolves all came back chunk-only — trying the last anyway"
+        );
+    }
+    last
 }
 
 // ── audio thread ──────────────────────────────────────────────────────────────
@@ -278,21 +381,23 @@ fn spawn_resolve(
     what: &str,
     fetching: &mut HashSet<String>,
     tx: &std::sync::mpsc::Sender<(String, Option<String>)>,
+    rt: &tokio::runtime::Handle,
 ) {
     if !fetching.insert(id.to_string()) {
         return; // already in flight; its result will be delivered to us anyway
     }
     let tx = tx.clone();
     let id = id.to_string();
+    let rt = rt.clone();
     thread::Builder::new()
         .name(format!("{what}-{id}"))
         .spawn(move || {
-            let _ = tx.send((id.clone(), resolve_url(&id)));
+            let _ = tx.send((id.clone(), resolve_url(&rt, &id)));
         })
         .ok();
 }
 
-fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
+fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>, rt: tokio::runtime::Handle) {
     #[cfg(windows)]
     let which_cmd = "where";
     #[cfg(not(windows))]
@@ -440,7 +545,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                             // competing yt-dlp via its ytdl_hook.
                             log::info!("[audio] Play {id}: cache miss — resolving (single yt-dlp)");
                             pending_resolve = Some(id.clone());
-                            spawn_resolve(&id, "resolve", &mut fetching, &fetch_tx);
+                            spawn_resolve(&id, "resolve", &mut fetching, &fetch_tx, &rt);
                         }
                     }
 
@@ -451,7 +556,7 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                         if fetching.len() >= MAX_PREFETCH {
                             continue;
                         }
-                        spawn_resolve(&id, "prefetch", &mut fetching, &fetch_tx);
+                        spawn_resolve(&id, "prefetch", &mut fetching, &fetch_tx, &rt);
                     }
 
                     Cmd::Pause => {
@@ -551,12 +656,19 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>) {
                             // resolve comes back empty we still fall back to
                             // ytdl_hook, where the results are drained.
                             pending_resolve = Some(id.clone());
-                            spawn_resolve(&id, "re-resolve", &mut fetching, &fetch_tx);
+                            spawn_resolve(&id, "re-resolve", &mut fetching, &fetch_tx, &rt);
                         }
                         Some(id) => {
                             log::error!(
                                 "[audio] load failed for {id} (mpv {code}) after retry — giving up"
                             );
+                            // Forget it here too. The re-resolve above cached
+                            // its URL on the way past — that is where every
+                            // resolve is cached — so giving up without this
+                            // left a URL known not to play sitting in the cache
+                            // as a hit, and the next `p`/`n` back onto the song
+                            // failed on it instantly without even re-resolving.
+                            url_cache.remove(&id);
                             let mut s = lock_state(&state);
                             s.loading = false;
                             s.error = Some("playback failed".into());
@@ -582,6 +694,31 @@ mod tests {
             cache.insert(format!("id{i}"), format!("https://cdn/{i}"));
         }
         cache
+    }
+
+    /// The screen, against the live CDN.
+    ///
+    /// Resolves one track several times and asks of each URL handed back the
+    /// question mpv would ask. Without the screen this is the coin toss that
+    /// made playback fail so often — at the refusal rate measured, all four
+    /// coming back playable happens about one run in sixteen — so a pass says
+    /// the screen is doing its job rather than that YouTube was in a good mood.
+    /// Three of four rather than four, because [`resolve_url`] deliberately
+    /// hands over an unscreenable URL rather than nothing once it runs out of
+    /// attempts.
+    #[test]
+    #[ignore = "hits YouTube and spends several yt-dlp runs"]
+    fn resolving_gives_back_urls_that_actually_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = rt.handle().clone();
+        let played = (0..4)
+            .filter_map(|_| resolve_url(&handle, "0JqnlBedvvQ"))
+            .filter(|url| serves_whole_file(&handle, url))
+            .count();
+        assert!(played >= 3, "only {played} of 4 resolves gave a playable URL");
     }
 
     #[test]

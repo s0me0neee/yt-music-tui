@@ -1033,7 +1033,7 @@ impl App {
         let selected = (n > 0).then_some(0);
 
         // Restore the volume saved on the previous exit.
-        let mut player = Player::new();
+        let mut player = Player::new(rt.clone());
         player.set_volume(persistence::load_settings().volume);
 
         let (lyrics_tx, lyrics_rx) = std::sync::mpsc::channel();

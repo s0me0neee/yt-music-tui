@@ -145,15 +145,10 @@ pub struct Player {
     revision: u64,
 }
 
-impl Default for Player {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Player {
-    pub fn new() -> Self {
-        let audio = AudioEngine::new();
+    /// `rt` is the app's runtime, borrowed by [`AudioEngine`]'s resolve threads.
+    pub fn new(rt: tokio::runtime::Handle) -> Self {
+        let audio = AudioEngine::new(rt);
         audio.send(Cmd::Volume(80));
         Self {
             audio,
