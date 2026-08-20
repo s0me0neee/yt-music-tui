@@ -1,6 +1,6 @@
 ---
 # yt-music-tui — feature plan
-Last updated: 2026-07-01
+Last updated: 2026-08-20
 
 Legend: ✅ done  🔄 in progress  ❌ not started
 
@@ -112,18 +112,80 @@ Legend: ✅ done  🔄 in progress  ❌ not started
 
 ## Tier 5 — Auth improvements
 
-❌ **Chrome CDP auto-auth** (fallback in `src/setup.rs`)
-- Spawn Chrome with `--remote-debugging-port=9222`, navigate to `music.youtube.com`
-- Connect to CDP WebSocket, enable `Network`, intercept first `youtubei/` request
-- Extract cookies + headers, write `browser.json`, kill Chrome
-- Zero manual steps; fall back to existing yt-dlp / cURL flow if Chrome not found
-- New deps: `ureq = "2"` (HTTP poll of `/json/version`), `tungstenite = "0.24"` (CDP WebSocket)
-- Edge cases: port 9222 in use, 60s timeout, Chrome crash
+~~**Chrome CDP auto-auth**~~ — superseded by the Tauri webview plan below (same
+idea — drive a real Google login and lift cookies out of it — but a bundled
+webview needs no external Chrome, no debug port, no WebSocket protocol client.
 
-❌ **Upstream OAuth**
-- `src/auth.rs` already scaffolds `yup_oauth2` with `tokencache.json`
-- Wire up once `ytmusicapi` upstream fixes their OAuth flow
-- Gives automatic silent token refresh with no user action
+~~**Upstream OAuth**~~ — dead end, confirmed: YouTube Music rejects Bearer
+tokens from user-created OAuth clients
+([sigma67/ytmusicapi#813](https://github.com/sigma67/ytmusicapi/issues/813)),
+and the `ytmusicapi-rs` sibling project's README documents hitting this
+directly. Not worth wiring up `yup_oauth2` against — there is no token this
+flow can produce that the API will accept. Cookie auth stays the only real
+path; the plan below changes *how* the cookie is obtained, not what it is.
+
+❌ **Tauri frontend + webview login** (replaces yt-dlp cookie extraction, for
+GUI users)
+- Motivation: today's setup (`ytm-core/src/session.rs`) gets cookies by
+  reaching into an *existing* browser's cookie store via
+  `yt-dlp --cookies-from-browser` — which is where the current pain lives
+  (Chrome 127+'s App-Bound Encryption defeats yt-dlp outright, the browser
+  has to be closed first, and the manual cURL-paste fallback exists only
+  because the automatic path fails often enough to need one). A Tauri app
+  bundles its own webview (wry — WebView2 / WKWebView / WebKitGTK), so it can
+  render an actual Google login page in-process and read the session back out
+  of *that* — no external browser, no encrypted store to crack open, no "is
+  Chrome closed" prompt.
+- Architecture: `ytm-core` is already UI-agnostic (the engine `tui/` drives
+  today), so this is a fourth workspace member — a `gui/` (or `tauri-app/`)
+  crate depending on `ytm-core` the same way `tui/` does, not a rewrite of
+  anything under `ytm-core/`.
+- Auth flow:
+  1. Open a Tauri `WebviewWindow` at `music.youtube.com` (redirects to Google
+     login if signed out). The user logs in exactly as in a normal browser —
+     passkeys, 2FA, "select account" all just work, since it's a real engine.
+  2. Detect completion via a navigation hook (`on_navigation` /
+     `on_page_load`) firing for a `music.youtube.com/*` URL post-login, not a
+     fixed timer.
+  3. Read the session back out via the webview's cookie API (Tauri
+     `webview.cookies()`, wrapping the `cookie` crate) and filter to the
+     `youtube.com`/`google.com` cookies innertube needs — the same
+     `is_youtube_domain` filter `session.rs` already applies to yt-dlp's
+     Netscape-format output.
+  4. Add `Session::setup_with_webview_cookies(cookie_header: String)` to
+     `ytm-core` — a new *adapter* alongside `setup_with_browser` /
+     `setup_with_curl` that reuses `build_default_headers` and
+     `write_private` verbatim. `browser.json`'s shape doesn't change, so a
+     session started in the Tauri app is a session the TUI can already read,
+     and vice versa — no migration, no new file format.
+  5. Silent refresh: replace `refresh_cookies()`'s yt-dlp call, for GUI users
+     only, with the same webview pulled again (hidden/offscreen) before the
+     existing 6h `REFRESH_AFTER` window closes. TUI-only users keep the
+     yt-dlp path, since a terminal has no webview to reuse.
+- Suggested milestones:
+  1. Throwaway spike: bare Tauri window, log in, dump `webview.cookies()` to
+     stdout — confirms the cookie-read API actually returns `SAPISID` et al.
+     on this machine (WKWebView/macOS first) before anything is built on it.
+  2. `Session::setup_with_webview_cookies` in `ytm-core` (pure adapter, no
+     Tauri dependency inside `ytm-core` itself — the crate stays UI-agnostic).
+  3. Minimal `gui/` crate: a "Sign in" button driving the flow above, calling
+     into `ytm-core` on success. No player UI yet.
+  4. Background silent-refresh task using the same hidden-webview trick.
+  5. Decide the GUI's actual scope (full player replacing the TUI, runs
+     alongside it, or an auth-only helper that just produces `browser.json`
+     for the TUI to consume) — worth settling before building past the spike.
+- Open risks:
+  - The cookie-read API's maturity differs by platform backend (WebView2 /
+    WKWebView / WebKitGTK) — same caveat flagged for raw `wry` earlier, now
+    one layer down inside Tauri. Milestone 1 exists specifically to find this
+    out early.
+  - An embedded webview may draw extra Google anti-automation friction
+    (captcha, "this browser may not be secure") that a real Chrome/Firefox
+    profile doesn't — untested, could rule the approach out on one platform.
+  - "Login finished" is a heuristic (navigation reaching `music.youtube.com`),
+    and Google's login flow is multi-page (email → password → 2FA → "stay
+    signed in" interstitial) — needs to be robust against that sequence
+    rather than firing on the first navigation past the email screen.
 
 ---
 
